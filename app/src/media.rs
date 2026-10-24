@@ -1,8 +1,8 @@
 //! FFmpeg helpers for the library: thumbnails for files without one (spec
 //! library.thumbnails), the frames of the trim timeline, and trims (spec edit.trim):
 //! fast without re-encoding, or exact with the video re-encoded.
-//! During the PoC ffmpeg.exe comes from the development tools folder; how it is
-//! shipped with the product is an open question (wiki/projeto/poc-u1-resultados.md).
+//! ffmpeg.exe is FFmpeg's own program built by tools/ffmpeg-build.py, which uses the
+//! FFmpeg libraries of the OBS runtime, so it lives next to the engine.
 
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -10,16 +10,12 @@ use std::process::Command;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// LAUREL_FFMPEG, then ffmpeg.exe next to the app, then the development layout
-/// (laurel-dev\tools\ffmpeg\ffmpeg.exe).
-pub fn find_ffmpeg() -> Option<PathBuf> {
+/// LAUREL_FFMPEG, else ffmpeg.exe next to the engine, in the runtime's bin\64bit.
+pub fn find_ffmpeg(engine: &Path) -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("LAUREL_FFMPEG") {
         return Some(PathBuf::from(p));
     }
-    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    [exe_dir.join("ffmpeg.exe"), exe_dir.join("..").join("tools").join("ffmpeg").join("ffmpeg.exe")]
-        .into_iter()
-        .find(|p| p.exists())
+    Some(engine.parent()?.join("ffmpeg.exe")).filter(|p| p.exists())
 }
 
 fn run(ffmpeg: &Path, args: &[&std::ffi::OsStr]) -> Result<(), String> {

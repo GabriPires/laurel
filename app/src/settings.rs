@@ -2,9 +2,11 @@
 //! (overlay.in-game, alerts.sound), storage (storage.location, storage.limits), the
 //! first-run startup question (app.startup), the games the user added or ignored
 //! (game.manual-add), the hotkeys (clip.hotkeys), recording on or off
-//! (record.toggle), the mouse cursor (capture.cursor) and screen recording
-//! (capture.screen, off by default per D13). Missing or invalid fields fall back to
-//! the defaults.
+//! (record.toggle), the mouse cursor (capture.cursor), screen recording
+//! (capture.screen, off by default per D13), the video and the clip length
+//! (quality.encoding, record.replay-buffer), and what the clips' main audio track
+//! mixes (audio.separate-tracks), and whether Laurel checks for updates (stage 6
+//! plan). Missing or invalid fields fall back to the defaults.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -56,6 +58,25 @@ pub struct Settings {
     /// monitor_capture device id; empty for the primary monitor.
     pub screen_monitor: String,
     pub screen_game_switch: bool,
+    /// Video encoder: auto, or a family (nvenc, amf, qsv, x264).
+    pub video_encoder: String,
+    /// h264, hevc or av1; H.264 is the fallback.
+    pub video_codec: String,
+    /// cbr or vbr.
+    pub video_rate: String,
+    /// quality, balanced or performance, mapped to each encoder's presets.
+    pub video_preset: String,
+    pub video_bitrate: u32,
+    /// Output height; 0 records at the monitor's size.
+    pub video_height: u32,
+    pub video_fps: u32,
+    /// Replay buffer length in seconds.
+    pub clip_secs: u32,
+    /// Track 1: game, game-mic or pc-mic (D12 revised); tracks 2 and 3 stay the game
+    /// and the microphone.
+    pub audio_mix: String,
+    /// Ask the update channel for a new version a little after each start.
+    pub check_updates: bool,
 }
 
 pub const DEFAULT_NAMING: &str = "{game} {date} {time}";
@@ -85,6 +106,16 @@ impl Default for Settings {
             screen_recording: false,
             screen_monitor: String::new(),
             screen_game_switch: true,
+            video_encoder: "auto".into(),
+            video_codec: "h264".into(),
+            video_rate: "cbr".into(),
+            video_preset: "balanced".into(),
+            video_bitrate: 20000,
+            video_height: 0,
+            video_fps: 60,
+            clip_secs: 30,
+            audio_mix: "game-mic".into(),
+            check_updates: true,
         }
     }
 }
@@ -95,6 +126,7 @@ impl Settings {
         let flag = |key: &str, default: bool| v[key].as_bool().unwrap_or(default);
         let number = |key: &str, default: u32, max: u64| v[key].as_u64().map_or(default, |n| n.min(max) as u32);
         let text = |key: &str, default: &str| v[key].as_str().map_or(default.to_string(), |s| s.trim().to_string());
+        let choice = |key: &str, allowed: &[&str], default: &str| v[key].as_str().filter(|s| allowed.contains(s)).unwrap_or(default).to_string();
         let pairs = |key: &str, a: &str, b: &str| -> Vec<(String, String)> {
             v[key].as_array().into_iter().flatten().filter_map(|e| Some((e[a].as_str()?.to_string(), e[b].as_str()?.to_string()))).collect()
         };
@@ -119,7 +151,23 @@ impl Settings {
             screen_recording: flag("screenRecording", d.screen_recording),
             screen_monitor: text("screenMonitor", &d.screen_monitor),
             screen_game_switch: flag("screenGameSwitch", d.screen_game_switch),
+            video_encoder: choice("videoEncoder", &["auto", "nvenc", "amf", "qsv", "x264"], &d.video_encoder),
+            video_codec: choice("videoCodec", &["h264", "hevc", "av1"], &d.video_codec),
+            video_rate: choice("videoRate", &["cbr", "vbr"], &d.video_rate),
+            video_preset: choice("videoPreset", &["quality", "balanced", "performance"], &d.video_preset),
+            video_bitrate: number("videoBitrate", d.video_bitrate, 200_000).max(1000),
+            video_height: number("videoHeight", d.video_height, 4320),
+            video_fps: number("videoFps", d.video_fps, 360).max(10),
+            clip_secs: number("clipSecs", d.clip_secs, 600).max(5),
+            audio_mix: choice("audioMix", &["game", "game-mic", "pc-mic"], &d.audio_mix),
+            check_updates: flag("checkUpdates", d.check_updates),
         }
+    }
+
+    /// Whether the video or the clip length differ: the engine restarts with them.
+    pub fn video_differs(&self, other: &Settings) -> bool {
+        (&self.video_encoder, &self.video_codec, &self.video_rate, &self.video_preset, self.video_bitrate, self.video_height, self.video_fps, self.clip_secs)
+            != (&other.video_encoder, &other.video_codec, &other.video_rate, &other.video_preset, other.video_bitrate, other.video_height, other.video_fps, other.clip_secs)
     }
 
     pub fn to_json(&self) -> Value {
@@ -144,6 +192,16 @@ impl Settings {
             "screenRecording": self.screen_recording,
             "screenMonitor": self.screen_monitor,
             "screenGameSwitch": self.screen_game_switch,
+            "videoEncoder": self.video_encoder,
+            "videoCodec": self.video_codec,
+            "videoRate": self.video_rate,
+            "videoPreset": self.video_preset,
+            "videoBitrate": self.video_bitrate,
+            "videoHeight": self.video_height,
+            "videoFps": self.video_fps,
+            "clipSecs": self.clip_secs,
+            "audioMix": self.audio_mix,
+            "checkUpdates": self.check_updates,
         })
     }
 }

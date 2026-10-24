@@ -1,6 +1,6 @@
 {
   "productName": "Laurel",
-  "version": "0.1.0",
+  "version": "0.1.0-rc.1",
   "identifier": "dev.laurel.app",
   "build": { "frontendDist": "./ui" },
   "app": {
@@ -11,5 +11,13 @@
     ],
     "security": { "csp": null, "assetProtocol": { "enable": true, "scope": [] } }
   },
-  "bundle": { "active": false, "icon": ["icons/icon.ico", "icons/icon.png"] }
+  "bundle": { "active": false, "icon": ["icons/icon.ico", "icons/icon.png"] },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYyNzc3NTQ5MkM3QTg3QzQKUldURWgzb3NTWFYzWXNPZkR1SnVUZ0V5eGpQM1IxNCtuMjlINHA5SmFEamtrNEVSTm55WHZ2STcK",
+      "endpoints": ["https://github.com/GabriPires/laurel/releases/download/updates/latest.json"],
+      "requireSignedVersion": true,
+      "windows": { "installMode": "passive" }
+    }
+  }
 }

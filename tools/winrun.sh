@@ -3,8 +3,9 @@
 # Windows folder and run it there through WSL interop (decision D10, option B).
 #
 # Usage: tools/winrun.sh <crate-dir> [--obs] [--timeout SECONDS] [-- args...]
-#   --obs       stage Laurel's own OBS runtime (tools/obs-runtime.py) in the output
-#               folder and put the executable in its bin\64bit, next to obs.dll
+#   --obs       stage Laurel's own OBS runtime (tools/obs-runtime.py) and its small
+#               ffmpeg.exe (tools/ffmpeg-build.py) in the output folder and put the
+#               executable in its bin\64bit, next to obs.dll
 # Output goes to C:\Users\$WINUSER\laurel-dev\<crate-name>\ (with --obs, the
 # executable goes to its bin\64bit\); args are passed as-is.
 set -euo pipefail
@@ -40,6 +41,7 @@ dest_wsl=/mnt/c/Users/$WINUSER/laurel-dev/$name
 dest_win="C:\\Users\\$WINUSER\\laurel-dev\\$name"
 if [ "$use_obs" = 1 ]; then
   python3 -I "$ROOT/tools/obs-runtime.py" stage "$dest_wsl"
+  python3 -I "$ROOT/tools/ffmpeg-build.py" stage "$dest_wsl"
   dest_wsl=$dest_wsl/bin/64bit
   dest_win=$dest_win\\bin\\64bit
 fi

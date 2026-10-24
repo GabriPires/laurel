@@ -17,6 +17,9 @@ pub type obs_output_t = c_void;
 pub type obs_module_t = c_void;
 pub type obs_properties_t = c_void;
 pub type obs_property_t = c_void;
+
+/// `enum obs_property_type`: a list (combo box) property.
+pub const OBS_PROPERTY_LIST: i32 = 6;
 pub type proc_handler_t = c_void;
 pub type signal_handler_t = c_void;
 pub type video_t = c_void;
@@ -154,6 +157,8 @@ extern "C" {
     // settings
     pub fn obs_data_create() -> *mut obs_data_t;
     pub fn obs_data_release(data: *mut obs_data_t);
+    pub fn obs_data_get_int(data: *mut obs_data_t, name: *const c_char) -> i64;
+    pub fn obs_data_get_string(data: *mut obs_data_t, name: *const c_char) -> *const c_char;
     pub fn obs_data_set_string(data: *mut obs_data_t, name: *const c_char, val: *const c_char);
     pub fn obs_data_set_int(data: *mut obs_data_t, name: *const c_char, val: i64);
     pub fn obs_data_set_bool(data: *mut obs_data_t, name: *const c_char, val: bool);
@@ -176,6 +181,12 @@ extern "C" {
     pub fn obs_property_list_item_int(p: *mut obs_property_t, idx: usize) -> i64;
     pub fn obs_property_list_format(p: *mut obs_property_t) -> i32;
     pub fn obs_properties_destroy(props: *mut obs_properties_t);
+    pub fn obs_get_encoder_properties(id: *const c_char) -> *mut obs_properties_t;
+    pub fn obs_encoder_defaults(id: *const c_char) -> *mut obs_data_t;
+    pub fn obs_properties_first(props: *mut obs_properties_t) -> *mut obs_property_t;
+    pub fn obs_property_next(p: *mut *mut obs_property_t) -> bool;
+    pub fn obs_property_name(p: *mut obs_property_t) -> *const c_char;
+    pub fn obs_property_get_type(p: *mut obs_property_t) -> i32;
 
     // encoders
     pub fn obs_video_encoder_create(id: *const c_char, name: *const c_char, settings: *mut obs_data_t, hotkey_data: *mut obs_data_t) -> *mut obs_encoder_t;

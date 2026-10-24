@@ -171,19 +171,48 @@ impl Obs {
             }
             let prop = ffi::obs_properties_get(props, name.as_ptr());
             if !prop.is_null() {
-                let int = ffi::obs_property_list_format(prop) == ffi::OBS_COMBO_FORMAT_INT;
-                for i in 0..ffi::obs_property_list_item_count(prop) {
-                    let value = if int {
-                        ffi::obs_property_list_item_int(prop, i).to_string()
-                    } else {
-                        opt_string(ffi::obs_property_list_item_string(prop, i)).unwrap_or_default()
-                    };
-                    items.push((opt_string(ffi::obs_property_list_item_name(prop, i)).unwrap_or_default(), value));
-                }
+                items = list_items(prop);
             }
             ffi::obs_properties_destroy(props);
         }
         items
+    }
+
+    /// The list properties of an encoder type (rate control, presets, profiles…)
+    /// with their items, and the encoder's default value for each.
+    pub fn encoder_list_properties(&self, encoder_id: &str) -> Vec<ListProperty> {
+        let id = cstr(encoder_id);
+        let mut out = Vec::new();
+        unsafe {
+            let props = ffi::obs_get_encoder_properties(id.as_ptr());
+            if props.is_null() {
+                return out;
+            }
+            let defaults = ffi::obs_encoder_defaults(id.as_ptr());
+            let mut prop = ffi::obs_properties_first(props);
+            while !prop.is_null() {
+                if ffi::obs_property_get_type(prop) == ffi::OBS_PROPERTY_LIST {
+                    let name = opt_string(ffi::obs_property_name(prop)).unwrap_or_default();
+                    let key = cstr(&name);
+                    let default = if defaults.is_null() {
+                        String::new()
+                    } else if ffi::obs_property_list_format(prop) == ffi::OBS_COMBO_FORMAT_INT {
+                        ffi::obs_data_get_int(defaults, key.as_ptr()).to_string()
+                    } else {
+                        opt_string(ffi::obs_data_get_string(defaults, key.as_ptr())).unwrap_or_default()
+                    };
+                    out.push(ListProperty { name, default, items: list_items(prop) });
+                }
+                if !ffi::obs_property_next(&mut prop) {
+                    break;
+                }
+            }
+            if !defaults.is_null() {
+                ffi::obs_data_release(defaults);
+            }
+            ffi::obs_properties_destroy(props);
+        }
+        out
     }
 
     pub fn stats(&self) -> CoreStats {
@@ -198,6 +227,24 @@ impl Obs {
             }
         }
     }
+}
+
+/// A list property: its name, the default value and the (label, value) items.
+pub struct ListProperty {
+    pub name: String,
+    pub default: String,
+    pub items: Vec<(String, String)>,
+}
+
+/// The (label, value) items of a list property; integer lists give decimal strings.
+unsafe fn list_items(prop: *mut ffi::obs_property_t) -> Vec<(String, String)> {
+    let int = ffi::obs_property_list_format(prop) == ffi::OBS_COMBO_FORMAT_INT;
+    (0..ffi::obs_property_list_item_count(prop))
+        .map(|i| {
+            let value = if int { ffi::obs_property_list_item_int(prop, i).to_string() } else { opt_string(ffi::obs_property_list_item_string(prop, i)).unwrap_or_default() };
+            (opt_string(ffi::obs_property_list_item_name(prop, i)).unwrap_or_default(), value)
+        })
+        .collect()
 }
 
 impl Drop for Obs {

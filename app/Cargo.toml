@@ -1,6 +1,6 @@
 [package]
 name = "laurel-app"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 description = "Laurel desktop app (PoC-U1): tray, windows, hotkeys and supervision of laurel-engine."
 edition.workspace = true
 license.workspace = true
@@ -14,3 +14,4 @@ tauri = { version = "2", features = ["tray-icon", "protocol-asset", "image-png"]
 tauri-plugin-dialog = "2"
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
+tauri-plugin-updater = "2"

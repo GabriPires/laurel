@@ -48,6 +48,8 @@ struct Inner {
     next_id: AtomicU64,
     state: Mutex<Value>,
     quitting: AtomicBool,
+    /// Set by `restart`: the next exit is asked for, not a failure.
+    restarting: AtomicBool,
 }
 
 impl Engine {
@@ -61,6 +63,7 @@ impl Engine {
             next_id: AtomicU64::new(1),
             state: Mutex::new(json!({ "state": "starting" })),
             quitting: AtomicBool::new(false),
+            restarting: AtomicBool::new(false),
         }));
         let supervisor = engine.clone();
         std::thread::Builder::new().name("engine-supervisor".into()).spawn(move || supervisor.supervise()).unwrap();
@@ -120,12 +123,15 @@ impl Engine {
         }
     }
 
-    /// Restarts supervision after the supervisor gave up.
+    /// Restarts the engine with fresh options (new settings), or restarts
+    /// supervision after the supervisor gave up. A restart asked for is not counted
+    /// as a failure and starts again at once.
     pub fn restart(&self) {
         if self.state()["state"] == "failed" {
             let supervisor = self.clone();
             std::thread::spawn(move || supervisor.supervise());
         } else {
+            self.0.restarting.store(true, Ordering::SeqCst);
             self.kill();
         }
     }
@@ -138,8 +144,9 @@ impl Engine {
 
     fn supervise(&self) {
         let mut quick_failures = 0;
+        let mut restarted = false;
         while !self.0.quitting.load(Ordering::SeqCst) {
-            self.set_state(json!({ "state": "starting" }));
+            self.set_state(if restarted { json!({ "state": "starting", "restart": true }) } else { json!({ "state": "starting" }) });
             let started = Instant::now();
             let message = match self.run_once() {
                 Ok(status) => format!("the engine exited ({status})"),
@@ -147,6 +154,11 @@ impl Engine {
             };
             if self.0.quitting.load(Ordering::SeqCst) {
                 break;
+            }
+            restarted = self.0.restarting.swap(false, Ordering::SeqCst);
+            if restarted {
+                log!("engine restarted to apply new settings");
+                continue;
             }
             quick_failures = if started.elapsed() > HEALTHY_RUN { 1 } else { quick_failures + 1 };
             if quick_failures >= MAX_QUICK_FAILURES {
@@ -194,14 +206,10 @@ impl Engine {
         });
         let log_path = cfg.work_dir.join("logs").join("engine.log");
         std::thread::spawn(move || {
-            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&log_path).ok();
-            if let Some(f) = file.as_mut() {
-                let _ = writeln!(f, "==== engine start at {}", crate::win::clock());
-            }
+            let mut file = crate::log::Rotating::open(&log_path, false, crate::log::MAX_BYTES);
+            file.line(&format!("==== engine start at {}", crate::win::clock()));
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if let Some(f) = file.as_mut() {
-                    let _ = writeln!(f, "{line}");
-                }
+                file.line(&line);
             }
         });
 
@@ -245,6 +253,16 @@ impl Engine {
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
         match msg.get("method").and_then(Value::as_str) {
             Some("ready") => self.set_state(json!({ "state": "ready", "info": params })),
+            // The video encoder changed while resuming (spec quality.encoding).
+            Some("encoder") => {
+                let mut state = self.state();
+                if state["state"] == "ready" {
+                    for (key, value) in params.as_object().into_iter().flatten() {
+                        state["info"][key] = value.clone();
+                    }
+                    self.set_state(state);
+                }
+            }
             Some("fatal") => {
                 let text = params.get("message").and_then(Value::as_str).unwrap_or_default().to_string();
                 log!("engine fatal error: {text}");

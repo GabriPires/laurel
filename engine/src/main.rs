@@ -9,12 +9,17 @@
 //!   --base WxH                  canvas size (default 1920x1080)
 //!   --out WxH                   encoded size (default = base)
 //!   --fps N                     (default 60)
-//!   --encoder ID                video encoder id (default obs_nvenc_h264_tex, else obs_x264)
+//!   --encoder auto|nvenc|amf|qsv|x264|ID  video encoder (default auto: the first that starts)
+//!   --codec h264|hevc|av1       for auto (default h264); H.264 is the fallback
+//!   --rate cbr|vbr              rate control (default cbr)
+//!   --preset quality|balanced|performance  mapped to each encoder's presets (default balanced)
 //!   --bitrate KBPS              (default 20000)
 //!   --buffer SECS               replay buffer length (default 30)
-//!   --audio game|all             track 2: the hooked game's audio (default) or all PC audio
+//!   --mix game|game-mic|pc-mic  track 1: game only, game and microphone (default), or all
+//!                               PC audio and microphone; track 2 is the game, track 3 the mic
 //!   --game-audio SPEC           tests: game audio from this window spec from the start
-//!   --no-desktop-audio, --no-mic, --no-cursor
+//!   --no-desktop-audio          no game or PC audio
+//!   --no-mic, --no-cursor
 //!   --no-output                 capture only: no audio, encoders or replay buffer
 //!   --paused                    build the replay buffer but do not start it (the app
 //!                               starts it with setRecording when it finds a game)
@@ -22,7 +27,8 @@
 //!   --rpc                       serve the app over JSON-RPC on stdin/stdout (see rpc.rs)
 //!   --clips-dir DIR, --screenshots-dir DIR  (default <work-dir>\clips and \screenshots)
 //!   --script "cmd; cmd; ..."    commands: wait N | save | screenshot | stats | beep N |
-//!                               capture <monitor[:N[:method]]|window:..|game[:..]> | quit
+//!                               capture <monitor[:N[:method]]|window:..|game[:..]> |
+//!                               mix <game|game-mic|pc-mic> | quit
 //!                               (without --script or --rpc, commands are read from stdin)
 //! Logs (libobs and the engine's own) always go to stderr.
 //!
@@ -48,8 +54,8 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use obs::{Obs, VideoConfig};
-use recorder::{AudioMode, Capture, GameInfo, Recorder, RecorderConfig};
+use obs::{Data, EncoderType, Obs, VideoConfig};
+use recorder::{AudioMix, Capture, GameInfo, Recorder, RecorderConfig, VideoChoice};
 use serde_json::{json, Value};
 
 /// Plugins required by the MVP specs. Frontend-only plugins of an OBS install must
@@ -66,11 +72,14 @@ struct Args {
     base: (u32, u32),
     out: Option<(u32, u32)>,
     fps: u32,
-    encoder: Option<String>,
+    encoder: String,
+    codec: String,
+    rate: String,
+    preset: String,
     bitrate: i64,
     buffer: i64,
     desktop_audio: bool,
-    audio: AudioMode,
+    mix: AudioMix,
     game_audio: Option<String>,
     mic: bool,
     cursor: bool,
@@ -223,11 +232,14 @@ fn parse_args() -> Result<Args, String> {
         base: (1920, 1080),
         out: None,
         fps: 60,
-        encoder: None,
+        encoder: "auto".into(),
+        codec: "h264".into(),
+        rate: "cbr".into(),
+        preset: "balanced".into(),
         bitrate: 20000,
         buffer: 30,
         desktop_audio: true,
-        audio: AudioMode::Game,
+        mix: AudioMix::GameMic,
         game_audio: None,
         mic: true,
         cursor: true,
@@ -250,16 +262,16 @@ fn parse_args() -> Result<Args, String> {
             "--base" => a.base = parse_size(&value()?)?,
             "--out" => a.out = Some(parse_size(&value()?)?),
             "--fps" => a.fps = value()?.parse().map_err(|_| "bad --fps")?,
-            "--encoder" => a.encoder = Some(value()?),
+            "--encoder" => a.encoder = value()?,
+            "--codec" => a.codec = one_of(value()?, &["h264", "hevc", "av1"], "--codec")?,
+            "--rate" => a.rate = one_of(value()?, &["cbr", "vbr"], "--rate")?,
+            "--preset" => a.preset = one_of(value()?, &["quality", "balanced", "performance"], "--preset")?,
             "--bitrate" => a.bitrate = value()?.parse().map_err(|_| "bad --bitrate")?,
             "--buffer" => a.buffer = value()?.parse().map_err(|_| "bad --buffer")?,
             "--no-desktop-audio" => a.desktop_audio = false,
-            "--audio" => {
-                a.audio = match value()?.as_str() {
-                    "game" => AudioMode::Game,
-                    "all" => AudioMode::All,
-                    other => return Err(format!("bad --audio {other}, expected game or all")),
-                }
+            "--mix" => {
+                let mix = value()?;
+                a.mix = AudioMix::parse(&mix).ok_or_else(|| format!("bad --mix {mix}, expected game, game-mic or pc-mic"))?;
             }
             "--game-audio" => a.game_audio = Some(value()?),
             "--no-mic" => a.mic = false,
@@ -305,6 +317,106 @@ fn main() {
     }
 }
 
+fn one_of(value: String, allowed: &[&str], flag: &str) -> Result<String, String> {
+    if allowed.contains(&value.as_str()) { Ok(value) } else { Err(format!("bad {flag} {value}, expected {}", allowed.join(" or "))) }
+}
+
+/// Video encoders in the order auto tries them (spec quality.encoding): the texture
+/// encoders of NVIDIA, AMD and Intel GPUs, which take the frames on the GPU, then
+/// NVENC's fallback that copies them, then the CPU. HEVC and AV1 come before H.264,
+/// which is the fallback for every codec.
+const H264_ENCODERS: &[&str] = &["obs_nvenc_h264_tex", "h264_texture_amf", "obs_qsv11_v2", "obs_nvenc_h264_soft", "obs_x264"];
+const HEVC_ENCODERS: &[&str] = &["obs_nvenc_hevc_tex", "h265_texture_amf", "obs_qsv11_hevc", "obs_nvenc_hevc_soft"];
+const AV1_ENCODERS: &[&str] = &["obs_nvenc_av1_tex", "av1_texture_amf", "obs_qsv11_av1", "obs_nvenc_av1_soft"];
+
+/// The encoder of a family (the choice the app offers) for a codec.
+fn family_encoder(family: &str, codec: &str) -> Option<&'static str> {
+    Some(match (family, codec) {
+        ("nvenc", "hevc") => "obs_nvenc_hevc_tex",
+        ("nvenc", "av1") => "obs_nvenc_av1_tex",
+        ("nvenc", _) => "obs_nvenc_h264_tex",
+        ("amf", "hevc") => "h265_texture_amf",
+        ("amf", "av1") => "av1_texture_amf",
+        ("amf", _) => "h264_texture_amf",
+        ("qsv", "hevc") => "obs_qsv11_hevc",
+        ("qsv", "av1") => "obs_qsv11_av1",
+        ("qsv", _) => "obs_qsv11_v2",
+        ("x264", _) => "obs_x264",
+        _ => return None,
+    })
+}
+
+/// The family of an encoder id, for the app.
+fn encoder_family(id: &str) -> &'static str {
+    if id.starts_with("obs_nvenc") {
+        "nvenc"
+    } else if id.ends_with("_amf") {
+        "amf"
+    } else if id.starts_with("obs_qsv") {
+        "qsv"
+    } else {
+        "x264"
+    }
+}
+
+/// The encoders to try: the one asked for (an id, or a family with the codec),
+/// then the codec's list, then H.264's, keeping only those OBS registered on this
+/// PC (it probes the GPUs at load).
+fn encoder_candidates(requested: &str, codec: &str, available: &[EncoderType]) -> Vec<String> {
+    let mut order: Vec<&str> = Vec::new();
+    match family_encoder(requested, codec) {
+        Some(id) => order.push(id),
+        None if requested != "auto" => order.push(requested),
+        None => {}
+    }
+    match codec {
+        "hevc" => order.extend(HEVC_ENCODERS),
+        "av1" => order.extend(AV1_ENCODERS),
+        _ => {}
+    }
+    order.extend(H264_ENCODERS);
+    let mut out: Vec<String> = Vec::new();
+    for id in order {
+        if available.iter().any(|e| e.video && e.id == id) && !out.iter().any(|o| o == id) {
+            out.push(id.to_string());
+        }
+    }
+    out
+}
+
+/// The encoders the app can offer, in the order auto tries them.
+fn video_encoder_list(available: &[EncoderType]) -> Value {
+    let known = H264_ENCODERS.iter().chain(HEVC_ENCODERS).chain(AV1_ENCODERS);
+    Value::Array(known.filter_map(|id| available.iter().find(|e| e.video && e.id == *id)).map(|e| json!({ "id": e.id, "family": encoder_family(&e.id), "codec": e.codec, "name": e.name })).collect())
+}
+
+/// Preset levels on each encoder's own list: NVENC, x264, AMF and QSV values.
+const PRESETS: [(&str, &[&str]); 3] = [
+    ("quality", &["p6", "faster", "quality", "TU2"]),
+    ("balanced", &["p5", "veryfast", "balanced", "TU4"]),
+    ("performance", &["p3", "superfast", "speed", "TU6"]),
+];
+
+/// Settings for a video encoder: the bitrate and the keyframe every second that all
+/// of them take, the rate control and the preset level as the encoder names them.
+fn video_settings(obs: &Obs, id: &str, args: &Args) -> Data {
+    let props = obs.encoder_list_properties(id);
+    let mut data = Data::new().int("bitrate", args.bitrate).int("keyint_sec", 1);
+    let rate = props.iter().find(|p| p.name == "rate_control").and_then(|p| p.items.iter().find(|(_, v)| v.eq_ignore_ascii_case(&args.rate))).map(|(_, v)| v.clone());
+    data = data.str("rate_control", &rate.unwrap_or_else(|| args.rate.to_uppercase()));
+    let wanted = PRESETS.iter().find(|(level, _)| *level == args.preset).map_or(&[][..], |(_, values)| *values);
+    for p in props.iter().filter(|p| matches!(p.name.as_str(), "preset" | "preset2" | "target_usage")) {
+        if let Some(value) = wanted.iter().find(|w| p.items.iter().any(|(_, v)| v.eq_ignore_ascii_case(w))) {
+            data = data.str(&p.name, value);
+        }
+    }
+    data
+}
+
+fn fallbacks_json(rec: &Recorder) -> Value {
+    Value::Array(rec.encoder_fallbacks().iter().map(|(id, error)| json!({ "encoder": id, "error": error })).collect())
+}
+
 fn run(args: Args) -> Result<(), String> {
     let config_dir = args.work_dir.join("obs-config");
     let clips_dir = args.clips_dir.clone().unwrap_or_else(|| args.work_dir.join("clips"));
@@ -319,7 +431,9 @@ fn run(args: Args) -> Result<(), String> {
     let obs_dll = module_path("obs.dll").map(|p| p.display().to_string()).unwrap_or_default();
     log!("[laurel] libobs {} ({obs_dll})", obs.version());
     obs.add_data_path(&args.obs_root.join("data/libobs"));
+    // Encoders need even dimensions (spec quality.encoding).
     let out = args.out.unwrap_or(args.base);
+    let out = (out.0.max(2) & !1, out.1.max(2) & !1);
     obs.reset_video(VideoConfig { base_width: args.base.0, base_height: args.base.1, output_width: out.0, output_height: out.1, fps: args.fps })?;
     obs.reset_audio(48000)?;
     for m in MODULES {
@@ -333,6 +447,10 @@ fn run(args: Args) -> Result<(), String> {
     if args.list {
         for e in encoders.iter().filter(|e| e.video) {
             log!("[laurel] video encoder {} ({}, {})", e.id, e.codec, e.name);
+            for p in obs.encoder_list_properties(&e.id) {
+                let items: Vec<String> = p.items.iter().map(|(label, value)| format!("{value}={label}")).collect();
+                log!("[laurel]   {} (default {}): {}", p.name, p.default, items.join(" | "));
+            }
         }
         for (label, id) in obs.source_list_property("monitor_capture", "monitor_id") {
             log!("[laurel] monitor {label} = {id}");
@@ -358,17 +476,16 @@ fn run(args: Args) -> Result<(), String> {
         return Ok(());
     }
 
-    let video_encoder = args.encoder.clone().unwrap_or_else(|| {
-        if encoders.iter().any(|e| e.id == "obs_nvenc_h264_tex") { "obs_nvenc_h264_tex".into() } else { "obs_x264".into() }
-    });
+    let choices = encoder_candidates(&args.encoder, &args.codec, &encoders);
+    log!("[laurel] video encoders to try: {}", choices.join(", "));
+    let video_choices = choices.iter().map(|id| VideoChoice { id: id.clone(), settings: video_settings(&obs, id, &args) }).collect();
     let cfg = RecorderConfig {
         capture: args.capture.clone(),
         cursor: args.cursor,
-        video_encoder: video_encoder.clone(),
         bitrate_kbps: args.bitrate,
         buffer_secs: args.buffer,
         desktop_audio: args.desktop_audio,
-        audio: args.audio,
+        mix: args.mix,
         game_audio: args.game_audio.clone(),
         mic: args.mic,
         clips_dir: clips_dir.clone(),
@@ -378,10 +495,10 @@ fn run(args: Args) -> Result<(), String> {
         start_paused: args.paused,
     };
     let started = Instant::now();
-    let mut rec = Recorder::start(&obs, &cfg)?;
+    let mut rec = Recorder::start(&obs, &cfg, video_choices)?;
     log!(
-        "[laurel] recording: capture={:?} base={}x{} out={}x{} fps={} encoder={} bitrate={}kbps buffer={}s audio={} mic={} record={} paused={}",
-        cfg.capture, args.base.0, args.base.1, out.0, out.1, args.fps, video_encoder, args.bitrate, args.buffer, if !args.desktop_audio { "off" } else if args.audio == AudioMode::All { "all" } else { "game" }, args.mic, args.record, args.paused
+        "[laurel] recording: capture={:?} base={}x{} out={}x{} fps={} encoder={} rate={} preset={} bitrate={}kbps buffer={}s game_audio={} mic={} mix={} record={} paused={}",
+        cfg.capture, args.base.0, args.base.1, out.0, out.1, args.fps, rec.encoder(), args.rate, args.preset, args.bitrate, args.buffer, args.desktop_audio, args.mic, rec.audio_mix().name(), args.record, args.paused
     );
 
     if args.rpc {
@@ -390,11 +507,17 @@ fn run(args: Args) -> Result<(), String> {
             "ready",
             json!({
                 "version": obs.version(),
-                "encoder": video_encoder,
+                "encoder": rec.encoder(),
+                "encoderRequested": args.encoder,
+                "codec": args.codec,
+                "encoderFallbacks": fallbacks_json(&rec),
+                "encoders": video_encoder_list(&encoders),
                 "target": args.capture_spec,
                 "output": [out.0, out.1],
+                "base": [args.base.0, args.base.1],
                 "fps": args.fps,
                 "bufferSecs": args.buffer,
+                "audioMix": rec.audio_mix().name(),
                 "recording": rec.active(),
                 "clipsDir": dirs.clips,
                 "screenshotsDir": dirs.screenshots,
@@ -441,6 +564,10 @@ fn run(args: Args) -> Result<(), String> {
                     Err(e) => log!("[laurel] capture switch failed: {e}"),
                 }
             }
+            Some("mix") => match AudioMix::parse(parts.next().unwrap_or_default()).ok_or("bad mix".to_string()).and_then(|m| rec.set_mix(m)) {
+                Ok(()) => log!("[laurel] mix switched at {:.1}s", started.elapsed().as_secs_f64()),
+                Err(e) => log!("[laurel] mix switch failed: {e}"),
+            },
             Some("stats") => log!("[laurel] stats after {:.1}s: {}", started.elapsed().as_secs_f64(), recorder::format_stats(&obs, &rec)),
             Some("quit") => break,
             Some(other) => log!("[laurel] unknown command {other}"),
@@ -478,9 +605,10 @@ fn serve_app(obs: &Obs, rec: &mut Recorder, args: &Args, dirs: &Dirs) {
                     "totalFrames": s.total_frames,
                     "outputDropped": rec.frames_dropped(),
                     "recording": rec.active(),
+                    "encoder": rec.encoder(),
                     "cursor": rec.cursor(),
                     "game": game_json(rec.game()),
-                    "audio": { "mode": if !args.desktop_audio { "off" } else if args.audio == AudioMode::All { "all" } else { "game" }, "follows": rec.game_audio() },
+                    "audio": { "mode": if args.desktop_audio { "game" } else { "off" }, "mix": rec.audio_mix().name(), "follows": rec.game_audio() },
                 }))
             }
             "listTargets" => {
@@ -528,16 +656,31 @@ fn serve_app(obs: &Obs, rec: &mut Recorder, args: &Args, dirs: &Dirs) {
                 rec.screenshot(&path, rec.output_size(), Duration::from_secs(5))
                     .map(|(w, h)| json!({ "path": path, "size": [w, h], "ms": t.elapsed().as_millis() as u64, "game": game_json(rec.game()) }))
             }
+            "listEncoders" => Ok(video_encoder_list(&obs.encoder_types())),
             "setCursor" => {
                 // Spec capture.cursor: applies to the running capture and the next ones.
                 let enabled = params.get("enabled").and_then(Value::as_bool).unwrap_or(true);
                 rec.set_cursor(enabled);
                 Ok(json!({ "cursor": rec.cursor() }))
             }
+            "setAudioMix" => {
+                // Spec audio.separate-tracks: track 1 changes without a restart.
+                let mix = params.get("mix").and_then(Value::as_str).unwrap_or_default();
+                match AudioMix::parse(mix) {
+                    Some(mix) => rec.set_mix(mix).map(|_| json!({ "mix": rec.audio_mix().name() })),
+                    None => Err(format!("bad mix {mix}, expected game, game-mic or pc-mic")),
+                }
+            }
             "setRecording" => {
                 // Pauses or resumes the replay buffer (low disk space, record.toggle).
                 let enabled = params.get("enabled").and_then(Value::as_bool).unwrap_or(true);
-                rec.set_recording(enabled).map(|_| json!({ "recording": rec.active() }))
+                let before = rec.encoder().to_string();
+                let result = rec.set_recording(enabled).map(|_| json!({ "recording": rec.active(), "encoder": rec.encoder() }));
+                if rec.encoder() != before {
+                    // A fallback while resuming (spec quality.encoding): the app tells the player.
+                    rpc::notify("encoder", json!({ "encoder": rec.encoder(), "encoderFallbacks": fallbacks_json(rec) }));
+                }
+                result
             }
             "shutdown" => return (Ok(Value::Null), rpc::Flow::Quit),
             other => Err(format!("method not found: {other}")),

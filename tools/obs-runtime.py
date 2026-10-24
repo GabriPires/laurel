@@ -122,6 +122,8 @@ later (gplv2.txt in this folder). Corresponding source code:
     in https://github.com/obsproject/obs-studio/releases/tag/{VERSION}
   Pre-built dependencies of this release (FFmpeg, x264, libcurl, librist, SRT, zlib):
     obs-deps {OBS_DEPS_VERSION}, https://github.com/obsproject/obs-deps/releases/tag/{OBS_DEPS_VERSION}
+Each Laurel release also carries all of this source, with the libraries obs-deps
+builds into these files, in Laurel-<version>-sources.zip (tools/gpl-sources.py).
 """
 
 
@@ -138,7 +140,8 @@ def read_manifest(dest: Path) -> dict[str, str]:
 
 
 def stamp() -> str:
-    return f"# OBS Studio {VERSION} {ZIP_SHA256}"
+    # The notice's hash too, so a staged runtime gets a changed notice.
+    return f"# OBS Studio {VERSION} {ZIP_SHA256} notice {hashlib.sha256(notice().encode()).hexdigest()[:12]}"
 
 
 def stage(dest: Path) -> None:

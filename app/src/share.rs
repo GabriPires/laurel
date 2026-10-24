@@ -115,9 +115,19 @@ pub fn show_in_folder(path: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Opens the file with its default app (the video player for clips).
+/// Opens the file with its default app (the video player for clips), or a folder in
+/// Explorer.
 pub fn open(path: &str) -> Result<(), String> {
-    let (op, file) = (wide("open"), wide(&windows_path(path)));
+    shell_open(&windows_path(path))
+}
+
+/// Opens a web address in the default browser.
+pub fn open_url(url: &str) -> Result<(), String> {
+    shell_open(url)
+}
+
+fn shell_open(target: &str) -> Result<(), String> {
+    let (op, file) = (wide("open"), wide(target));
     let code = unsafe { ShellExecuteW(0, op.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) };
     if code > 32 {
         Ok(())

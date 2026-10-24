@@ -6,6 +6,7 @@
 #   <out>\Laurel\LICENSE
 #   <out>\Laurel\engine\            OBS runtime staged by tools/obs-runtime.py
 #   <out>\Laurel\engine\bin\64bit\laurel-engine.exe
+#   <out>\Laurel\engine\bin\64bit\ffmpeg.exe  from tools/ffmpeg-build.py (trims, thumbnails)
 #
 # and a zip of it next to the folder, to copy to another PC.
 #
@@ -38,8 +39,9 @@ print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] =
 dest=$out/Laurel
 mkdir -p "$dest/engine/bin/64bit"
 python3 -I "$ROOT/tools/obs-runtime.py" stage "$dest/engine"
+python3 -I "$ROOT/tools/ffmpeg-build.py" stage "$dest/engine"
 cp "$release/laurel-engine.exe" "$dest/engine/bin/64bit/"
-cp "$release/laurel-app.exe" "$ROOT/LICENSE" "$dest/"
+cp "$release/laurel-app.exe" "$ROOT/LICENSE" "$ROOT/THIRD-PARTY-NOTICES.md" "$dest/"
 echo "[package] Laurel $version in $dest"
 
 if [ "$zip" = 1 ]; then

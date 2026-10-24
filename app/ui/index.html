@@ -48,11 +48,20 @@
 
       <section id="startup-banner" class="banner" hidden>
         <div>
-          <strong>Start Laurel with Windows?</strong>
-          <p>Laurel then waits in the tray, ready to record when you open a game.</p>
+          <strong id="banner-title">Start Laurel with Windows?</strong>
+          <p id="banner-text">Laurel then waits in the tray, ready to record when you open a game.</p>
         </div>
         <button id="banner-yes" class="btn btn-primary">Start with Windows</button>
         <button id="banner-no" class="btn btn-secondary">Not now</button>
+      </section>
+
+      <section id="update-banner" class="banner" hidden>
+        <div>
+          <strong id="update-title">A new version of Laurel is ready</strong>
+          <p id="update-text">Laurel closes, installs it and opens again in a moment.</p>
+        </div>
+        <button id="update-now" class="btn btn-primary">Install and restart</button>
+        <button id="update-later" class="btn btn-secondary">Later</button>
       </section>
 
       <!-- Library: the home screen -->
@@ -281,15 +290,87 @@
                 <div class="row-text"><label for="opt-cursor" class="row-name">Show the mouse cursor</label><span class="row-desc">Draw the cursor in clips and screenshots. Changes apply right away, also while a game is being recorded.</span></div>
                 <input type="checkbox" id="opt-cursor" class="switch" role="switch">
               </div>
+            </div>
+            <h2 class="group-label">Video</h2>
+            <div class="rows">
               <div class="row-item">
-                <div class="row-text"><span class="row-name">Clip length and video</span><span class="row-desc">What every clip holds.</span></div>
+                <div class="row-text"><span class="row-name">Recording now</span><span id="encoder-note" class="row-desc">What every clip holds.</span></div>
                 <span id="engine-detail" class="row-value">Waiting for the engine</span>
               </div>
+              <div class="row-item">
+                <div class="row-text"><label for="opt-clip-secs" class="row-name">Clip length</label><span class="row-desc">How much a clip keeps from before you press the shortcut.</span></div>
+                <select id="opt-clip-secs" class="row-select">
+                  <option value="15">15 seconds</option>
+                  <option value="30">30 seconds</option>
+                  <option value="45">45 seconds</option>
+                  <option value="60">1 minute</option>
+                  <option value="90">1.5 minutes</option>
+                  <option value="120">2 minutes</option>
+                  <option value="180">3 minutes</option>
+                  <option value="300">5 minutes</option>
+                </select>
+              </div>
+              <div class="row-item">
+                <div class="row-text"><label for="opt-video-height" class="row-name">Resolution</label><span class="row-desc">Lower resolutions keep the monitor's shape.</span></div>
+                <select id="opt-video-height" class="row-select"></select>
+              </div>
+              <div class="row-item">
+                <div class="row-text"><label for="opt-video-fps" class="row-name">Frame rate</label></div>
+                <select id="opt-video-fps" class="row-select">
+                  <option value="30">30 fps</option>
+                  <option value="60">60 fps</option>
+                  <option value="120">120 fps</option>
+                  <option value="144">144 fps</option>
+                  <option value="165">165 fps</option>
+                  <option value="240">240 fps</option>
+                </select>
+              </div>
+              <div class="row-item">
+                <div class="row-text"><label for="opt-video-encoder" class="row-name">Encoder</label><span class="row-desc">Auto uses your graphics card, or the processor when there is none. If one fails, Laurel moves to the next and tells you.</span></div>
+                <select id="opt-video-encoder" class="row-select"></select>
+              </div>
+              <div class="row-item">
+                <div class="row-text"><label for="opt-video-codec" class="row-name">Codec</label><span id="codec-desc" class="row-desc">H.264 plays everywhere. HEVC and AV1 make smaller files on recent cards; HEVC may need the HEVC Video Extensions to play.</span></div>
+                <select id="opt-video-codec" class="row-select">
+                  <option value="h264">H.264</option>
+                  <option value="hevc">HEVC (H.265)</option>
+                  <option value="av1">AV1</option>
+                </select>
+              </div>
+              <div class="row-item">
+                <div class="row-text"><label for="opt-video-preset" class="row-name">Quality</label><span class="row-desc">Performance uses less of the graphics card while you play.</span></div>
+                <select id="opt-video-preset" class="row-select">
+                  <option value="quality">Quality</option>
+                  <option value="balanced">Balanced</option>
+                  <option value="performance">Performance</option>
+                </select>
+              </div>
+              <div class="row-item">
+                <div class="row-text"><label for="opt-video-bitrate" class="row-name">Bitrate</label><span class="row-desc">20000 kbps suits 1440p at 60 fps; more for higher frame rates, less for 1080p.</span></div>
+                <span class="row-unit"><input id="opt-video-bitrate" type="number" min="1000" max="200000" step="1000" class="num wide"> kbps</span>
+                <select id="opt-video-rate" aria-label="Bitrate mode" class="row-select narrow">
+                  <option value="cbr">Constant</option>
+                  <option value="vbr">Variable</option>
+                </select>
+              </div>
             </div>
+            <p class="group-desc">Video changes restart the recording engine for a moment.</p>
+            <h2 class="group-label">Audio</h2>
+            <div class="rows">
+              <div class="row-item">
+                <div class="row-text"><label for="opt-audio-mix" class="row-name">Clip sound</label><span id="audio-mix-desc" class="row-desc"></span></div>
+                <select id="opt-audio-mix" class="row-select">
+                  <option value="game">Game only</option>
+                  <option value="game-mic">Game and microphone</option>
+                  <option value="pc-mic">All PC sound and microphone</option>
+                </select>
+              </div>
+            </div>
+            <p class="group-desc">Clips also keep the game and your microphone on separate tracks, for video editors. Changes apply to the next clips.</p>
             <h2 class="group-label">Screen recording</h2>
             <div class="rows">
               <div class="row-item">
-                <div class="row-text"><label for="opt-screen" class="row-name">Record the screen when no game is open</label><span class="row-desc">Off by default: Laurel records games. Turn this on to keep the last seconds of your screen too. Screen clips have your microphone but not the PC's sound.</span></div>
+                <div class="row-text"><label for="opt-screen" class="row-name">Record the screen when no game is open</label><span class="row-desc">Off by default: Laurel records games. Turn this on to keep the last seconds of your screen too. Screen clips have the PC's sound only with All PC sound and microphone, in Audio.</span></div>
                 <input type="checkbox" id="opt-screen" class="switch" role="switch">
               </div>
               <div class="row-item screen-option">
@@ -447,6 +528,10 @@
                 <span id="capture-state" class="capture-state">Waiting for a game</span>
                 <button id="restart" class="btn btn-secondary" hidden>Restart engine</button>
               </div>
+              <div class="row-item">
+                <div class="row-text"><span class="row-name">Logs</span><span class="row-desc">What Laurel and its recording engine wrote down. Send the .log files with a bug report; the .old.log ones hold the previous session.</span></div>
+                <button id="open-logs" class="btn btn-secondary">Open logs folder</button>
+              </div>
             </div>
             <h2 class="group-label">Pipeline</h2>
             <dl class="stats rows">
@@ -469,20 +554,44 @@
             </div>
             <div class="rows">
               <div class="row-item">
-                <div class="row-text"><span class="row-name">Laurel</span><span class="row-desc">Free software under the GNU GPL, version 2 or later.</span></div>
+                <div class="row-text"><span class="row-name">Laurel</span><span class="row-desc">Copyright © 2026 the Laurel contributors. Laurel is free software: you can share and change it under the GNU General Public License, version 2 or any later version. It comes with no warranty, to the extent permitted by law.</span></div>
                 <span id="about-version" class="row-value mono-value"></span>
+              </div>
+              <div class="row-item">
+                <div class="row-text"><span class="row-name">Source code</span><span class="row-desc">Laurel's code and how it is built. Each release also carries the source of the OBS and FFmpeg parts.</span></div>
+                <button id="about-source" class="btn btn-secondary">Open on GitHub</button>
               </div>
               <div class="row-item">
                 <div class="row-text"><span class="row-name">Recording engine</span><span class="row-desc">libobs from OBS Studio, GPL 2.0 or later.</span></div>
                 <span id="about-libobs" class="row-value mono-value"></span>
               </div>
               <div class="row-item">
-                <div class="row-text"><span class="row-name">Trim and thumbnails</span><span class="row-desc">FFmpeg.</span></div>
+                <div class="row-text"><span class="row-name">Trim and thumbnails</span><span class="row-desc">FFmpeg 7.1.1, GPL 3.0 or later.</span></div>
               </div>
               <div class="row-item">
                 <div class="row-text"><span class="row-name">Fonts</span><span class="row-desc">Cinzel, Figtree and JetBrains Mono, under the SIL Open Font License.</span></div>
               </div>
             </div>
+            <h2 class="group-label">Updates</h2>
+            <div class="rows">
+              <div class="row-item">
+                <div class="row-text"><label for="opt-updates" class="row-name">Check for updates</label><span class="row-desc">A little after it starts, Laurel asks GitHub whether a new version exists. That is the only thing it looks up on the internet; nothing about you or your clips is sent.</span></div>
+                <input type="checkbox" id="opt-updates" class="switch" role="switch">
+              </div>
+              <div class="row-item">
+                <div class="row-text"><span class="row-name">New version</span><span id="update-status" class="row-desc" role="status">Not checked yet.</span></div>
+                <button id="update-check" class="btn btn-secondary">Check now</button>
+                <button id="update-install" class="btn btn-primary" hidden>Install and restart</button>
+              </div>
+            </div>
+            <h2 class="group-label">Licenses</h2>
+            <div class="rows">
+              <div class="row-item">
+                <div class="row-text"><label for="license-doc" class="row-name">Document</label><span class="row-desc">The licenses of Laurel and of the software it carries.</span></div>
+                <select id="license-doc" class="row-select"></select>
+              </div>
+            </div>
+            <pre id="license-text" class="license-text" tabindex="0" aria-label="License text"></pre>
           </section>
         </main>
       </div>

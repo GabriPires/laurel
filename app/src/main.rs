@@ -24,9 +24,10 @@ mod share;
 mod sound;
 mod storage;
 mod tray_icons;
+mod updates;
 mod win;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -166,15 +167,20 @@ fn on_hotkey(app: &AppHandle, event: hotkeys::Event) {
     }
 }
 
-fn engine_config(work_dir: PathBuf, storage: Arc<Storage>, detector: Arc<Detector>, store: Arc<Store>) -> EngineConfig {
+/// laurel-engine.exe: LAUREL_ENGINE, else the bin\64bit folder of its OBS runtime
+/// (tools/obs-runtime.py), bundled next to the app or in the development layout.
+fn engine_exe() -> PathBuf {
     let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from)).unwrap_or_default();
-    // The engine runs from the bin\64bit folder of its OBS runtime (tools/obs-runtime.py).
     let engine_in = |runtime: PathBuf| runtime.join("bin").join("64bit").join("laurel-engine.exe");
-    let exe = std::env::var_os("LAUREL_ENGINE").map(PathBuf::from).unwrap_or_else(|| {
+    std::env::var_os("LAUREL_ENGINE").map(PathBuf::from).unwrap_or_else(|| {
         let bundled = engine_in(exe_dir.join("engine"));
         // Development layout: laurel-dev\laurel-app next to laurel-dev\laurel-engine.
         if bundled.exists() { bundled } else { engine_in(exe_dir.join("..").join("laurel-engine")) }
-    });
+    })
+}
+
+fn engine_config(work_dir: PathBuf, storage: Arc<Storage>, detector: Arc<Detector>, store: Arc<Store>) -> EngineConfig {
+    let exe = engine_exe();
     let (w, h) = win::primary_monitor_size();
     let options = move || {
         let (clips, shots) = (storage.clips_dir(), storage.screenshots_dir());
@@ -183,6 +189,30 @@ fn engine_config(work_dir: PathBuf, storage: Arc<Storage>, detector: Arc<Detecto
             options.push("--no-cursor".into());
         }
         options.extend(["--base".into(), format!("{w}x{h}"), "--clips-dir".into(), clips.display().to_string(), "--screenshots-dir".into(), shots.display().to_string()]);
+        // Video and clip length (spec quality.encoding): a lower height keeps the
+        // monitor's aspect; the engine makes both sides even.
+        let s = store.get();
+        options.extend([
+            "--encoder".into(),
+            s.video_encoder.clone(),
+            "--codec".into(),
+            s.video_codec.clone(),
+            "--rate".into(),
+            s.video_rate.clone(),
+            "--preset".into(),
+            s.video_preset.clone(),
+            "--bitrate".into(),
+            s.video_bitrate.to_string(),
+            "--fps".into(),
+            s.video_fps.to_string(),
+            "--buffer".into(),
+            s.clip_secs.to_string(),
+            "--mix".into(),
+            s.audio_mix.clone(),
+        ]);
+        if s.video_height > 0 && s.video_height < h {
+            options.extend(["--out".into(), format!("{}x{}", w * s.video_height / h, s.video_height)]);
+        }
         options
     };
     EngineConfig { exe, work_dir, options: Box::new(options) }
@@ -324,11 +354,23 @@ fn watch_disk(app: AppHandle) {
 fn watch_engine_state(app: &AppHandle) {
     let handle = app.clone();
     let previous = Mutex::new(String::new());
+    let previous_encoder = Mutex::new(String::new());
     app.listen("engine-state", move |event| {
         let state: Value = serde_json::from_str(event.payload()).unwrap_or_default();
         let now = state["state"].as_str().unwrap_or_default().to_string();
         let mut previous = previous.lock().unwrap();
         let notifier = handle.state::<Notifier>();
+        // Spec quality.encoding: the player hears about an encoder that could not start.
+        if now == "ready" {
+            let info = &state["info"];
+            let encoder = info["encoder"].as_str().unwrap_or_default().to_string();
+            let mut previous_encoder = previous_encoder.lock().unwrap();
+            let fallbacks = info["encoderFallbacks"].as_array().map_or(0, Vec::len);
+            if fallbacks > 0 && (*previous != "ready" || *previous_encoder != encoder) {
+                notifier.notify(Kind::Error, "Video encoder changed", &format!("Recording with {}", encoder_name(info, &encoder)));
+            }
+            *previous_encoder = encoder;
+        }
         if now == "ready" && *previous != "ready" {
             let detector = handle.state::<Arc<Detector>>().inner().clone();
             // Off the event thread: the detector waits for engine replies.
@@ -337,7 +379,7 @@ fn watch_engine_state(app: &AppHandle) {
                 let secs = state["info"]["bufferSecs"].as_u64().unwrap_or_default();
                 notifier.notify(Kind::Info, "Recording", &format!("Laurel keeps the last {secs} s"));
             }
-        } else if *previous == "ready" && now != "ready" && state["closing"] != true {
+        } else if *previous == "ready" && now != "ready" && state["closing"] != true && state["restart"] != true {
             notifier.notify(Kind::Error, "Recording stopped", state["message"].as_str().unwrap_or("The engine stopped"));
         }
         *previous = now;
@@ -405,6 +447,11 @@ fn get_settings(app: AppHandle) -> Value {
     v
 }
 
+/// The display name of an encoder id, from the engine's list.
+fn encoder_name(info: &Value, id: &str) -> String {
+    info["encoders"].as_array().into_iter().flatten().find(|e| e["id"] == id).and_then(|e| e["name"].as_str()).unwrap_or(id).to_string()
+}
+
 /// Saves the settings; the capture folder is changed only through `change_folder`.
 #[tauri::command]
 fn set_settings(app: AppHandle, settings: Value) -> Result<Value, String> {
@@ -413,6 +460,7 @@ fn set_settings(app: AppHandle, settings: Value) -> Result<Value, String> {
     // The folder, the game lists, the hotkeys and recording on/off change only through
     // their own commands.
     let current = store.get();
+    let video_changed = new.video_differs(&current);
     new.folder = current.folder;
     new.custom_games = current.custom_games;
     new.ignored_games = current.ignored_games;
@@ -421,6 +469,7 @@ fn set_settings(app: AppHandle, settings: Value) -> Result<Value, String> {
     new.hotkey_toggle = current.hotkey_toggle;
     new.recording_enabled = current.recording_enabled;
     let cursor_changed = new.show_cursor != current.show_cursor;
+    let mix_changed = new.audio_mix != current.audio_mix;
     let screen = detect::screen_of(&new);
     store.set(new.clone()).map_err(|e| e.to_string())?;
     log!("settings: {}", new.to_json());
@@ -430,6 +479,17 @@ fn set_settings(app: AppHandle, settings: Value) -> Result<Value, String> {
         if let Err(e) = app.state::<Engine>().request("setCursor", json!({ "enabled": new.show_cursor }), SHOT_TIMEOUT) {
             log!("setCursor failed: {e}");
         }
+    }
+    if mix_changed && !video_changed {
+        // Spec audio.separate-tracks: track 1 changes without a restart; a restarted engine gets --mix.
+        if let Err(e) = app.state::<Engine>().request("setAudioMix", json!({ "mix": new.audio_mix }), SHOT_TIMEOUT) {
+            log!("setAudioMix failed: {e}");
+        }
+    }
+    if video_changed {
+        // Spec quality.encoding: the engine takes the video settings when it starts.
+        log!("settings: video changed, restarting the engine");
+        app.state::<Engine>().restart();
     }
     let removed = app.state::<Arc<Storage>>().enforce_limit(&app.state::<Arc<Library>>());
     if !removed.is_empty() {
@@ -644,11 +704,12 @@ fn library_keep(app: AppHandle, path: String, kept: bool) -> Result<Value, Strin
 
 /// Shows a sample notice of the given kind, with its sound.
 #[tauri::command]
-fn preview_notice(notifier: tauri::State<'_, Notifier>, kind: String) {
+fn preview_notice(app: AppHandle, kind: String) {
+    let notifier = app.state::<Notifier>();
     match kind.as_str() {
         "screenshot" => notifier.notify(Kind::Screenshot, "Screenshot saved", "Saved to your screenshots"),
         "error" => notifier.notify(Kind::Error, "Clip not saved", "Disk almost full: free up space to keep recording"),
-        _ => notifier.notify(Kind::Clip, "Clip saved", "Last 30 s"),
+        _ => notifier.notify(Kind::Clip, "Clip saved", &format!("Last {} s", app.state::<Arc<Store>>().get().clip_secs)),
     }
 }
 
@@ -717,6 +778,56 @@ fn share_action(action: String, path: String) -> Result<(), String> {
         "open" => share::open(&path),
         other => Err(format!("unknown action {other}")),
     }
+}
+
+/// Where Laurel's source code is published, with each release's GPL sources.
+const SOURCE_URL: &str = "https://github.com/GabriPires/laurel";
+
+/// The license texts the About page shows (the GPL's appropriate legal notices):
+/// Laurel's license and the third-party notices built into the app, then the notices
+/// that tools/obs-runtime.py and tools/ffmpeg-build.py stage in the runtime's licenses
+/// folder, next to the engine.
+#[tauri::command]
+fn licenses() -> Value {
+    let mut docs = vec![
+        json!({ "title": "Laurel: GNU GPL, version 2", "text": include_str!("../../LICENSE") }),
+        json!({ "title": "Third-party notices", "text": include_str!("../../THIRD-PARTY-NOTICES.md") }),
+    ];
+    let engine = engine_exe();
+    let folder = engine.parent().and_then(Path::parent).and_then(Path::parent).map(|runtime| runtime.join("licenses"));
+    for (file, title) in [("OBS-RUNTIME.txt", "OBS Studio runtime"), ("FFMPEG.txt", "FFmpeg"), ("gplv3.txt", "GNU GPL, version 3")] {
+        if let Some(text) = folder.as_ref().and_then(|f| std::fs::read_to_string(f.join(file)).ok()) {
+            docs.push(json!({ "title": title, "text": text }));
+        }
+    }
+    Value::Array(docs)
+}
+
+#[tauri::command]
+fn open_source_page() -> Result<(), String> {
+    share::open_url(SOURCE_URL)
+}
+
+/// Whether this build can update itself, and its version.
+#[tauri::command]
+fn update_info(app: AppHandle) -> Value {
+    json!({ "configured": updates::configured(&app), "current": app.package_info().version.to_string() })
+}
+
+#[tauri::command]
+async fn update_check(app: AppHandle) -> Result<Value, String> {
+    updates::check(&app).await
+}
+
+#[tauri::command]
+async fn update_install(app: AppHandle) -> Result<(), String> {
+    updates::install(&app).await
+}
+
+/// Opens the logs folder, for bug reports.
+#[tauri::command]
+fn open_logs() -> Result<(), String> {
+    share::open(&log::dir().ok_or("the logs folder is not set")?.display().to_string())
 }
 
 /// The view the main window opens in (development: LAUREL_START_VIEW).
@@ -859,12 +970,15 @@ fn selftest(app: AppHandle) {
     let _ = notifier.set_settings(Settings { overlay: true, sounds: false, ..user_settings.clone() });
     let run = || -> Result<(), String> {
         wait_ready("at start")?;
+        check_log_rotation()?;
         std::thread::sleep(Duration::from_secs(8)); // let the "Recording" notice expire
         let first = clip()?;
         check_library(&app, &first)?;
         check_storage(&app, &engine)?;
         check_overlay(&engine, &notifier)?;
         log!("[selftest] screenshot ok: {}", engine.request("screenshot", Value::Null, SHOT_TIMEOUT)?);
+        check_video(&app, &engine, &wait_ready)?;
+        check_audio(&app, &engine)?;
         log!("[selftest] targets: {}", engine.request("listTargets", Value::Null, SHOT_TIMEOUT)?);
         log!("[selftest] status: {}", engine.request("status", Value::Null, SHOT_TIMEOUT)?);
         log!("[selftest] killing the engine");
@@ -1148,6 +1262,32 @@ fn check_toggle_and_cursor(app: &AppHandle, engine: &Engine) -> Result<(), Strin
     outcome
 }
 
+/// Self-test of the log rotation: a log over its limit moves to `.old.log` and starts
+/// again, so it stays within twice the limit, and a fresh open keeps the previous one.
+fn check_log_rotation() -> Result<(), String> {
+    let dir = std::env::temp_dir().join("laurel-selftest-logs");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("test.log");
+    let mut log = log::Rotating::open(&path, false, 10_000);
+    for i in 0..300 {
+        log.line(&format!("{i:04} {}", "x".repeat(94)));
+    }
+    drop(log);
+    let size = |p: &std::path::Path| std::fs::metadata(p).map_or(0, |m| m.len());
+    let (current, old) = (size(&path), size(&log::Rotating::old_path(&path)));
+    let last = std::fs::read_to_string(&path).unwrap_or_default().lines().last().unwrap_or_default().chars().take(4).collect::<String>();
+    let reopened = log::Rotating::open(&path, true, 10_000);
+    drop(reopened);
+    let (fresh, kept) = (size(&path), size(&log::Rotating::old_path(&path)));
+    let _ = std::fs::remove_dir_all(&dir);
+    log!("[selftest] log rotation: 30000 bytes written with a 10000-byte limit left {current} + {old} old, last line {last}; a fresh open left {fresh} and kept {kept}");
+    if current > 10_100 || old == 0 || old > 10_100 || last != "0299" || fresh != 0 || kept != current {
+        return Err("the log rotation did not behave".into());
+    }
+    Ok(())
+}
+
 /// The file name of a path written with either kind of slash.
 fn fileish_name(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().unwrap_or(path)
@@ -1230,6 +1370,85 @@ fn check_library(app: &AppHandle, saved: &Value) -> Result<(), String> {
     let listed = library.list(Some("clip"), Some("Laurel self-test"))?;
     log!("[selftest] library lists {} self-test clips", listed.len());
     Ok(())
+}
+
+/// Self-test of the video settings (spec quality.encoding): the engine lists the
+/// encoders it can use and records with one; the processor encoder at 720p, 30 fps
+/// and 15 s, set in the settings, reaches the engine after a restart, with the
+/// all-PC clip sound (audio.separate-tracks); then the player's settings come back.
+fn check_video(app: &AppHandle, engine: &Engine, wait_ready: &dyn Fn(&str) -> Result<(), String>) -> Result<(), String> {
+    let list = engine.request("listEncoders", Value::Null, SHOT_TIMEOUT)?;
+    let ids: Vec<&str> = list.as_array().into_iter().flatten().filter_map(|e| e["id"].as_str()).collect();
+    let info = engine.state()["info"].clone();
+    log!("[selftest] encoders: {ids:?}; recording with {} (fallbacks {})", info["encoder"], info["encoderFallbacks"]);
+    if !ids.contains(&"obs_x264") || !ids.iter().any(|id| info["encoder"] == *id) {
+        return Err(format!("unexpected encoders: {ids:?}, in use {}", info["encoder"]));
+    }
+    let store = app.state::<Arc<Store>>();
+    let original = store.get();
+    let original_mix = original.audio_mix.clone();
+    let test = Settings { video_encoder: "x264".into(), video_preset: "performance".into(), video_height: 720, video_fps: 30, clip_secs: 15, audio_mix: "pc-mic".into(), ..original.clone() };
+    // A restart is asynchronous: the old engine may still read as ready for a moment,
+    // so wait for it to go before waiting for the new one.
+    let restart = |what: &str| -> Result<(), String> {
+        engine.restart();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine.state()["state"] == "ready" && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        wait_ready(what)
+    };
+    store.set(test).map_err(|e| e.to_string())?;
+    let result = restart("after the video change").map(|_| engine.state()["info"].clone());
+    store.set(original).map_err(|e| e.to_string())?;
+    restart("after restoring the video")?;
+    let changed = result?;
+    let restored = engine.state()["info"].clone();
+    log!(
+        "[selftest] video settings: encoder {}, output {}, fps {}, buffer {} s, clip sound {}; restored: {}, clip sound {}",
+        changed["encoder"], changed["output"], changed["fps"], changed["bufferSecs"], changed["audioMix"], restored["encoder"], restored["audioMix"]
+    );
+    if changed["encoder"] != "obs_x264" || changed["output"][1] != 720 || changed["fps"] != 30 || changed["bufferSecs"] != 15 || changed["audioMix"] != "pc-mic" {
+        return Err("the video settings did not reach the engine".into());
+    }
+    if restored["audioMix"] != original_mix.as_str() {
+        return Err(format!("the clip sound was not restored: {}", restored["audioMix"]));
+    }
+    Ok(())
+}
+
+/// Self-test of the clip sound (spec audio.separate-tracks, D12 revised): the mix
+/// changes in the running engine, without a restart; a clip saved with all PC sound
+/// keeps its three tracks; a bad mix is refused; then the player's mix comes back.
+fn check_audio(app: &AppHandle, engine: &Engine) -> Result<(), String> {
+    let original = app.state::<Arc<Store>>().get().audio_mix;
+    let set = |mix: &str| engine.request("setAudioMix", json!({ "mix": mix }), SHOT_TIMEOUT);
+    let outcome = (|| -> Result<(), String> {
+        let frames = engine.request("status", Value::Null, SHOT_TIMEOUT)?["totalFrames"].as_u64().unwrap_or_default();
+        let pc = set("pc-mic")?;
+        let status = engine.request("status", Value::Null, SHOT_TIMEOUT)?;
+        std::thread::sleep(Duration::from_secs(3));
+        let saved = engine.request("saveClip", Value::Null, CLIP_TIMEOUT)?;
+        let path = saved["path"].as_str().ok_or("saveClip without path")?;
+        let tracks = mp4::probe(std::path::Path::new(path))?.audio_tracks;
+        let after = engine.request("status", Value::Null, SHOT_TIMEOUT)?["totalFrames"].as_u64().unwrap_or_default();
+        let game = set("game")?;
+        let bad = set("loud");
+        log!(
+            "[selftest] clip sound: {} (status {}), clip {path} with {tracks} audio tracks; then {}; bad mix refused: {:?}; frames {frames} -> {after}",
+            pc["mix"], status["audio"]["mix"], game["mix"], bad.as_ref().err()
+        );
+        if pc["mix"] != "pc-mic" || status["audio"]["mix"] != "pc-mic" || tracks != 3 || game["mix"] != "game" || bad.is_ok() {
+            return Err("the clip sound did not change in the engine".into());
+        }
+        if after <= frames {
+            return Err("the engine stopped while the clip sound changed".into());
+        }
+        Ok(())
+    })();
+    let restored = set(&original);
+    log!("[selftest] clip sound restored: {restored:?}");
+    outcome.and(restored.map(|_| ()))
 }
 
 /// Self-test of storage: an unwritable folder is refused; the size limit removes
@@ -1379,6 +1598,8 @@ fn main() {
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(updates::Pending::default())
         // Tauri's own Raw Input registration would replace the hotkeys' one (one
         // registration per device type and process); the app needs no device events.
         .device_event_filter(tauri::DeviceEventFilter::Always)
@@ -1414,6 +1635,12 @@ fn main() {
             games_remove,
             games_set_ignored,
             share_action,
+            licenses,
+            open_source_page,
+            open_logs,
+            update_info,
+            update_check,
+            update_install,
             start_view,
             save_clip_now,
             screenshot_now
@@ -1450,7 +1677,7 @@ fn main() {
             app.manage(storage.clone());
             app.manage(Notifier::new(app.handle().clone(), store.clone()));
             watch_engine_state(app.handle());
-            let ffmpeg = media::find_ffmpeg();
+            let ffmpeg = media::find_ffmpeg(&engine_exe());
             log!("ffmpeg: {}", ffmpeg.as_ref().map_or("not found".into(), |p| p.display().to_string()));
             // The self-test keeps its own library index: scanning its temporary folder
             // would otherwise drop the player's items, with their games and Keep marks.
@@ -1499,6 +1726,9 @@ fn main() {
             if selftest_mode {
                 let handle = app.handle().clone();
                 std::thread::spawn(move || selftest(handle));
+            } else {
+                // The self-test makes no network request.
+                updates::check_after_start(app.handle());
             }
             Ok(())
         })

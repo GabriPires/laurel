@@ -1,0 +1,26 @@
+{
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "Laurel",
+    "copyright": "Laurel contributors, GNU GPL version 2 or later",
+    "category": "Video",
+    "shortDescription": "Game clip recorder",
+    "longDescription": "Laurel keeps the last seconds of the game you are playing and saves them as a clip when you press a hotkey.",
+    "resources": {
+      "../target/laurel-installer/engine/": "engine/",
+      "../LICENSE": "LICENSE",
+      "../THIRD-PARTY-NOTICES.md": "THIRD-PARTY-NOTICES.md"
+    },
+    "windows": {
+      "webviewInstallMode": { "type": "embedBootstrapper", "silent": true },
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "installerHooks": "installer/hooks.nsh",
+        "languages": ["English"],
+        "compression": "lzma"
+      }
+    }
+  }
+}

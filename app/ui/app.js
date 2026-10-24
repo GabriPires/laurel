@@ -85,12 +85,8 @@ async function showMaximized() {
 appWindow.onResized(showMaximized);
 showMaximized();
 
-const ENCODERS = {
-  obs_nvenc_h264_tex: 'NVIDIA NVENC H.264',
-  obs_nvenc_hevc_tex: 'NVIDIA NVENC HEVC',
-  obs_nvenc_av1_tex: 'NVIDIA NVENC AV1',
-  obs_x264: 'x264 (CPU)',
-};
+// An encoder's display name, from the engine's list.
+const encoderName = (info, id) => info.encoders?.find((e) => e.id === id)?.name ?? id;
 
 let engineState = { state: 'starting' };
 let pausedForDisk = false;
@@ -148,9 +144,16 @@ function showState(s) {
   $('restart').hidden = s.state !== 'failed';
   if (s.state === 'ready') {
     engineInfo = s.info;
-    $('engine-detail').textContent = `Last ${s.info.bufferSecs} s · ${s.info.output.join('x')} · ${s.info.fps} fps`;
+    const name = encoderName(s.info, s.info.encoder);
+    $('engine-detail').textContent = `${name} · ${s.info.output.join('x')} · ${s.info.fps} fps · last ${s.info.bufferSecs} s`;
+    // Spec quality.encoding: an encoder that could not start is shown with why.
+    const failed = s.info.encoderFallbacks ?? [];
+    $('encoder-note').textContent = failed.length
+      ? `${encoderName(s.info, failed[0].encoder)} could not start (${failed[0].error}), so Laurel records with ${name}.`
+      : 'What every clip holds.';
+    $('encoder-note').classList.toggle('warn', failed.length > 0);
     $('s-buffer').textContent = `${s.info.bufferSecs} s`;
-    $('s-encoder').textContent = ENCODERS[s.info.encoder] ?? s.info.encoder;
+    $('s-encoder').textContent = name;
     showEngineInfo();
   } else {
     $('engine-detail').textContent = s.message ?? 'Waiting for the engine';

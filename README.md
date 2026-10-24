@@ -4,7 +4,7 @@
 
 Laurel keeps the last seconds of the game you are playing and saves them as a clip when you press a hotkey. It finds your games on its own, records their sound apart from your microphone, and keeps everything on your PC, in a library where you trim, keep and share your clips.
 
-> **Status: in development.** Laurel works day to day on its developer's PC, but there is no release or installer yet. The next stage adds the encoders for every GPU, the choice of the default audio track, how FFmpeg ships, and the installer. Windows, 64-bit only for now.
+> **Status: release candidate.** Laurel 0.1.0-rc.1 is a pre-release for a test with friends: an installer for Windows 10 (2004 or later) and 11, 64-bit, that updates itself. It is not signed yet, so Windows SmartScreen warns before it runs. The test guide, in Portuguese, is in [`docs/teste-dos-amigos.md`](docs/teste-dos-amigos.md).
 
 *Resumo em português mais abaixo.*
 
@@ -31,7 +31,7 @@ Laurel never uses an installed OBS Studio: `tools/obs-runtime.py` stages its own
 
 ## Building
 
-Laurel is cross-compiled for Windows (MSVC) from WSL. You need Rust with the `x86_64-pc-windows-msvc` target, `cargo-xwin`, `clang`/`lld`/`llvm`, Python 3 and Node.
+Laurel is cross-compiled for Windows (MSVC) from WSL. You need Rust with the `x86_64-pc-windows-msvc` target, `cargo-xwin`, `clang`/`lld`/`llvm`, `make` and `gcc` (for FFmpeg's `configure`), Python 3 and Node.
 
 ```bash
 rustup target add x86_64-pc-windows-msvc
@@ -45,9 +45,18 @@ tools/winrun.sh app
 
 # The self-contained Laurel folder and a zip of it
 tools/package.sh
+
+# The Windows installer (NSIS), and its test on a clean Windows in Windows Sandbox
+cargo install tauri-cli --version "^2" --locked
+tools/installer.sh
+tools/sandboxtest.sh
 ```
 
-`tools/winrun.sh` builds, copies the result to `%USERPROFILE%\laurel-dev\` and runs it on Windows. Trims and thumbnails need `ffmpeg.exe` and `ffprobe.exe`, either in `laurel-dev\tools\ffmpeg\` or at the path in `LAUREL_FFMPEG`. `tools/winrun.sh app -- --selftest` runs the app's scripted self-test (it types F13, F14 and F16 into the focused window, so run it when you are not playing).
+`tools/winrun.sh` builds, copies the result to `%USERPROFILE%\laurel-dev\` and runs it on Windows. Trims and thumbnails use a small `ffmpeg.exe` (about 0.3 MB) that `tools/ffmpeg-build.py` builds from the official FFmpeg 7.1.1 release, checked against a pinned SHA-256, and links to the FFmpeg libraries already in the OBS runtime; `tools/winrun.sh engine --obs` and `tools/package.sh` put it next to the engine (`LAUREL_FFMPEG` points the app to another one). `tools/winrun.sh app -- --selftest` runs the app's scripted self-test (it types F13, F14 and F16 into the focused window, so run it when you are not playing).
+
+`tools/installer.sh` builds `Laurel_<version>_x64-setup.exe` with Tauri's NSIS bundler. It installs Laurel for the current user in `%LOCALAPPDATA%\Laurel`, without administrator rights, turns on start with Windows on a fresh install (the app confirms it on its first run), and installs Microsoft's Visual C++ Runtime only when it is missing (that step asks for administrator rights). The uninstaller removes Laurel, its start entry and, when no OBS Studio is installed, the game capture hook it shares with OBS; clips are never removed, and the app's data only when you tick the box. Without `makensis` on the PATH, the script unpacks Ubuntu's `nsis` packages into its cache, without root.
+
+Laurel updates itself through the Tauri updater: a little after it starts (unless turned off in Settings, About), it asks the public repository's update channel whether a new version exists, and installs it only when you click Install and restart. Packages must carry the project's signature, with the version signed in. `tools/sign-release.sh` signs an installer with the project's private key (it asks for the key's password) and writes the channel's `latest.json`.
 
 ## How the project works
 
@@ -58,7 +67,7 @@ tools/package.sh
 
 ## Roadmap
 
-1. **Now (Phase 4, MVP):** stage 6, with encoders for NVIDIA, AMD, Intel and the CPU, the default audio track (game only; game and microphone; all PC sound and microphone), FFmpeg, and an installer with a clean uninstall. Then a test with friends.
+1. **Now (Phase 4, MVP):** stage 6, with encoders for NVIDIA, AMD, Intel and the CPU, the default audio track (game only; game and microphone; all PC sound and microphone), a small FFmpeg, and an installer with a clean uninstall. Then a test with friends.
 2. **Phase 5, parity:** the features of the reference app that fit Laurel, starting with a vertical (TikTok-style) export.
 3. **Phase 6:** first release and community.
 

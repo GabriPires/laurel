@@ -1,5 +1,6 @@
-//! Recording pipeline for PoC-E1: one capture source, desktop and microphone audio
-//! on separate tracks, one video encoder and a libobs replay buffer.
+//! Recording pipeline for PoC-E1: one capture source, game and microphone audio
+//! on separate tracks plus the mix the user chose, one video encoder and a libobs
+//! replay buffer.
 //!
 //! Specs: capture.*, record.replay-buffer, record.buffer-storage, record.screenshots,
 //! quality.encoding, quality.container, audio.* (wiki/specs/).
@@ -14,14 +15,15 @@ use std::time::Duration;
 use crate::obs::{clear_output_channel, cstr, ffi, opt_string, Data, Encoder, Obs, Output, Scene, SharedSource, Source};
 
 const VIDEO_CHANNEL: u32 = 0;
-/// Game audio, or all PC audio in `AudioMode::All`.
-const DESKTOP_AUDIO_CHANNEL: u32 = 1;
+const GAME_AUDIO_CHANNEL: u32 = 1;
+/// All PC audio, only while the mix asks for it.
+const PC_AUDIO_CHANNEL: u32 = 2;
 const MIC_CHANNEL: u32 = 3;
 
-/// Audio mixer bits: track 1 is the full mix, track 2 the game (or all PC audio),
-/// track 3 the microphone (decision D12).
+/// Audio mixer bits: track 1 is the mix the user chose, track 2 the game, track 3
+/// the microphone (decision D12, revised 2026-10-24).
 const MIX_TRACK: u32 = 1 << 0;
-const DESKTOP_TRACK: u32 = 1 << 1;
+const GAME_TRACK: u32 = 1 << 1;
 const MIC_TRACK: u32 = 1 << 2;
 
 /// The process the game capture source is hooked into, from its "hooked" signal.
@@ -44,13 +46,34 @@ struct GameWatch {
     audio_bound: Mutex<Option<String>>,
 }
 
-/// Where track 2 comes from (spec audio.per-app, decision D12).
+/// What track 1, the one players play, mixes (spec audio.separate-tracks, D12
+/// revised 2026-10-24). Tracks 2 and 3 stay the game and the microphone.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum AudioMode {
-    /// The audio of the hooked game's process only (Windows process loopback).
+pub enum AudioMix {
     Game,
-    /// Everything the default output device plays (Parity option).
-    All,
+    GameMic,
+    /// Everything the default output device plays, which already holds the game,
+    /// and the microphone (spec audio.all-pc).
+    PcMic,
+}
+
+impl AudioMix {
+    pub fn parse(s: &str) -> Option<AudioMix> {
+        match s {
+            "game" => Some(AudioMix::Game),
+            "game-mic" => Some(AudioMix::GameMic),
+            "pc-mic" => Some(AudioMix::PcMic),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            AudioMix::Game => "game",
+            AudioMix::GameMic => "game-mic",
+            AudioMix::PcMic => "pc-mic",
+        }
+    }
 }
 
 /// A libobs window spec `title:class:exe`, with ':' and '#' escaped as libobs does.
@@ -79,16 +102,22 @@ pub enum Capture {
     None,
 }
 
+/// A video encoder the recorder may use, with its settings; the recorder tries
+/// them in order (spec quality.encoding).
+pub struct VideoChoice {
+    pub id: String,
+    pub settings: Data,
+}
+
 #[derive(Clone, Debug)]
 pub struct RecorderConfig {
     pub capture: Capture,
     pub cursor: bool,
-    pub video_encoder: String,
     pub bitrate_kbps: i64,
     pub buffer_secs: i64,
-    /// Game (or PC) audio on track 2.
+    /// Game audio on track 2 and, with `AudioMix::PcMic`, PC audio on track 1.
     pub desktop_audio: bool,
-    pub audio: AudioMode,
+    pub mix: AudioMix,
     /// Tests: bind the game audio to this window spec from the start.
     pub game_audio: Option<String>,
     pub mic: bool,
@@ -107,8 +136,14 @@ pub struct RecorderConfig {
 pub struct Recorder {
     // Field order matters for drop: output first, then encoders, then sources.
     output: Option<Output>,
+    video: Option<Encoder>,
     _encoders: Vec<Encoder>,
-    _sources: Vec<Source>,
+    game_audio: Option<Source>,
+    mic: Option<Source>,
+    /// Exists only while the mix is `AudioMix::PcMic`.
+    pc_audio: Option<Source>,
+    mix: AudioMix,
+    desktop_audio: bool,
     capture: Option<Source>,
     /// Fits the capture into the canvas; it is what the video channel shows.
     scene: Scene,
@@ -121,6 +156,10 @@ pub struct Recorder {
     output_size: (u32, u32),
     /// Whether captures draw the mouse cursor (spec capture.cursor).
     cursor: bool,
+    /// The video encoders to try, the one in use, and the ones that failed with why.
+    video_choices: Vec<VideoChoice>,
+    video_index: usize,
+    fallbacks: Vec<(String, String)>,
 }
 
 unsafe extern "C" fn on_replay_saved(data: *mut c_void, _cd: *mut ffi::calldata_t) {
@@ -129,7 +168,7 @@ unsafe extern "C" fn on_replay_saved(data: *mut c_void, _cd: *mut ffi::calldata_
 }
 
 impl Recorder {
-    pub fn start(obs: &Obs, cfg: &RecorderConfig) -> Result<Recorder, String> {
+    pub fn start(obs: &Obs, cfg: &RecorderConfig, video_choices: Vec<VideoChoice>) -> Result<Recorder, String> {
         // Watch the game capture before anything else: with the hook already in the
         // game, "hooked" can fire before the rest of the pipeline exists.
         let game = Arc::new(GameWatch::default());
@@ -141,43 +180,51 @@ impl Recorder {
         let (tx, saved_rx) = channel();
         let saved_tx = Box::into_raw(Box::new(tx));
         if !cfg.record {
-            return Ok(Recorder { output: None, _encoders: vec![], _sources: vec![], capture, scene, game, watching_game, binder_thread: None, saved_tx, saved_rx, output_size: cfg.output_size, cursor: cfg.cursor });
+            return Ok(Recorder {
+                output: None,
+                video: None,
+                _encoders: vec![],
+                game_audio: None,
+                mic: None,
+                pc_audio: None,
+                mix: cfg.mix,
+                desktop_audio: false,
+                capture,
+                scene,
+                game,
+                watching_game,
+                binder_thread: None,
+                saved_tx,
+                saved_rx,
+                output_size: cfg.output_size,
+                cursor: cfg.cursor,
+                video_choices,
+                video_index: 0,
+                fallbacks: vec![],
+            });
         }
 
-        let mut sources = Vec::new();
         let mut track_masks = vec![MIX_TRACK];
         let mut binder_thread = None;
+        let mut game_audio = None;
         if cfg.desktop_audio {
-            let audio = match cfg.audio {
-                AudioMode::All => Source::new("wasapi_output_capture", "desktop-audio", &Data::new().str("device_id", "default"))?,
-                AudioMode::Game => {
-                    let window = cfg.game_audio.clone().unwrap_or_default();
-                    let source = Source::new("wasapi_process_output_capture", "game-audio", &Data::new().str("window", &window).int("priority", MATCH_TITLE_THEN_EXE))?;
-                    if !window.is_empty() {
-                        *game.audio_bound.lock().unwrap() = Some(window);
-                    }
-                    binder_thread = Some(spawn_audio_binder(SharedSource::of(&source), game.clone()));
-                    source
-                }
-            };
-            audio.set_audio_mixers(MIX_TRACK | DESKTOP_TRACK);
-            audio.set_output_channel(DESKTOP_AUDIO_CHANNEL);
-            sources.push(audio);
-            track_masks.push(DESKTOP_TRACK);
+            let window = cfg.game_audio.clone().unwrap_or_default();
+            let source = Source::new("wasapi_process_output_capture", "game-audio", &Data::new().str("window", &window).int("priority", MATCH_TITLE_THEN_EXE))?;
+            if !window.is_empty() {
+                *game.audio_bound.lock().unwrap() = Some(window);
+            }
+            binder_thread = Some(spawn_audio_binder(SharedSource::of(&source), game.clone()));
+            source.set_output_channel(GAME_AUDIO_CHANNEL);
+            game_audio = Some(source);
+            track_masks.push(GAME_TRACK);
         }
+        let mut mic = None;
         if cfg.mic {
-            let mic = Source::new("wasapi_input_capture", "microphone", &Data::new().str("device_id", "default"))?;
-            mic.set_audio_mixers(MIX_TRACK | MIC_TRACK);
-            mic.set_output_channel(MIC_CHANNEL);
-            sources.push(mic);
+            let source = Source::new("wasapi_input_capture", "microphone", &Data::new().str("device_id", "default"))?;
+            source.set_output_channel(MIC_CHANNEL);
+            mic = Some(source);
             track_masks.push(MIC_TRACK);
         }
-
-        let video_settings = Data::new()
-            .str("rate_control", "CBR")
-            .int("bitrate", cfg.bitrate_kbps)
-            .int("keyint_sec", 1);
-        let venc = Encoder::video(&cfg.video_encoder, "video", &video_settings)?;
 
         let mut encoders = vec![];
         let out_settings = Data::new()
@@ -188,21 +235,105 @@ impl Recorder {
             // Size cap with headroom over bitrate * duration (video plus audio).
             .int("max_size_mb", (cfg.bitrate_kbps + 640) * cfg.buffer_secs * 2 / 8 / 1000 + 64);
         let output = Output::new("replay_buffer", "replay-buffer", &out_settings)?;
-        output.set_video_encoder(&venc);
         for (track, mask) in track_masks.iter().enumerate() {
             let mixer = mask.trailing_zeros() as usize;
             let aenc = Encoder::audio("ffmpeg_aac", &format!("audio-track-{}", track + 1), &Data::new().int("bitrate", 160), mixer)?;
             output.set_audio_encoder(&aenc, track);
             encoders.push(aenc);
         }
-        encoders.push(venc);
-
         output.connect("saved", on_replay_saved, saved_tx.cast());
-        if !cfg.start_paused {
-            output.start()?;
-        }
 
-        Ok(Recorder { output: Some(output), _encoders: encoders, _sources: sources, capture, scene, game, watching_game, binder_thread, saved_tx, saved_rx, output_size: cfg.output_size, cursor: cfg.cursor })
+        let mut rec = Recorder {
+            output: Some(output),
+            video: None,
+            _encoders: encoders,
+            game_audio,
+            mic,
+            pc_audio: None,
+            mix: cfg.mix,
+            desktop_audio: cfg.desktop_audio,
+            capture,
+            scene,
+            game,
+            watching_game,
+            binder_thread,
+            saved_tx,
+            saved_rx,
+            output_size: cfg.output_size,
+            cursor: cfg.cursor,
+            video_choices,
+            video_index: 0,
+            fallbacks: vec![],
+        };
+        rec.set_mix(cfg.mix)?;
+        rec.first_video_encoder()?;
+        if !cfg.start_paused {
+            rec.start_output()?;
+        }
+        Ok(rec)
+    }
+
+    /// Puts the first video encoder that can be created on the output.
+    fn first_video_encoder(&mut self) -> Result<(), String> {
+        let first = self.video_choices.first().map(|c| Encoder::video(&c.id, "video", &c.settings));
+        match first {
+            Some(Ok(enc)) => {
+                self.output()?.set_video_encoder(&enc);
+                self.video = Some(enc);
+                Ok(())
+            }
+            Some(Err(e)) => {
+                self.fallbacks.push((self.video_choices[0].id.clone(), e));
+                if self.next_video_encoder()? { Ok(()) } else { Err("no video encoder could be created".into()) }
+            }
+            None => Err("no video encoder is available".into()),
+        }
+    }
+
+    /// Moves to the next video encoder that can be created; false when none is left.
+    fn next_video_encoder(&mut self) -> Result<bool, String> {
+        while self.video_index + 1 < self.video_choices.len() {
+            self.video_index += 1;
+            let id = self.video_choices[self.video_index].id.clone();
+            match Encoder::video(&id, "video", &self.video_choices[self.video_index].settings) {
+                Ok(enc) => {
+                    self.output()?.set_video_encoder(&enc);
+                    self.video = Some(enc);
+                    log!("[laurel] video encoder now {id}");
+                    return Ok(true);
+                }
+                Err(e) => self.fallbacks.push((id, e)),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Starts the replay buffer. A video encoder that cannot start (no such GPU, a
+    /// codec the GPU lacks, frames on another GPU) gives way to the next choice
+    /// (spec quality.encoding); the reasons are kept for the app.
+    fn start_output(&mut self) -> Result<(), String> {
+        loop {
+            let error = match self.output()?.start() {
+                Ok(()) => return Ok(()),
+                Err(e) => e,
+            };
+            let failed = self.encoder().to_string();
+            log!("[laurel] video encoder {failed} could not start: {error}");
+            self.fallbacks.push((failed, error.clone()));
+            if !self.next_video_encoder()? {
+                return Err(format!("no video encoder could start: {error}"));
+            }
+        }
+    }
+
+    /// The video encoder in use.
+    pub fn encoder(&self) -> &str {
+        self.video_choices.get(self.video_index).map_or("", |c| c.id.as_str())
+    }
+
+    /// The video encoders that could not be used, with the reason.
+    pub fn encoder_fallbacks(&self) -> &[(String, String)] {
+        &self.fallbacks
     }
 
     fn game_ptr(&self) -> *mut c_void {
@@ -219,11 +350,10 @@ impl Recorder {
     }
 
     /// Starts or stops the replay buffer; the capture keeps running.
-    pub fn set_recording(&self, enabled: bool) -> Result<(), String> {
-        let output = self.output()?;
-        match (enabled, output.active()) {
-            (true, false) => output.start()?,
-            (false, true) => output.stop(),
+    pub fn set_recording(&mut self, enabled: bool) -> Result<(), String> {
+        match (enabled, self.output()?.active()) {
+            (true, false) => self.start_output()?,
+            (false, true) => self.output()?.stop(),
             _ => {}
         }
         log!("[laurel] recording {}", if enabled { "resumed" } else { "paused" });
@@ -265,6 +395,38 @@ impl Recorder {
 
     pub fn cursor(&self) -> bool {
         self.cursor
+    }
+
+    /// Chooses what track 1 mixes, while recording continues (the next clips have
+    /// it). The PC audio already holds the game, so with it the game source stays on
+    /// track 2 only; the PC capture exists only while this mix is chosen.
+    pub fn set_mix(&mut self, mix: AudioMix) -> Result<(), String> {
+        self.output()?;
+        let pc = mix == AudioMix::PcMic && self.desktop_audio;
+        if pc && self.pc_audio.is_none() {
+            let source = Source::new("wasapi_output_capture", "pc-audio", &Data::new().str("device_id", "default"))?;
+            source.set_audio_mixers(MIX_TRACK);
+            source.set_output_channel(PC_AUDIO_CHANNEL);
+            self.pc_audio = Some(source);
+        } else if !pc {
+            if let Some(source) = self.pc_audio.take() {
+                clear_output_channel(PC_AUDIO_CHANNEL);
+                drop(source);
+            }
+        }
+        if let Some(game) = &self.game_audio {
+            game.set_audio_mixers(GAME_TRACK | if mix == AudioMix::PcMic { 0 } else { MIX_TRACK });
+        }
+        if let Some(mic) = &self.mic {
+            mic.set_audio_mixers(MIC_TRACK | if mix == AudioMix::Game { 0 } else { MIX_TRACK });
+        }
+        self.mix = mix;
+        log!("[laurel] audio mix {} (track 1)", mix.name());
+        Ok(())
+    }
+
+    pub fn audio_mix(&self) -> AudioMix {
+        self.mix
     }
 
     fn output(&self) -> Result<&Output, String> {
@@ -340,7 +502,7 @@ impl Drop for Recorder {
             output.stop();
             output.disconnect("saved", on_replay_saved, self.saved_tx.cast());
         }
-        for ch in [VIDEO_CHANNEL, DESKTOP_AUDIO_CHANNEL, MIC_CHANNEL] {
+        for ch in [VIDEO_CHANNEL, GAME_AUDIO_CHANNEL, PC_AUDIO_CHANNEL, MIC_CHANNEL] {
             clear_output_channel(ch);
         }
         unsafe { drop(Box::from_raw(self.saved_tx)) };

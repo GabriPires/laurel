@@ -282,6 +282,9 @@ label.row-name { cursor: pointer; }
 .row-desc { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
 .row-value { color: var(--soft); font-size: 13px; text-align: right; }
 .row-select { width: 240px; }
+.row-select.narrow { width: 130px; }
+input.num.wide { width: 100px; }
+.row-desc.warn { color: var(--warn); }
 .row-input { flex: 1 1 280px; min-width: 0; }
 .row-range { width: 200px; accent-color: var(--primary); }
 .row-unit { display: inline-flex; align-items: center; gap: 6px; color: var(--soft); }
@@ -290,6 +293,7 @@ label.row-name { cursor: pointer; }
 .note svg { flex: none; margin-top: 1px; color: var(--primary); }
 .note.bad, .note.bad svg { color: var(--danger-text); }
 .page-actions { display: flex; gap: 10px; }
+.license-text { margin: 0; max-height: 380px; overflow: auto; padding: 14px 18px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--soft); font: 12px/1.55 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* Shortcuts */
 kbd.hotkey { min-width: 92px; padding: 6px 10px; border: 1px solid var(--line); font-size: 13px; text-align: center; color: var(--text); }
