@@ -1,0 +1,62 @@
+{
+  "about": "Laurel's curated game list (spec game.detection). Games installed through Steam, Epic, Riot and Xbox are found from their libraries; this list only adds games from other launchers, store entries that are not games, and helper or client executables that live in game folders. Keys: <store>:<id> or exe:<lowercase file name>.",
+  "notGames": [
+    "steam:228980",
+    "steam:250820",
+    "steam:365670",
+    "steam:431960",
+    "steam:993090",
+    "steam:1905180",
+    "xbox:Microsoft.4297127D64EC6"
+  ],
+  "blockedExes": [
+    "battle.net.exe",
+    "eadesktop.exe",
+    "epicgameslauncher.exe",
+    "galaxyclient.exe",
+    "leagueclient.exe",
+    "leagueclientux.exe",
+    "leagueclientuxrender.exe",
+    "riot client.exe",
+    "riotclientservices.exe",
+    "riotclientux.exe",
+    "riotclientuxrender.exe",
+    "steam.exe",
+    "steamwebhelper.exe",
+    "ubisoftconnect.exe",
+    "upc.exe",
+    "vconsole2.exe"
+  ],
+  "blockedPatterns": [
+    "anticheat",
+    "battleye",
+    "beservice",
+    "cefprocess",
+    "crash",
+    "diagnose",
+    "dxsetup",
+    "helper",
+    "install",
+    "launcher",
+    "patcher",
+    "qtwebengineprocess",
+    "redist",
+    "report",
+    "setup",
+    "unins",
+    "updater",
+    "upload"
+  ],
+  "games": [
+    { "exe": "Diablo IV.exe", "name": "Diablo IV" },
+    { "exe": "GenshinImpact.exe", "name": "Genshin Impact" },
+    { "exe": "GTA5.exe", "name": "Grand Theft Auto V" },
+    { "exe": "Hearthstone.exe", "name": "Hearthstone" },
+    { "exe": "osu!.exe", "name": "osu!" },
+    { "exe": "Overwatch.exe", "name": "Overwatch" },
+    { "exe": "RobloxPlayerBeta.exe", "name": "Roblox" },
+    { "exe": "StarRail.exe", "name": "Honkai: Star Rail" },
+    { "exe": "Wow.exe", "name": "World of Warcraft" },
+    { "exe": "ZenlessZoneZero.exe", "name": "Zenless Zone Zero" }
+  ]
+}

@@ -1,0 +1,10 @@
+[package]
+name = "libobs-hello"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "Phase 3 feasibility spike: load libobs from a Windows OBS install, init D3D11 video, load modules and list encoders/sources/outputs."
+publish = false
+
+[profile.release]
+debug = "line-tables-only"

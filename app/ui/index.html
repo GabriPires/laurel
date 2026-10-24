@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Laurel</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="titlebar" data-tauri-drag-region="deep">
+    <div class="brand">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 21c0-6 2-11 7-15"/><path d="M14.5 13.5c2.5.3 4.5-.6 5.5-2.5-2.4-.4-4.4.4-5.5 2.5z"/><path d="M13 17c-2.6.2-4.6-.9-5.4-2.9 2.4-.3 4.4.7 5.4 2.9z"/><path d="M16.5 9.5c.4-2.4 1.9-4 4-4.5-.1 2.3-1.5 3.9-4 4.5z"/><path d="M12.6 11.8c-2.3-.7-3.6-2.5-3.6-4.6 2.2.5 3.6 2.2 3.6 4.6z"/></svg>
+      <span>LAUREL</span>
+    </div>
+    <button id="status-chip" class="status starting" title="Recording details">Starting</button>
+    <div class="quick">
+      <button id="save-clip" class="quick-btn"><kbd id="kbd-clip">F8</kbd> Save clip</button>
+      <button id="screenshot" class="quick-btn"><kbd id="kbd-screenshot">Shift+F8</kbd> Screenshot</button>
+    </div>
+    <div class="spacer"></div>
+    <label class="rec-toggle"><input type="checkbox" id="opt-recording" class="switch rec-input" role="switch" checked> Record games</label>
+    <div class="window-buttons">
+      <button id="win-min" aria-label="Minimize" title="Minimize"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M5 12h14"/></svg></button>
+      <button id="win-max" aria-label="Maximize" title="Maximize"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="1"/></svg></button>
+      <button id="win-close" class="close" aria-label="Close to the tray" title="Close (Laurel keeps running in the tray)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+    </div>
+  </header>
+
+  <div class="shell">
+    <nav class="rail" aria-label="Sections">
+      <button class="rail-btn active" data-view="library" aria-label="Library" title="Library" aria-current="page">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 5v14M17 5v14M3 9h4M3 15h4M17 9h4M17 15h4"/></svg>
+      </button>
+      <div class="spacer"></div>
+      <button class="rail-btn" data-view="settings" aria-label="Settings" title="Settings">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>
+      </button>
+    </nav>
+
+    <div class="content">
+      <section id="admin-banner" class="banner warn" hidden>
+        <div>
+          <strong id="admin-title">This game runs as administrator</strong>
+          <p>To record it, Laurel needs to run as administrator too. Windows will ask for permission, and Laurel opens again.</p>
+        </div>
+        <button id="admin-restart" class="btn btn-primary">Restart as administrator</button>
+      </section>
+
+      <section id="startup-banner" class="banner" hidden>
+        <div>
+          <strong>Start Laurel with Windows?</strong>
+          <p>Laurel then waits in the tray, ready to record when you open a game.</p>
+        </div>
+        <button id="banner-yes" class="btn btn-primary">Start with Windows</button>
+        <button id="banner-no" class="btn btn-secondary">Not now</button>
+      </section>
+
+      <!-- Library: the home screen -->
+      <div id="view-library" class="view">
+        <aside class="side" aria-label="Library">
+          <h2 class="side-title">Library</h2>
+          <button class="side-item" data-filter="all">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1"/><rect x="13" y="4" width="7" height="7" rx="1"/><rect x="4" y="13" width="7" height="7" rx="1"/><rect x="13" y="13" width="7" height="7" rx="1"/></svg>
+            <span class="side-name">All</span><span id="count-all" class="count"></span>
+          </button>
+          <button class="side-item" data-filter="clip">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M10 9l5 3-5 3z"/></svg>
+            <span class="side-name">Clips</span><span id="count-clip" class="count"></span>
+          </button>
+          <button class="side-item" data-filter="screenshot">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="M21 16l-5-5-8 8"/></svg>
+            <span class="side-name">Screenshots</span><span id="count-screenshot" class="count"></span>
+          </button>
+          <button class="side-item" data-filter="kept">
+            <svg class="kept-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M12 4l2.4 5 5.4.7-4 3.7 1 5.4L12 16.3 7.2 18.8l1-5.4-4-3.7 5.4-.7z"/></svg>
+            <span class="side-name">Kept</span><span id="count-kept" class="count"></span>
+          </button>
+          <div class="side-label">Games</div>
+          <div id="side-games" class="side-games"></div>
+          <button id="storage-open" class="side-foot storage-btn" title="Storage settings">
+            <span class="side-label flush">Storage</span>
+            <span class="meter" aria-hidden="true"><span id="storage-bar" class="meter-fill"></span></span>
+            <span id="storage-text" class="mono-small"></span>
+          </button>
+        </aside>
+
+        <main class="pane library-pane">
+          <div class="filter-bar">
+            <h1 id="library-title">All</h1>
+            <span id="library-count" class="mono-small"></span>
+            <label class="sort">Sort
+              <select id="library-sort">
+                <option value="new">Newest first</option>
+                <option value="old">Oldest first</option>
+                <option value="size">Largest first</option>
+              </select>
+            </label>
+            <label class="search">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></svg>
+              <input id="library-search" type="search" placeholder="Search clips" aria-label="Search by game or file name" spellcheck="false">
+            </label>
+            <button id="library-refresh" class="icon-btn" aria-label="Look for new files" title="Look for new files">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8 8 0 00-14.3-4.9L4 8M4 4v4h4M4 13a8 8 0 0014.3 4.9L20 16M20 20v-4h-4"/></svg>
+            </button>
+          </div>
+          <p id="library-empty" class="empty-state" hidden></p>
+          <div id="library-groups" class="library-groups"></div>
+        </main>
+      </div>
+
+      <!-- Clip viewer -->
+      <div id="view-viewer" class="view" hidden>
+        <main class="pane viewer-pane">
+          <div class="viewer-head">
+            <button id="viewer-back" class="back">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>
+              Library
+            </button>
+            <h1 id="viewer-title">Clip</h1>
+            <span id="viewer-when" class="muted"></span>
+            <div class="spacer"></div>
+            <span id="viewer-position" class="mono-small"></span>
+            <button id="viewer-close" class="icon-btn" aria-label="Close the viewer" title="Close (Esc)">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+            </button>
+          </div>
+          <div class="stage">
+            <div id="viewer-media" class="viewer-media"></div>
+            <button id="viewer-prev" class="stage-arrow prev" aria-label="Previous" title="Previous (←)">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>
+            </button>
+            <button id="viewer-next" class="stage-arrow next" aria-label="Next" title="Next (→)">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+            </button>
+            <div id="player-bar" class="player-bar">
+              <button id="player-play" class="player-btn" aria-label="Play" title="Play the selection (Space)">
+                <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path id="player-play-icon" d="M7 5l12 7-12 7z" fill="currentColor"/></svg>
+              </button>
+              <span id="player-time" class="player-time"></span>
+              <input id="player-seek" class="player-seek" type="range" min="0" max="1" step="0.01" aria-label="Position in the clip">
+              <div class="spacer"></div>
+              <button id="player-mute" class="player-btn" aria-label="Mute" title="Mute (M)">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 10v4h4l5 4V6L8 10z" fill="currentColor"/><path id="player-mute-icon" d="M16.5 9a4 4 0 010 6M19 7a7 7 0 010 10"/></svg>
+              </button>
+              <input id="player-volume" class="player-volume" type="range" min="0" max="1" step="0.05" aria-label="Volume">
+              <button id="player-full" class="player-btn" aria-label="Full screen" title="Full screen (F)">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path id="player-full-icon" d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+              </button>
+            </div>
+          </div>
+          <section id="trim" class="trim" aria-label="Trim">
+            <div id="timeline" class="timeline" aria-label="Clip timeline: click to look at a moment, drag the handles to choose the part to keep">
+              <div id="timeline-strip" class="timeline-strip"></div>
+              <div id="timeline-shade-left" class="timeline-shade"></div>
+              <div id="timeline-shade-right" class="timeline-shade"></div>
+              <div id="timeline-selection" class="timeline-selection"></div>
+              <div id="timeline-keyframe" class="timeline-keyframe" title="The fast trim starts here"></div>
+              <div id="timeline-playhead" class="timeline-playhead"></div>
+              <div id="handle-start" class="timeline-handle" role="slider" tabindex="0" aria-label="Start of the trim"></div>
+              <div id="handle-end" class="timeline-handle" role="slider" tabindex="0" aria-label="End of the trim"></div>
+            </div>
+            <div class="trim-info">
+              <p id="trim-mode-hint" class="hint"></p>
+              <span id="trim-summary" class="trim-summary"></span>
+            </div>
+            <div class="trim-row">
+              <button id="trim-set-start" class="btn btn-secondary">Start here <kbd>I</kbd></button>
+              <button id="trim-play" class="btn btn-secondary">Play the selection <kbd>Space</kbd></button>
+              <button id="trim-set-end" class="btn btn-secondary">End here <kbd>O</kbd></button>
+              <div class="spacer"></div>
+              <div class="segmented" role="radiogroup" aria-label="Trim mode">
+                <label title="No re-encoding: saved in about a second"><input type="radio" name="trim-mode" value="fast" checked><span>Fast</span></label>
+                <label title="Starts exactly at the start; re-encodes the video"><input type="radio" name="trim-mode" value="exact"><span>Exact</span></label>
+              </div>
+              <button id="trim-save" class="btn btn-primary">Save trimmed copy</button>
+            </div>
+          </section>
+          <p class="key-hint"><kbd>←</kbd> <kbd>→</kbd> previous or next · <kbd>M</kbd> mute · <kbd>F</kbd> full screen · <kbd>Del</kbd> delete · <kbd>Esc</kbd> back to the library</p>
+        </main>
+
+        <aside class="details" aria-label="Details">
+          <div class="detail-block">
+            <div class="side-label flush">Game</div>
+            <button id="viewer-game" class="detail-game">
+              <span id="viewer-game-tile" class="game-tile big"></span>
+              <span id="viewer-game-name" class="detail-game-name"></span>
+              <span id="viewer-game-count" class="detail-game-count"></span>
+            </button>
+          </div>
+          <dl class="facts">
+            <dt>Recorded</dt><dd id="fact-recorded"></dd>
+            <dt id="fact-length-label">Length</dt><dd id="fact-length" class="mono-value"></dd>
+            <dt id="fact-video-label">Video</dt><dd id="fact-video"></dd>
+            <dt id="fact-audio-label">Audio</dt><dd id="fact-audio"></dd>
+            <dt>Size</dt><dd id="fact-size" class="mono-value"></dd>
+          </dl>
+          <div class="detail-block">
+            <div class="side-label flush">File</div>
+            <code id="viewer-path" class="path small"></code>
+            <button class="link-btn" data-share="copy-path">Copy path</button>
+          </div>
+          <div class="detail-actions">
+            <button id="viewer-keep" class="btn btn-keep" aria-pressed="false">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M12 4l2.4 5 5.4.7-4 3.7 1 5.4L12 16.3 7.2 18.8l1-5.4-4-3.7 5.4-.7z"/></svg>
+              <span id="viewer-keep-label">Keep</span>
+            </button>
+            <button class="btn btn-secondary" data-share="copy-file">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a1 1 0 00-1-1H5a1 1 0 00-1 1v10a1 1 0 001 1h3"/></svg>
+              Copy file
+            </button>
+            <button class="btn btn-secondary" data-share="show">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>
+              Show in folder
+            </button>
+            <button class="btn btn-secondary" data-share="open">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 01-1 1H5a1 1 0 01-1-1V7a1 1 0 011-1h5"/></svg>
+              <span id="viewer-open-label">Open in player</span>
+            </button>
+            <div class="spacer"></div>
+            <div id="delete-confirm" class="confirm danger" hidden>
+              <p id="delete-question">Move this clip to the Recycle Bin?</p>
+              <div class="row">
+                <button id="delete-yes" class="btn btn-danger">Delete</button>
+                <button id="delete-no" class="btn btn-secondary">Cancel</button>
+              </div>
+            </div>
+            <button id="viewer-delete" class="btn btn-danger-outline">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a1 1 0 001 1h8a1 1 0 001-1l1-12M9 7V4h6v3"/></svg>
+              Delete
+            </button>
+          </div>
+          <p id="viewer-status" class="viewer-status" role="status"></p>
+        </aside>
+      </div>
+
+      <!-- Settings -->
+      <div id="view-settings" class="view" hidden>
+        <aside class="side" aria-label="Settings pages">
+          <h2 class="side-title">Settings</h2>
+          <label class="search side-search">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></svg>
+            <input id="settings-search" type="search" placeholder="Search settings" aria-label="Search settings" spellcheck="false">
+          </label>
+          <div class="side-group">
+            <div class="side-label">Recording</div>
+            <button class="side-item" data-page="recording"><span class="side-name">Recording</span></button>
+            <button class="side-item" data-page="shortcuts"><span class="side-name">Shortcuts</span></button>
+            <button class="side-item" data-page="games"><span class="side-name">Games</span></button>
+          </div>
+          <div class="side-group">
+            <div class="side-label">Storage</div>
+            <button class="side-item" data-page="storage"><span class="side-name">Storage</span></button>
+          </div>
+          <div class="side-group">
+            <div class="side-label">App</div>
+            <button class="side-item" data-page="notifications"><span class="side-name">Notifications</span></button>
+            <button class="side-item" data-page="startup"><span class="side-name">Startup</span></button>
+            <button class="side-item" data-page="advanced"><span class="side-name">Advanced</span></button>
+            <button class="side-item" data-page="about"><span class="side-name">About</span></button>
+          </div>
+          <p id="settings-no-match" class="muted small-note" hidden>No settings match.</p>
+          <div class="side-foot">
+            <div id="engine-info" class="mono-small">Engine starting…</div>
+          </div>
+        </aside>
+
+        <main class="pane settings-pane">
+          <span id="settings-status" class="settings-status" role="status"></span>
+
+          <section class="page" data-page="recording" aria-labelledby="page-recording">
+            <div class="page-head">
+              <span class="page-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3.5" fill="currentColor"/></svg></span>
+              <div><h1 id="page-recording">Recording</h1><p>What Laurel records, and when.</p></div>
+            </div>
+            <div class="rows">
+              <div class="row-item">
+                <div class="row-text"><label for="opt-recording-page" class="row-name">Record games</label><span class="row-desc">Laurel keeps the last seconds of the game you are playing, so a shortcut can save them.</span></div>
+                <input type="checkbox" id="opt-recording-page" class="switch rec-input" role="switch">
+              </div>
+              <div class="row-item">
+                <div class="row-text"><label for="opt-cursor" class="row-name">Show the mouse cursor</label><span class="row-desc">Draw the cursor in clips and screenshots. Changes apply right away, also while a game is being recorded.</span></div>
+                <input type="checkbox" id="opt-cursor" class="switch" role="switch">
+              </div>
+              <div class="row-item">
+                <div class="row-text"><span class="row-name">Clip length and video</span><span class="row-desc">What every clip holds.</span></div>
+                <span id="engine-detail" class="row-value">Waiting for the engine</span>
+              </div>
+            </div>
+            <h2 class="group-label">Screen recording</h2>
+            <div class="rows">
+              <div class="row-item">
+                <div class="row-text"><label for="opt-screen" class="row-name">Record the screen when no game is open</label><span class="row-desc">Off by default: Laurel records games. Turn this on to keep the last seconds of your screen too. Screen clips have your microphone but not the PC's sound.</span></div>
+                <input type="checkbox" id="opt-screen" class="switch" role="switch">
+              </div>
+              <div class="row-item screen-option">
+                <div class="row-text"><label for="opt-screen-monitor" class="row-name">Monitor</label><span class="row-desc">The screen to record.</span></div>
+                <select id="opt-screen-monitor" class="row-select"></select>
+              </div>
+              <div class="row-item screen-option">
+                <div class="row-text"><label for="opt-screen-switch" class="row-name">Switch to games</label><span class="row-desc">Record the game when one opens, and go back to the screen when it closes.</span></div>
+                <input type="checkbox" id="opt-screen-switch" class="switch" role="switch">
+              </div>
+            </div>
+          </section>
+
+          <section class="page" data-page="shortcuts" aria-labelledby="page-shortcuts" hidden>
+            <div class="page-head">
+              <span class="page-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M7 10h.01M11 10h.01M15 10h.01M8 14h8"/></svg></span>
+              <div><h1 id="page-shortcuts">Shortcuts</h1><p>Keys and mouse buttons that work while you play.</p></div>
+            </div>
+            <div class="rows">
+              <div class="row-item hotkey-row" data-action="clip">
+                <div class="row-text"><span class="row-name">Save clip</span><span class="row-desc">Saves the last seconds.</span></div>
+                <kbd id="hk-clip" class="hotkey">F8</kbd>
+                <button class="btn btn-secondary" data-hotkey="clip">Change</button>
+              </div>
+              <div class="row-item hotkey-row" data-action="screenshot">
+                <div class="row-text"><span class="row-name">Screenshot</span><span class="row-desc">Saves a picture of the game.</span></div>
+                <kbd id="hk-screenshot" class="hotkey">Shift+F8</kbd>
+                <button class="btn btn-secondary" data-hotkey="screenshot">Change</button>
+              </div>
+              <div class="row-item hotkey-row" data-action="toggle">
+                <div class="row-text"><span class="row-name">Recording on/off</span><span class="row-desc">Optional. Not set by default.</span></div>
+                <kbd id="hk-toggle" class="hotkey">Not set</kbd>
+                <button id="hk-toggle-clear" class="btn btn-secondary" hidden>Clear</button>
+                <button class="btn btn-secondary" data-hotkey="toggle">Change</button>
+              </div>
+            </div>
+            <div class="note">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg>
+              <span id="hotkey-message" role="status">Shortcuts work in games, also in exclusive fullscreen, and the game still gets the key.</span>
+            </div>
+            <div class="page-actions">
+              <button id="hotkeys-reset" class="btn btn-secondary">Reset to F8 and Shift+F8</button>
+            </div>
+          </section>
+
+          <section class="page" data-page="games" aria-labelledby="page-games" hidden>
+            <div class="page-head">
+              <span class="page-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9h4M8 7v4M15 10h.01M18 9h.01"/><path d="M17.3 5H6.7a4 4 0 00-4 3.6l-.6 6A3 3 0 005.1 18c1 0 1.9-.5 2.4-1.3L9 15h6l1.5 1.7c.5.8 1.4 1.3 2.4 1.3a3 3 0 003-3.4l-.6-6A4 4 0 0017.3 5z"/></svg></span>
+              <div><h1 id="page-games">Games</h1><p id="games-summary"></p></div>
+            </div>
+            <h2 class="group-label">Installed games</h2>
+            <p class="group-desc">Laurel records these when you play them. Turn a game off to stop recording it.</p>
+            <ul id="games-installed" class="rows game-list"></ul>
+            <h2 class="group-label">Your games</h2>
+            <p class="group-desc">Add a game Laurel does not find on its own: pick one of the programs open now, or its .exe file.</p>
+            <ul id="games-custom" class="rows game-list"></ul>
+            <div class="add-game">
+              <select id="games-running" aria-label="Programs open now"></select>
+              <button id="games-add-running" class="btn btn-secondary">Add</button>
+              <button id="games-browse" class="btn btn-secondary">Browse…</button>
+            </div>
+            <div id="games-ignored-field" hidden>
+              <h2 class="group-label">Not recorded</h2>
+              <ul id="games-ignored" class="rows game-list"></ul>
+            </div>
+          </section>
+
+          <section class="page" data-page="storage" aria-labelledby="page-storage" hidden>
+            <div class="page-head">
+              <span class="page-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg></span>
+              <div><h1 id="page-storage">Storage</h1><p>Where clips and screenshots go, and how much room they take.</p></div>
+            </div>
+            <div class="rows">
+              <div class="row-item wrap">
+                <div class="row-text"><span class="row-name">Capture folder</span><span id="storage-usage" class="row-desc"></span></div>
+                <button id="change-folder" class="btn btn-secondary">Change…</button>
+                <code id="opt-folder" class="path full"></code>
+                <div id="move-confirm" class="confirm full" hidden>
+                  <p id="move-question"></p>
+                  <div class="row">
+                    <button id="move-yes" class="btn btn-primary">Move them</button>
+                    <button id="move-no" class="btn btn-secondary">Leave them</button>
+                    <button id="move-cancel" class="btn btn-secondary">Cancel</button>
+                  </div>
+                </div>
+              </div>
+              <div class="row-item wrap">
+                <div class="row-text"><label for="opt-naming" class="row-name">File names</label><span class="row-desc">Use {game}, {date} and {time}. Example: <span id="naming-preview" class="mono-inline"></span></span></div>
+                <input id="opt-naming" type="text" spellcheck="false" class="row-input">
+              </div>
+              <div class="row-item">
+                <div class="row-text"><label for="opt-limit" class="row-name">Keep the folder under a size</label><span class="row-desc">The oldest clips and screenshots go first. Kept items are never removed.</span></div>
+                <span class="row-unit"><input id="opt-limit-gb" type="number" min="1" max="100000" class="num" aria-label="Size limit in GB"> GB</span>
+                <input type="checkbox" id="opt-limit" class="switch" role="switch">
+              </div>
+              <div class="row-item">
+                <div class="row-text"><label for="opt-recycle" class="row-name">Send removed files to the Recycle Bin</label><span class="row-desc">For the files the size limit removes.</span></div>
+                <input type="checkbox" id="opt-recycle" class="switch" role="switch">
+              </div>
+              <div class="row-item">
+                <div class="row-text"><label for="opt-min-free" class="row-name">Pause when the disk is almost full</label><span class="row-desc">Recording pauses when less than this is free, and resumes on its own when there is room again.</span></div>
+                <span class="row-unit"><input id="opt-min-free" type="number" min="0" max="1000" class="num"> GB</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="page" data-page="notifications" aria-labelledby="page-notifications" hidden>
+            <div class="page-head">
+              <span class="page-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 16V11a6 6 0 0112 0v5l1.5 2h-15z"/><path d="M10 20a2 2 0 004 0"/></svg></span>
+              <div><h1 id="page-notifications">Notifications</h1><p>How Laurel tells you a clip was saved while you play.</p></div>
+            </div>
+            <div class="rows">
+              <div class="row-item">
+                <div class="row-text"><label for="opt-overlay" class="row-name">Show notices over games</label><span class="row-desc">A short notice in the corner of the game.</span></div>
+                <input type="checkbox" id="opt-overlay" class="switch" role="switch">
+              </div>
+              <div class="row-item">
+                <div class="row-text"><label for="opt-sounds" class="row-name">Play sounds</label><span class="row-desc">A sound for clips, screenshots and errors.</span></div>
+                <input type="checkbox" id="opt-sounds" class="switch" role="switch">
+              </div>
+              <div class="row-item">
+                <div class="row-text"><label for="opt-volume" class="row-name">Volume</label></div>
+                <input type="range" id="opt-volume" min="0" max="100" step="5" class="row-range">
+                <output id="opt-volume-value" for="opt-volume" class="mono">70</output>
+              </div>
+              <div class="row-item">
+                <div class="row-text"><span class="row-name">Try them</span></div>
+                <button id="preview-clip" class="btn btn-secondary">Clip notice</button>
+                <button id="preview-error" class="btn btn-secondary">Error notice</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="page" data-page="startup" aria-labelledby="page-startup" hidden>
+            <div class="page-head">
+              <span class="page-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M12 3v8"/><path d="M7 6.5a7 7 0 1010 0"/></svg></span>
+              <div><h1 id="page-startup">Startup</h1><p>When Laurel starts.</p></div>
+            </div>
+            <div class="rows">
+              <div class="row-item">
+                <div class="row-text"><label for="opt-autostart" class="row-name">Start Laurel with Windows</label><span class="row-desc">Laurel waits in the tray, ready to record when you open a game.</span></div>
+                <input type="checkbox" id="opt-autostart" class="switch" role="switch">
+              </div>
+            </div>
+          </section>
+
+          <section class="page" data-page="advanced" aria-labelledby="page-advanced" hidden>
+            <div class="page-head">
+              <span class="page-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19h16M7 16V9M12 16V5M17 16v-4"/></svg></span>
+              <div><h1 id="page-advanced">Advanced</h1><p>What the recording engine is doing, for when something looks wrong.</p></div>
+            </div>
+            <div class="rows">
+              <div class="row-item">
+                <div class="row-text"><span class="row-name">Capture</span><span id="capture-hint" class="row-desc">Open a game from Steam, Epic, Riot or Xbox, or add yours in Games.</span></div>
+                <span id="capture-state" class="capture-state">Waiting for a game</span>
+                <button id="restart" class="btn btn-secondary" hidden>Restart engine</button>
+              </div>
+            </div>
+            <h2 class="group-label">Pipeline</h2>
+            <dl class="stats rows">
+              <div><dt>Capture</dt><dd id="s-capture">–</dd></div>
+              <div><dt>FPS</dt><dd id="s-fps">–</dd></div>
+              <div><dt>Frames</dt><dd id="s-frames">–</dd></div>
+              <div><dt>Skipped / lagged</dt><dd id="s-dropped">–</dd></div>
+              <div><dt>Replay buffer</dt><dd id="s-buffer">–</dd></div>
+              <div><dt>Encoder</dt><dd id="s-encoder">–</dd></div>
+              <div><dt>Game audio</dt><dd id="s-audio">–</dd></div>
+            </dl>
+            <h2 class="group-label">Activity</h2>
+            <ol id="activity" class="activity rows"><li class="empty">Clips and screenshots you save appear here.</li></ol>
+          </section>
+
+          <section class="page" data-page="about" aria-labelledby="page-about" hidden>
+            <div class="page-head">
+              <span class="page-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg></span>
+              <div><h1 id="page-about">About</h1><p>A free game clip recorder: no ads, every feature included.</p></div>
+            </div>
+            <div class="rows">
+              <div class="row-item">
+                <div class="row-text"><span class="row-name">Laurel</span><span class="row-desc">Free software under the GNU GPL, version 2 or later.</span></div>
+                <span id="about-version" class="row-value mono-value"></span>
+              </div>
+              <div class="row-item">
+                <div class="row-text"><span class="row-name">Recording engine</span><span class="row-desc">libobs from OBS Studio, GPL 2.0 or later.</span></div>
+                <span id="about-libobs" class="row-value mono-value"></span>
+              </div>
+              <div class="row-item">
+                <div class="row-text"><span class="row-name">Trim and thumbnails</span><span class="row-desc">FFmpeg.</span></div>
+              </div>
+              <div class="row-item">
+                <div class="row-text"><span class="row-name">Fonts</span><span class="row-desc">Cinzel, Figtree and JetBrains Mono, under the SIL Open Font License.</span></div>
+              </div>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+  <script src="library.js"></script>
+  <script src="settings.js"></script>
+  <script src="games.js"></script>
+  <script src="hotkeys.js"></script>
+</body>
+</html>

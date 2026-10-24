@@ -1,0 +1,6 @@
+# Rust build output
+target/
+
+# Python and OS leftovers
+__pycache__/
+.DS_Store

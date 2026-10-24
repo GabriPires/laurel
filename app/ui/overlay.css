@@ -1,0 +1,41 @@
+/* In-game notices (wiki/projeto/guia-de-estilo.md, "Overlay no jogo"). The window
+   is transparent and click-through; only the notices are painted. */
+@font-face { font-family: "Figtree"; src: url("fonts/figtree.woff2") format("woff2"); font-weight: 400 700; font-display: block; }
+
+:root {
+  color-scheme: dark;
+  --toast-bg: rgba(11, 12, 18, 0.92);
+  --line: #2a2e3d;
+  --text: #eef0f8;
+  --muted: #969baf;
+  --primary: #12d99b;
+  --accent: #a77bff;
+  --accent-line: rgba(167, 123, 255, 0.5);
+  --danger: #ff5470;
+  --danger-text: #f79aad;
+  --danger-bg: rgba(42, 14, 22, 0.94);
+  --danger-line: rgba(255, 84, 112, 0.4);
+  font-family: "Figtree", "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+}
+
+html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
+.stack { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
+
+.toast { width: 300px; box-sizing: border-box; display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--toast-bg); color: var(--text); animation: enter 160ms ease-out; }
+.toast.leaving { animation: leave 180ms ease-in forwards; }
+.toast svg { flex: none; width: 20px; height: 20px; }
+.toast .text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.toast .title { font-weight: 700; }
+.toast .detail { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+
+.toast.clip { border-color: var(--accent-line); }
+.toast.clip svg { color: var(--accent); }
+.toast.screenshot svg, .toast.info svg { color: var(--primary); }
+.toast.error { border-color: var(--danger-line); background: var(--danger-bg); }
+.toast.error svg { color: var(--danger); }
+.toast.error .detail { color: var(--danger-text); }
+
+@keyframes enter { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: none; } }
+@keyframes leave { to { opacity: 0; transform: translateY(-8px); } }
+@media (prefers-reduced-motion: reduce) { .toast, .toast.leaving { animation: none; } }

@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["engine", "app"]
+# Spikes are standalone crates with their own Cargo.toml.
+exclude = ["poc"]
+
+[workspace.package]
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[profile.release]
+debug = "line-tables-only"
