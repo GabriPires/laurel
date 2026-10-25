@@ -14,6 +14,7 @@ mod detect;
 mod engine;
 mod games;
 mod hotkeys;
+mod i18n;
 mod library;
 mod log;
 mod media;
@@ -40,6 +41,7 @@ use tauri::{AppHandle, Emitter, Listener, Manager, RunEvent, WindowEvent};
 use detect::{Detector, Mode};
 use engine::{Engine, EngineConfig};
 use hotkeys::{Combo, Hotkeys};
+use i18n::t;
 use library::Library;
 use log::log;
 use overlay::{Kind, Notifier};
@@ -53,11 +55,13 @@ const DISK_CHECK: Duration = Duration::from_secs(15);
 /// Name of the value under the Run key (spec app.startup).
 const AUTOSTART_NAME: &str = "Laurel";
 
-/// The tray menu items whose labels show the hotkeys.
+/// The tray menu items, relabeled when the hotkeys or the language change.
 struct TrayItems {
+    open: MenuItem<Wry>,
     toggle: CheckMenuItem<Wry>,
     clip: MenuItem<Wry>,
     shot: MenuItem<Wry>,
+    quit: MenuItem<Wry>,
 }
 
 /// The hotkey actions; "toggle" (record.toggle) has no hotkey by default.
@@ -93,10 +97,12 @@ fn hotkeys_json(app: &AppHandle) -> Value {
 fn update_tray(app: &AppHandle) {
     if let Some(items) = app.try_state::<TrayItems>() {
         let settings = app.state::<Arc<Store>>().get();
-        let _ = items.toggle.set_text(format!("Recording{}", hotkey_suffix(&settings, "toggle")));
+        let _ = items.open.set_text(t!("Open Laurel"));
+        let _ = items.toggle.set_text(format!("{}{}", t!("Recording"), hotkey_suffix(&settings, "toggle")));
         let _ = items.toggle.set_checked(settings.recording_enabled);
-        let _ = items.clip.set_text(format!("Save clip{}", hotkey_suffix(&settings, "clip")));
-        let _ = items.shot.set_text(format!("Screenshot{}", hotkey_suffix(&settings, "screenshot")));
+        let _ = items.clip.set_text(format!("{}{}", t!("Save clip"), hotkey_suffix(&settings, "clip")));
+        let _ = items.shot.set_text(format!("{}{}", t!("Screenshot"), hotkey_suffix(&settings, "screenshot")));
+        let _ = items.quit.set_text(t!("Quit"));
     }
 }
 
@@ -128,9 +134,9 @@ fn set_recording_enabled(app: &AppHandle, enabled: bool, notice: bool) {
     if notice {
         let notifier = app.state::<Notifier>();
         if enabled {
-            notifier.notify(Kind::Info, "Recording on", "Laurel records your games again");
+            notifier.notify(Kind::Info, &t!("Recording on"), &t!("Laurel records your games again"));
         } else {
-            notifier.notify(Kind::Info, "Recording off", "Laurel stops recording until you turn it back on");
+            notifier.notify(Kind::Info, &t!("Recording off"), &t!("Laurel stops recording until you turn it back on"));
         }
     }
 }
@@ -139,8 +145,8 @@ fn set_recording_enabled(app: &AppHandle, enabled: bool, notice: bool) {
 fn on_hotkey(app: &AppHandle, event: hotkeys::Event) {
     use hotkeys::Event;
     match event {
-        Event::Pressed("clip") => save_clip(app),
-        Event::Pressed("screenshot") => take_screenshot(app),
+        Event::Pressed("clip") => save_clip(app, "the hotkey"),
+        Event::Pressed("screenshot") => take_screenshot(app, "the hotkey"),
         Event::Pressed("toggle") => {
             let app = app.clone();
             std::thread::spawn(move || {
@@ -219,24 +225,25 @@ fn engine_config(work_dir: PathBuf, storage: Arc<Storage>, detector: Arc<Detecto
 }
 
 /// Saves a clip and tells the windows and the player; used by the hotkey, the tray
-/// and the UI.
-fn save_clip(app: &AppHandle) {
+/// and the UI. `source` goes to the log, to tell later what asked for each clip.
+fn save_clip(app: &AppHandle, source: &str) {
+    log!("clip requested by {source}");
     let app = app.clone();
     std::thread::spawn(move || {
         let engine = app.state::<Engine>();
         let notifier = app.state::<Notifier>();
         let refused = if !app.state::<Arc<Detector>>().enabled() {
-            Some("Recording is off")
+            Some(t!("Recording is off"))
         } else if app.state::<Arc<Storage>>().is_paused() {
-            Some("Disk almost full: free up space to keep recording")
+            Some(t!("Disk almost full: free up space to keep recording"))
         } else if !app.state::<Arc<Detector>>().recording() {
-            Some("No game is being recorded")
+            Some(t!("No game is being recorded"))
         } else {
             None
         };
         if let Some(message) = refused {
-            notifier.notify(Kind::Error, "Clip not saved", message);
-            report(&app, "clip-saved", "saveClip", Err(message.into()));
+            notifier.notify(Kind::Error, &t!("Clip not saved"), &message);
+            report(&app, "clip-saved", "saveClip", Err(message));
             return;
         }
         let mut result = engine.request("saveClip", Value::Null, CLIP_TIMEOUT);
@@ -245,37 +252,38 @@ fn save_clip(app: &AppHandle) {
                 attach_game(&app, saved);
                 let secs = engine.state()["info"]["bufferSecs"].as_u64().unwrap_or_default();
                 let detail = match library::game_name(&saved["game"]) {
-                    Some(game) => format!("Last {secs} s · {game}"),
-                    None => format!("Last {secs} s"),
+                    Some(game) => t!("Last {secs} s · {game}", secs = secs, game = game),
+                    None => t!("Last {secs} s", secs = secs),
                 };
-                notifier.notify(Kind::Clip, "Clip saved", &detail);
+                notifier.notify(Kind::Clip, &t!("Clip saved"), &detail);
                 finish_saved(&app, saved);
             }
-            Err(e) => notifier.notify(Kind::Error, "Clip not saved", e),
+            Err(e) => notifier.notify(Kind::Error, &t!("Clip not saved"), e),
         }
         report(&app, "clip-saved", "saveClip", result);
     });
 }
 
-fn take_screenshot(app: &AppHandle) {
+fn take_screenshot(app: &AppHandle, source: &str) {
+    log!("screenshot requested by {source}");
     let app = app.clone();
     std::thread::spawn(move || {
         let notifier = app.state::<Notifier>();
         let detector = app.state::<Arc<Detector>>();
         if !detector.enabled() || (detector.mode() == Mode::Detect && detector.current().is_none()) {
-            let message = if detector.enabled() { "No game is being captured" } else { "Recording is off" };
-            notifier.notify(Kind::Error, "Screenshot not saved", message);
-            report(&app, "screenshot-saved", "screenshot", Err(message.into()));
+            let message = if detector.enabled() { t!("No game is being captured") } else { t!("Recording is off") };
+            notifier.notify(Kind::Error, &t!("Screenshot not saved"), &message);
+            report(&app, "screenshot-saved", "screenshot", Err(message));
             return;
         }
         let mut result = app.state::<Engine>().request("screenshot", Value::Null, SHOT_TIMEOUT);
         match &mut result {
             Ok(saved) => {
                 attach_game(&app, saved);
-                notifier.notify(Kind::Screenshot, "Screenshot saved", "Saved to your screenshots");
+                notifier.notify(Kind::Screenshot, &t!("Screenshot saved"), &t!("Saved to your screenshots"));
                 finish_saved(&app, saved);
             }
-            Err(e) => notifier.notify(Kind::Error, "Screenshot not saved", e),
+            Err(e) => notifier.notify(Kind::Error, &t!("Screenshot not saved"), e),
         }
         report(&app, "screenshot-saved", "screenshot", result);
     });
@@ -336,10 +344,10 @@ fn watch_disk(app: AppHandle) {
             let notifier = app.state::<Notifier>();
             if pause {
                 log!("disk almost full ({free_gb:.1} GB free): recording paused");
-                notifier.notify(Kind::Error, "Recording paused", &format!("Disk almost full ({free_gb:.1} GB free). Free up space to keep recording."));
+                notifier.notify(Kind::Error, &t!("Recording paused"), &t!("Disk almost full ({free} GB free). Free up space to keep recording.", free = i18n::number(free_gb, 1)));
             } else {
                 log!("disk space back ({free_gb:.1} GB free): recording resumed");
-                notifier.notify(Kind::Info, "Recording resumed", &format!("{free_gb:.1} GB free on the capture drive"));
+                notifier.notify(Kind::Info, &t!("Recording resumed"), &t!("{free} GB free on the capture drive", free = i18n::number(free_gb, 1)));
             }
             let _ = app.emit("storage-state", storage.state(&app.state::<Arc<Library>>()));
         }
@@ -367,7 +375,7 @@ fn watch_engine_state(app: &AppHandle) {
             let mut previous_encoder = previous_encoder.lock().unwrap();
             let fallbacks = info["encoderFallbacks"].as_array().map_or(0, Vec::len);
             if fallbacks > 0 && (*previous != "ready" || *previous_encoder != encoder) {
-                notifier.notify(Kind::Error, "Video encoder changed", &format!("Recording with {}", encoder_name(info, &encoder)));
+                notifier.notify(Kind::Error, &t!("Video encoder changed"), &t!("Recording with {encoder}", encoder = encoder_name(info, &encoder)));
             }
             *previous_encoder = encoder;
         }
@@ -377,10 +385,10 @@ fn watch_engine_state(app: &AppHandle) {
             std::thread::spawn(move || detector.engine_ready());
             if handle.state::<Arc<Detector>>().mode() != Mode::Detect && !handle.state::<Arc<Storage>>().is_paused() {
                 let secs = state["info"]["bufferSecs"].as_u64().unwrap_or_default();
-                notifier.notify(Kind::Info, "Recording", &format!("Laurel keeps the last {secs} s"));
+                notifier.notify(Kind::Info, &t!("Recording|notice"), &t!("Laurel keeps the last {secs} s", secs = secs));
             }
         } else if *previous == "ready" && now != "ready" && state["closing"] != true && state["restart"] != true {
-            notifier.notify(Kind::Error, "Recording stopped", state["message"].as_str().unwrap_or("The engine stopped"));
+            notifier.notify(Kind::Error, &t!("Recording stopped"), &state["message"].as_str().map_or_else(|| t!("The engine stopped"), String::from));
         }
         *previous = now;
     });
@@ -442,6 +450,8 @@ fn autostart_command() -> String {
 #[tauri::command]
 fn get_settings(app: AppHandle) -> Value {
     let mut v = app.state::<Arc<Store>>().get().to_json();
+    v["languageResolved"] = json!(i18n::current());
+    v["systemLanguage"] = json!(i18n::system());
     v["autostart"] = Value::Bool(win::autostart_command(AUTOSTART_NAME).is_some());
     v["storage"] = app.state::<Arc<Storage>>().state(&app.state::<Arc<Library>>());
     v
@@ -469,11 +479,26 @@ fn set_settings(app: AppHandle, settings: Value) -> Result<Value, String> {
     new.hotkey_toggle = current.hotkey_toggle;
     new.recording_enabled = current.recording_enabled;
     let cursor_changed = new.show_cursor != current.show_cursor;
+    let language_changed = new.language != current.language;
+    let fewer_days = new.deleted_days < current.deleted_days;
     let mix_changed = new.audio_mix != current.audio_mix;
     let screen = detect::screen_of(&new);
     store.set(new.clone()).map_err(|e| e.to_string())?;
     log!("settings: {}", new.to_json());
     app.state::<Arc<Detector>>().set_screen(screen);
+    if fewer_days {
+        let removed = app.state::<Arc<Library>>().expire(new.deleted_days, new.recycle);
+        if !removed.is_empty() {
+            log!("recently deleted: {} item(s) past {} day(s) removed", removed.len(), new.deleted_days);
+            let _ = app.emit("library-changed", Value::Null);
+        }
+    }
+    if language_changed {
+        // The tray and the next notices change now; the main window reloads itself.
+        i18n::set(&new.language);
+        log!("language: {} ({})", new.language, i18n::current());
+        update_tray(&app);
+    }
     if cursor_changed {
         // Spec capture.cursor: applies to the running capture; a restarted engine gets --no-cursor.
         if let Err(e) = app.state::<Engine>().request("setCursor", json!({ "enabled": new.show_cursor }), SHOT_TIMEOUT) {
@@ -515,7 +540,7 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<Value, String> {
 #[tauri::command]
 async fn pick_folder(app: AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
-    let picked = tauri::async_runtime::spawn_blocking(move || app.dialog().file().set_title("Choose the capture folder").blocking_pick_folder())
+    let picked = tauri::async_runtime::spawn_blocking(move || app.dialog().file().set_title(t!("Choose the capture folder")).blocking_pick_folder())
         .await
         .map_err(|e| e.to_string())?;
     Ok(picked.and_then(|p| p.into_path().ok()).map(|p| p.display().to_string()))
@@ -524,7 +549,7 @@ async fn pick_folder(app: AppHandle) -> Result<Option<String>, String> {
 #[tauri::command]
 async fn pick_exe(app: AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
-    let picked = tauri::async_runtime::spawn_blocking(move || app.dialog().file().set_title("Choose the game's program").add_filter("Programs", &["exe"]).blocking_pick_file())
+    let picked = tauri::async_runtime::spawn_blocking(move || app.dialog().file().set_title(t!("Choose the game's program")).add_filter(t!("Programs"), &["exe"]).blocking_pick_file())
         .await
         .map_err(|e| e.to_string())?;
     Ok(picked.and_then(|p| p.into_path().ok()).map(|p| p.display().to_string()))
@@ -670,7 +695,7 @@ async fn change_folder(app: AppHandle, folder: String, move_items: bool) -> Resu
         let (store, storage, library) = (task.state::<Arc<Store>>(), task.state::<Arc<Storage>>(), task.state::<Arc<Library>>());
         let new = PathBuf::from(folder.trim());
         if !new.is_absolute() {
-            return Err("choose a full folder path".into());
+            return Err(t!("Choose a full folder path"));
         }
         Storage::check_writable(&new)?;
         let old = storage.folder();
@@ -684,6 +709,8 @@ async fn change_folder(app: AppHandle, folder: String, move_items: bool) -> Resu
             task.asset_protocol_scope().allow_directory(dir, true).map_err(|e| e.to_string())?;
         }
         library.set_dirs(clips, shots);
+        let trash = library.ensure_trash()?;
+        task.asset_protocol_scope().allow_directory(&trash, true).map_err(|e| e.to_string())?;
         library.scan()?;
         task.state::<Engine>().restart();
         log!("capture folder: {} -> {} ({moved} moved, {} failed)", old.display(), new.display(), failed.len());
@@ -695,11 +722,39 @@ async fn change_folder(app: AppHandle, folder: String, move_items: bool) -> Resu
     Ok(summary)
 }
 
+/// Tells the windows that the library and the room it takes changed.
+fn library_changed(app: &AppHandle) {
+    let _ = app.emit("library-changed", Value::Null);
+    let _ = app.emit("storage-state", app.state::<Arc<Storage>>().state(&app.state::<Arc<Library>>()));
+}
+
+/// Runs `action` on each path off the main thread: the results that worked, and
+/// the paths that failed with why.
+async fn for_each_item(paths: Vec<String>, action: impl Fn(&str) -> Result<Value, String> + Send + 'static) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (mut items, mut failed) = (Vec::new(), Vec::new());
+        for path in paths {
+            match action(&path) {
+                Ok(item) => items.push(item),
+                Err(e) => {
+                    log!("{path}: {e}");
+                    failed.push(format!("{path}: {e}"));
+                }
+            }
+        }
+        json!({ "items": items, "failed": failed })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Marks items to keep, or not (spec storage.limits).
 #[tauri::command]
-fn library_keep(app: AppHandle, path: String, kept: bool) -> Result<Value, String> {
-    let item = app.state::<Arc<Library>>().set_kept(&path, kept)?;
-    let _ = app.emit("library-changed", item.clone());
-    Ok(item)
+async fn library_keep(app: AppHandle, paths: Vec<String>, kept: bool) -> Result<Value, String> {
+    let library = app.state::<Arc<Library>>().inner().clone();
+    let result = for_each_item(paths, move |path| library.set_kept(path, kept)).await?;
+    let _ = app.emit("library-changed", Value::Null);
+    Ok(result)
 }
 
 /// Shows a sample notice of the given kind, with its sound.
@@ -707,16 +762,18 @@ fn library_keep(app: AppHandle, path: String, kept: bool) -> Result<Value, Strin
 fn preview_notice(app: AppHandle, kind: String) {
     let notifier = app.state::<Notifier>();
     match kind.as_str() {
-        "screenshot" => notifier.notify(Kind::Screenshot, "Screenshot saved", "Saved to your screenshots"),
-        "error" => notifier.notify(Kind::Error, "Clip not saved", "Disk almost full: free up space to keep recording"),
-        _ => notifier.notify(Kind::Clip, "Clip saved", &format!("Last {} s", app.state::<Arc<Store>>().get().clip_secs)),
+        "screenshot" => notifier.notify(Kind::Screenshot, &t!("Screenshot saved"), &t!("Saved to your screenshots")),
+        "error" => notifier.notify(Kind::Error, &t!("Clip not saved"), &t!("Disk almost full: free up space to keep recording")),
+        _ => notifier.notify(Kind::Clip, &t!("Clip saved"), &t!("Last {secs} s", secs = app.state::<Arc<Store>>().get().clip_secs)),
     }
 }
 
 #[tauri::command]
-async fn library_list(library: tauri::State<'_, Arc<Library>>, kind: Option<String>, game: Option<String>) -> Result<Vec<Value>, String> {
+async fn library_list(library: tauri::State<'_, Arc<Library>>, kind: Option<String>, game: Option<String>, deleted: Option<bool>) -> Result<Vec<Value>, String> {
     let library = library.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || library.list(kind.as_deref(), game.as_deref())).await.map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || if deleted == Some(true) { library.list_deleted() } else { library.list(kind.as_deref(), game.as_deref()) })
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -760,13 +817,52 @@ async fn library_trim_info(app: AppHandle, path: String) -> Result<Value, String
 
 /// Deletes a clip or screenshot from the viewer: the file goes to the Recycle Bin.
 #[tauri::command]
-async fn library_delete(app: AppHandle, path: String) -> Result<(), String> {
+async fn library_delete(app: AppHandle, paths: Vec<String>) -> Result<Value, String> {
     let library = app.state::<Arc<Library>>().inner().clone();
-    let target = path.clone();
-    tauri::async_runtime::spawn_blocking(move || library.delete(&target)).await.map_err(|e| e.to_string())??;
-    log!("deleted: {path}");
-    let _ = app.emit("library-changed", Value::Null);
-    Ok(())
+    let result = for_each_item(paths, move |path| library.delete(path)).await?;
+    log!("deleted to Recently deleted: {}", result["items"].as_array().map_or(0, Vec::len));
+    library_changed(&app);
+    Ok(result)
+}
+
+/// Brings items back from Recently deleted (spec library.trash).
+#[tauri::command]
+async fn library_restore(app: AppHandle, paths: Vec<String>) -> Result<Value, String> {
+    let library = app.state::<Arc<Library>>().inner().clone();
+    let result = for_each_item(paths, move |path| library.restore(path)).await?;
+    log!("restored from Recently deleted: {}", result["items"].as_array().map_or(0, Vec::len));
+    library_changed(&app);
+    Ok(result)
+}
+
+/// Removes items from Recently deleted for good, or all of them without `paths`:
+/// to the Recycle Bin when the storage setting says so.
+#[tauri::command]
+async fn library_purge(app: AppHandle, paths: Option<Vec<String>>) -> Result<Value, String> {
+    let library = app.state::<Arc<Library>>().inner().clone();
+    let recycle = app.state::<Arc<Store>>().get().recycle;
+    let paths = match paths {
+        Some(paths) => paths,
+        None => library.list_deleted()?.iter().filter_map(|i| i["path"].as_str().map(String::from)).collect(),
+    };
+    let result = for_each_item(paths, move |path| library.purge(path, recycle).map(|()| json!(path))).await?;
+    log!("removed for good from Recently deleted: {}", result["items"].as_array().map_or(0, Vec::len));
+    library_changed(&app);
+    Ok(result)
+}
+
+/// Removes for good the deleted items whose days are up (spec library.trash), now
+/// and every ten minutes.
+fn watch_deleted(app: AppHandle) {
+    std::thread::spawn(move || loop {
+        let settings = app.state::<Arc<Store>>().get();
+        let removed = app.state::<Arc<Library>>().expire(settings.deleted_days, settings.recycle);
+        if !removed.is_empty() {
+            log!("recently deleted: {} item(s) past {} day(s) removed", removed.len(), settings.deleted_days);
+            library_changed(&app);
+        }
+        std::thread::sleep(Duration::from_secs(600));
+    });
 }
 
 #[tauri::command]
@@ -790,12 +886,12 @@ const SOURCE_URL: &str = "https://github.com/GabriPires/laurel";
 #[tauri::command]
 fn licenses() -> Value {
     let mut docs = vec![
-        json!({ "title": "Laurel: GNU GPL, version 2", "text": include_str!("../../LICENSE") }),
-        json!({ "title": "Third-party notices", "text": include_str!("../../THIRD-PARTY-NOTICES.md") }),
+        json!({ "title": t!("Laurel: GNU GPL, version 2"), "text": include_str!("../../LICENSE") }),
+        json!({ "title": t!("Third-party notices"), "text": include_str!("../../THIRD-PARTY-NOTICES.md") }),
     ];
     let engine = engine_exe();
     let folder = engine.parent().and_then(Path::parent).and_then(Path::parent).map(|runtime| runtime.join("licenses"));
-    for (file, title) in [("OBS-RUNTIME.txt", "OBS Studio runtime"), ("FFMPEG.txt", "FFmpeg"), ("gplv3.txt", "GNU GPL, version 3")] {
+    for (file, title) in [("OBS-RUNTIME.txt", t!("OBS Studio runtime")), ("FFMPEG.txt", "FFmpeg".into()), ("gplv3.txt", t!("GNU GPL, version 3"))] {
         if let Some(text) = folder.as_ref().and_then(|f| std::fs::read_to_string(f.join(file)).ok()) {
             docs.push(json!({ "title": title, "text": text }));
         }
@@ -838,21 +934,21 @@ fn start_view() -> Option<String> {
 
 #[tauri::command]
 fn save_clip_now(app: AppHandle) {
-    save_clip(&app);
+    save_clip(&app, "the title bar button");
 }
 
 #[tauri::command]
 fn screenshot_now(app: AppHandle) {
-    take_screenshot(&app);
+    take_screenshot(&app, "the title bar button");
 }
 
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
-    let open = MenuItem::with_id(app, "open", "Open Laurel", true, None::<&str>)?;
+    let open = MenuItem::with_id(app, "open", t!("Open Laurel"), true, None::<&str>)?;
     let settings = app.state::<Arc<Store>>().get();
-    let toggle = CheckMenuItem::with_id(app, "toggle", format!("Recording{}", hotkey_suffix(&settings, "toggle")), true, settings.recording_enabled, None::<&str>)?;
-    let clip = MenuItem::with_id(app, "clip", format!("Save clip{}", hotkey_suffix(&settings, "clip")), true, None::<&str>)?;
-    let shot = MenuItem::with_id(app, "shot", format!("Screenshot{}", hotkey_suffix(&settings, "screenshot")), true, None::<&str>)?;
-    let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let toggle = CheckMenuItem::with_id(app, "toggle", format!("{}{}", t!("Recording"), hotkey_suffix(&settings, "toggle")), true, settings.recording_enabled, None::<&str>)?;
+    let clip = MenuItem::with_id(app, "clip", format!("{}{}", t!("Save clip"), hotkey_suffix(&settings, "clip")), true, None::<&str>)?;
+    let shot = MenuItem::with_id(app, "shot", format!("{}{}", t!("Screenshot"), hotkey_suffix(&settings, "screenshot")), true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", t!("Quit"), true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &toggle, &clip, &shot, &PredefinedMenuItem::separator(app)?, &quit_item])?;
     let mut tray = TrayIconBuilder::with_id("main").tooltip("Laurel").menu(&menu).show_menu_on_left_click(false);
     if let Some(icon) = app.default_window_icon() {
@@ -865,8 +961,8 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             let app = app.clone();
             std::thread::spawn(move || set_recording_enabled(&app, !enabled, false));
         }
-        "clip" => save_clip(app),
-        "shot" => take_screenshot(app),
+        "clip" => save_clip(app, "the tray menu"),
+        "shot" => take_screenshot(app, "the tray menu"),
         "quit" => quit(app),
         _ => {}
     })
@@ -876,7 +972,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
         }
     })
     .build(app)?;
-    app.manage(TrayItems { toggle, clip, shot });
+    app.manage(TrayItems { open, toggle, clip, shot, quit: quit_item });
     Ok(())
 }
 
@@ -886,26 +982,26 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
 fn tray_state(app: &AppHandle) -> (&'static str, String) {
     let engine = app.state::<Engine>().state();
     let game = app.state::<Arc<Detector>>().snapshot();
-    let name = game["game"]["name"].as_str().unwrap_or("the game");
+    let name = game["game"]["name"].as_str().map_or_else(|| t!("the game"), String::from);
     match engine["state"].as_str().unwrap_or_default() {
-        "failed" | "stopped" => return ("attention", "Laurel: the recording engine stopped".into()),
-        "starting" if game["enabled"] != false => return ("waiting", "Laurel: starting".into()),
+        "failed" | "stopped" => return ("attention", t!("Laurel: the recording engine stopped")),
+        "starting" if game["enabled"] != false => return ("waiting", t!("Laurel: starting")),
         _ => {}
     }
     if game["enabled"] == false {
-        ("off", "Laurel: recording is off".into())
+        ("off", t!("Laurel: recording is off"))
     } else if app.state::<Arc<Storage>>().is_paused() {
-        ("attention", "Laurel: paused, the disk is almost full".into())
+        ("attention", t!("Laurel: paused, the disk is almost full"))
     } else if game["needsAdmin"] == true {
-        ("attention", format!("Laurel: {name} needs administrator"))
+        ("attention", t!("Laurel: {name} needs administrator", name = name))
     } else if game["recording"] == true && game["capture"] == "screen" {
-        ("recording", "Laurel: recording the screen".into())
+        ("recording", t!("Laurel: recording the screen"))
     } else if game["recording"] == true && !game["game"].is_null() {
-        ("recording", format!("Laurel: recording {name}"))
+        ("recording", t!("Laurel: recording {name}", name = name))
     } else if game["recording"] == true && game["mode"] == "fixed" {
-        ("recording", "Laurel: recording".into())
+        ("recording", t!("Laurel: recording"))
     } else {
-        ("waiting", "Laurel: waiting for a game".into())
+        ("waiting", t!("Laurel: waiting for a game"))
     }
 }
 
@@ -968,9 +1064,12 @@ fn selftest(app: AppHandle) {
     let notifier = app.state::<Notifier>().inner().clone();
     let user_settings = notifier.settings();
     let _ = notifier.set_settings(Settings { overlay: true, sounds: false, ..user_settings.clone() });
+    // The checks read the English texts.
+    i18n::set("en");
     let run = || -> Result<(), String> {
         wait_ready("at start")?;
         check_log_rotation()?;
+        check_language()?;
         std::thread::sleep(Duration::from_secs(8)); // let the "Recording" notice expire
         let first = clip()?;
         check_library(&app, &first)?;
@@ -992,12 +1091,30 @@ fn selftest(app: AppHandle) {
         check_toggle_and_cursor(&app, &engine)
     };
     let outcome = run();
+    i18n::set(&user_settings.language);
     let _ = notifier.set_settings(user_settings);
     match outcome {
         Ok(()) => log!("selftest: PASS"),
         Err(e) => log!("selftest: FAIL {e}"),
     }
     quit(&app);
+}
+
+/// Self-test of the interface language: the Portuguese strings load, a count picks
+/// its form, fields are filled in, and English comes back.
+fn check_language() -> Result<(), String> {
+    i18n::set("pt-BR");
+    let saved = t!("Clip saved");
+    let last = t!("Last {secs} s", secs = 30);
+    let items = (i18n::tr_plural(1, "{n} item", "{n} items", &[]), i18n::tr_plural(3, "{n} item", "{n} items", &[]));
+    let script = i18n::script();
+    i18n::set("en");
+    let english = t!("Clip saved");
+    log!("[selftest] language: {saved:?}, {last:?}, {items:?}; window script {} bytes; back to English: {english:?}", script.len());
+    if saved == "Clip saved" || last.contains("{secs}") || items.0 == items.1 || english != "Clip saved" || !script.contains("\"pt-BR\"") {
+        return Err("the interface language did not behave".into());
+    }
+    Ok(())
 }
 
 /// Self-test of game detection (specs game.detection, game.manual-add): a program
@@ -1359,13 +1476,24 @@ fn check_library(app: &AppHandle, saved: &Value) -> Result<(), String> {
     if frames.iter().filter(|f| f.exists()).count() != 12 || count(&exact) != 60 || count(&fast) != fast_expected || exact["audioTracks"] != item["audioTracks"] || again_path.contains("(trim) (trim)") {
         return Err("the new trim did not behave".into());
     }
-    // Delete (the viewer's Delete key): the file leaves the folder and the index.
+    // Delete (spec library.trash): the file moves to Recently deleted, comes back
+    // where it was, and leaves for good, with its thumbnail.
+    let exists = |p: &str| std::path::Path::new(p).exists();
     let again_thumb = again["thumbnail"].as_str().unwrap_or_default().to_string();
-    library.delete(&again_path)?;
-    let still_listed = library.list(Some("clip"), None)?.iter().any(|i| i["path"] == again_path.as_str());
-    log!("[selftest] deleted {again_path}: on disk {}, listed {still_listed}, thumbnail on disk {}", std::path::Path::new(&again_path).exists(), std::path::Path::new(&again_thumb).exists());
-    if std::path::Path::new(&again_path).exists() || still_listed || (!again_thumb.is_empty() && std::path::Path::new(&again_thumb).exists()) {
-        return Err("delete left the clip behind".into());
+    let deleted = library.delete(&again_path)?;
+    let trashed = deleted["path"].as_str().unwrap_or_default().to_string();
+    let listed = |p: &str| -> Result<(bool, bool), String> {
+        Ok((library.list(Some("clip"), None)?.iter().any(|i| i["path"] == p), library.list_deleted()?.iter().any(|i| i["path"] == p)))
+    };
+    let after_delete = (exists(&again_path), exists(&trashed), listed(&trashed)?, deleted["originalPath"] == again_path.as_str());
+    let restored = library.restore(&trashed)?;
+    let after_restore = (exists(&again_path), exists(&trashed), listed(&again_path)?, restored["deletedMs"].is_null());
+    let trashed = library.delete(&again_path)?["path"].as_str().unwrap_or_default().to_string();
+    library.purge(&trashed, true)?;
+    let after_purge = (exists(&trashed), listed(&trashed)?, !again_thumb.is_empty() && exists(&again_thumb));
+    log!("[selftest] deleted {again_path} to {trashed}: {after_delete:?}; restored: {after_restore:?}; removed for good: {after_purge:?}");
+    if after_delete != (false, true, (false, true), true) || after_restore != (true, false, (true, false), true) || after_purge != (false, (false, false), false) || !trashed.contains(r"\.deleted\") {
+        return Err("delete, restore or removal did not behave".into());
     }
     let listed = library.list(Some("clip"), Some("Laurel self-test"))?;
     log!("[selftest] library lists {} self-test clips", listed.len());
@@ -1483,6 +1611,17 @@ fn check_storage(app: &AppHandle, engine: &Engine) -> Result<(), String> {
     log!("[selftest] limit removed {removed:?}; on disk: {on_disk:?}");
     if removed != [paths[1].clone()] || on_disk != [true, false, true] {
         return Err("the size limit removed the wrong item".into());
+    }
+    // Recently deleted goes before the oldest item, and leaves when its days are up
+    // (these test files are deleted, not sent to the Recycle Bin).
+    let trashed = lib.delete(&paths[2])?["path"].as_str().unwrap_or_default().to_string();
+    let first = Storage::enforce_limit_bytes(&lib, lib.total_size() - 1, false);
+    let trashed = lib.delete(&paths[0])?["path"].as_str().unwrap_or_default().to_string() + "|" + &trashed;
+    let kept_days = lib.expire(1, false);
+    let expired = lib.expire(0, false);
+    log!("[selftest] the limit removed {first:?} first (deleted {trashed}); one day kept {kept_days:?}; no days removed {expired:?}");
+    if first.len() != 1 || !trashed.ends_with(&first[0]) || !kept_days.is_empty() || expired.len() != 1 || !lib.list_deleted()?.is_empty() {
+        return Err("Recently deleted and the size limit did not behave".into());
     }
     drop(lib);
     let _ = std::fs::remove_dir_all(&tmp);
@@ -1603,6 +1742,18 @@ fn main() {
         // Tauri's own Raw Input registration would replace the hotkeys' one (one
         // registration per device type and process); the app needs no device events.
         .device_event_filter(tauri::DeviceEventFilter::Always)
+        // The main window's first script (index.html): the interface language and its
+        // strings (i18n.rs), read on every load, so a reload shows a new language.
+        // Windows serves the scheme as http://laurel.localhost/.
+        .register_uri_scheme_protocol("laurel", |_ctx, request| {
+            let (status, body) = if request.uri().path() == "/i18n.js" { (200, i18n::script()) } else { (404, String::new()) };
+            tauri::http::Response::builder()
+                .status(status)
+                .header("Content-Type", "text/javascript; charset=utf-8")
+                .header("Cache-Control", "no-store")
+                .body(body.into_bytes())
+                .unwrap_or_default()
+        })
         .invoke_handler(tauri::generate_handler![
             engine_request,
             engine_state,
@@ -1617,6 +1768,8 @@ fn main() {
             library_trim_info,
             library_keep,
             library_delete,
+            library_restore,
+            library_purge,
             set_autostart,
             pick_folder,
             pick_exe,
@@ -1654,6 +1807,8 @@ fn main() {
             log!("Laurel {} starting; work dir {}; administrator: {}", app.package_info().version, work_dir.display(), win::self_elevated());
             let store = Arc::new(Store::open(&work_dir.join("settings.json")));
             app.manage(store.clone());
+            i18n::set(&store.get().language);
+            log!("language: {} ({})", store.get().language, i18n::current());
             // Game detection, unless a fixed target is asked for. The self-test records
             // no capture at all (a fullscreen game capture would hook whatever game the
             // player has open) and turns detection on for its own check.
@@ -1688,14 +1843,19 @@ fn main() {
                 let _ = std::fs::create_dir_all(&dir);
                 app.asset_protocol_scope().allow_directory(&dir, true)?;
             }
+            match library.ensure_trash() {
+                Ok(trash) => app.asset_protocol_scope().allow_directory(&trash, true)?,
+                Err(e) => log!("recently deleted unavailable: {e}"),
+            }
             app.manage(library.clone());
             let handle = app.handle().clone();
-            std::thread::spawn(move || match library.scan() {
-                Ok((added, removed)) => {
-                    log!("library scan: {added} added, {removed} removed");
-                    let _ = handle.emit("library-changed", Value::Null);
+            std::thread::spawn(move || {
+                match library.scan() {
+                    Ok((added, removed)) => log!("library scan: {added} added, {removed} removed"),
+                    Err(e) => log!("library scan failed: {e}"),
                 }
-                Err(e) => log!("library scan failed: {e}"),
+                library_changed(&handle);
+                watch_deleted(handle);
             });
             // The windows are created here, after every state they call into exists
             // (windows created from the config would load before setup runs).

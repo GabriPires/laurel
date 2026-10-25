@@ -1,6 +1,6 @@
 // Settings (storage.location, storage.limits, app.startup, overlay.in-game,
 // alerts.sound, capture.cursor, capture.screen, quality.encoding,
-// audio.separate-tracks): pages picked in the side panel,
+// audio.separate-tracks, the interface language): pages picked in the side panel,
 // which a search narrows down, and the first-run "start with Windows?" banner.
 // The backend saves the whole settings object, so every save sends all fields.
 let settings = null;
@@ -34,9 +34,6 @@ $('settings-search').oninput = () => {
   if (found.size && !found.has(settingsPage)) showPage([...found][0]);
 };
 
-const GB = 1024 ** 3;
-const fmtGb = (bytes) => `${(bytes / GB).toFixed(1)} GB`;
-
 function namingPreview(pattern) {
   const d = new Date();
   const two = (n) => String(n).padStart(2, '0');
@@ -49,11 +46,16 @@ function namingPreview(pattern) {
 
 function showStorage(storage) {
   $('opt-folder').textContent = storage.folder;
-  const parts = [`${fmtGb(storage.usedBytes)} used`];
-  if (settings.limitEnabled) parts[0] += ` of ${settings.limitGb} GB`;
-  if (storage.freeBytes != null) parts.push(`${fmtGb(storage.freeBytes)} free on the drive`);
-  if (storage.pausedForDisk) parts.push('recording paused: disk almost full');
+  const used = fmtSize(storage.usedBytes);
+  const parts = [settings.limitEnabled ? t('{used} used of {limit} GB', { used, limit: fmtNum(settings.limitGb) }) : t('{used} used', { used })];
+  if (storage.freeBytes != null) parts.push(t('{free} free on the drive', { free: fmtSize(storage.freeBytes) }));
+  if (storage.pausedForDisk) parts.push(t('recording paused: disk almost full'));
   $('storage-usage').textContent = parts.join(' · ');
+  const deleted = storage.deletedCount ?? 0;
+  $('deleted-usage').textContent = deleted
+    ? tp(deleted, 'Deleted clips and screenshots wait here before they go for good. Now: {n} item, {size}.', 'Deleted clips and screenshots wait here before they go for good. Now: {n} items, {size}.', { size: fmtSize(storage.deletedBytes) })
+    : t('Deleted clips and screenshots wait here before they go for good. Nothing there now.');
+  $('deleted-empty').disabled = deleted === 0;
   window.showStorageBar?.(storage, settings.limitEnabled ? settings.limitGb : 0);
   pausedForDisk = storage.pausedForDisk;
   showStatus();
@@ -61,7 +63,7 @@ function showStorage(storage) {
 
 // Video (spec quality.encoding): the encoders and codecs this PC has come from the
 // engine, and the resolutions go up to the monitor's.
-const FAMILIES = { nvenc: 'NVIDIA NVENC', amf: 'AMD AMF', qsv: 'Intel Quick Sync', x264: 'Processor (x264)' };
+const FAMILIES = { nvenc: 'NVIDIA NVENC', amf: 'AMD AMF', qsv: 'Intel Quick Sync', x264: t('Processor (x264)') };
 
 function setSelect(select, value) {
   if (![...select.options].some((o) => o.value === String(value))) select.append(new Option(String(value), String(value)));
@@ -71,9 +73,9 @@ function setSelect(select, value) {
 function fillVideo(s, info = engineInfo) {
   const encoders = info?.encoders ?? [];
   const families = [...new Set(encoders.map((e) => e.family))];
-  const options = [['auto', 'Auto'], ...families.map((f) => [f, FAMILIES[f] ?? f])];
+  const options = [['auto', t('Auto')], ...families.map((f) => [f, FAMILIES[f] ?? f])];
   if (s.videoEncoder !== 'auto' && encoders.length && !families.includes(s.videoEncoder)) {
-    options.push([s.videoEncoder, `${FAMILIES[s.videoEncoder] ?? s.videoEncoder} (not on this PC)`]);
+    options.push([s.videoEncoder, t('{encoder} (not on this PC)', { encoder: FAMILIES[s.videoEncoder] ?? s.videoEncoder })]);
   }
   $('opt-video-encoder').replaceChildren(...options.map(([value, text]) => new Option(text, value)));
   setSelect($('opt-video-encoder'), s.videoEncoder);
@@ -85,7 +87,7 @@ function fillVideo(s, info = engineInfo) {
   $('opt-video-codec').value = s.videoCodec;
   const base = info?.base ?? [0, 0];
   const heights = [2160, 1440, 1080, 720].filter((h) => !base[1] || h < base[1]);
-  $('opt-video-height').replaceChildren(new Option(base[1] ? `Monitor (${base[0]}x${base[1]})` : 'Monitor', '0'), ...heights.map((h) => new Option(`${h}p`, String(h))));
+  $('opt-video-height').replaceChildren(new Option(base[1] ? t('Monitor ({size})', { size: `${base[0]}x${base[1]}` }) : t('Monitor'), '0'), ...heights.map((h) => new Option(`${h}p`, String(h))));
   setSelect($('opt-video-height'), s.videoHeight);
   setSelect($('opt-video-fps'), s.videoFps);
   setSelect($('opt-clip-secs'), s.clipSecs);
@@ -97,10 +99,13 @@ function fillVideo(s, info = engineInfo) {
 // What the clips' main track holds (D12 revised): the one Laurel, Discord and
 // most players play. All PC sound takes everything the speakers play.
 const MIX_DESC = {
-  game: 'What you hear when a clip plays in Laurel, Discord or any player. Only the game: your voice stays on its own track.',
-  'game-mic': 'What you hear when a clip plays in Laurel, Discord or any player: the game and your voice.',
-  'pc-mic': 'Everything your PC plays goes into clips: Discord, music, notifications and Laurel\'s own sounds, plus your voice.',
+  game: t('What you hear when a clip plays in Laurel, Discord or any player. Only the game: your voice stays on its own track.'),
+  'game-mic': t('What you hear when a clip plays in Laurel, Discord or any player: the game and your voice.'),
+  'pc-mic': t('Everything your PC plays goes into clips: Discord, music, notifications and Laurel\'s own sounds, plus your voice.'),
 };
+
+// Language names in their own language.
+const LANGUAGE_NAMES = { en: 'English', 'pt-BR': 'Português (Brasil)' };
 
 function showMix(mix) {
   $('audio-mix-desc').textContent = MIX_DESC[mix] ?? MIX_DESC['game-mic'];
@@ -125,6 +130,7 @@ function fill(s) {
   $('opt-limit-gb').value = s.limitGb;
   $('opt-recycle').checked = s.recycle;
   $('opt-min-free').value = s.minFreeGb;
+  $('opt-deleted-days').value = String(s.deletedDays);
   $('opt-cursor').checked = s.showCursor;
   $('opt-screen').checked = s.screenRecording;
   $('opt-screen-switch').checked = s.screenGameSwitch;
@@ -133,6 +139,8 @@ function fill(s) {
   fillVideo(s);
   $('opt-audio-mix').value = s.audioMix;
   $('opt-updates').checked = s.checkUpdates;
+  $('opt-language').querySelector('option[value="system"]').textContent = t('Windows language ({language})', { language: LANGUAGE_NAMES[s.systemLanguage] ?? s.systemLanguage });
+  $('opt-language').value = s.language;
   showMix(s.audioMix);
   fillMonitors(s.screenMonitor);
   $('opt-autostart').checked = s.autostart;
@@ -153,7 +161,7 @@ async function fillMonitors(selected) {
   }
   const primary = document.createElement('option');
   primary.value = '';
-  primary.textContent = 'Primary monitor';
+  primary.textContent = t('Primary monitor');
   select.replaceChildren(primary, ...monitors.map((m) => {
     const option = document.createElement('option');
     option.value = m.id;
@@ -178,6 +186,7 @@ async function saveSettings() {
     limitGb: Number($('opt-limit-gb').value) || settings.limitGb,
     recycle: $('opt-recycle').checked,
     minFreeGb: Number($('opt-min-free').value),
+    deletedDays: Number($('opt-deleted-days').value),
     showCursor: $('opt-cursor').checked,
     screenRecording: $('opt-screen').checked,
     screenMonitor: $('opt-screen-monitor').value,
@@ -193,18 +202,29 @@ async function saveSettings() {
     clipSecs: Number($('opt-clip-secs').value),
     audioMix: $('opt-audio-mix').value,
     checkUpdates: $('opt-updates').checked,
+    language: $('opt-language').value,
   };
   try {
     fill(await invoke('set_settings', { settings: next }));
-    $('settings-status').textContent = 'Saved';
+    // A new language: the window reloads with its strings, back on this page.
+    if (settings.languageResolved && settings.languageResolved !== LANG) {
+      try {
+        sessionStorage.setItem('laurel.view', `settings:${settingsPage}`);
+      } catch {
+        // The window opens on the library instead.
+      }
+      location.reload();
+      return;
+    }
+    $('settings-status').textContent = t('Saved');
     setTimeout(() => { $('settings-status').textContent = ''; }, 1500);
   } catch (e) {
-    $('settings-status').textContent = `Could not save: ${e}`;
+    $('settings-status').textContent = t('Could not save: {error}', { error: e });
   }
 }
 
-for (const id of ['opt-overlay', 'opt-sounds', 'opt-volume', 'opt-naming', 'opt-limit', 'opt-limit-gb', 'opt-recycle', 'opt-min-free', 'opt-cursor', 'opt-screen', 'opt-screen-monitor', 'opt-screen-switch',
-  'opt-video-encoder', 'opt-video-codec', 'opt-video-preset', 'opt-video-rate', 'opt-video-bitrate', 'opt-video-height', 'opt-video-fps', 'opt-clip-secs', 'opt-audio-mix', 'opt-updates']) {
+for (const id of ['opt-overlay', 'opt-sounds', 'opt-volume', 'opt-naming', 'opt-limit', 'opt-limit-gb', 'opt-recycle', 'opt-min-free', 'opt-deleted-days', 'opt-cursor', 'opt-screen', 'opt-screen-monitor', 'opt-screen-switch',
+  'opt-video-encoder', 'opt-video-codec', 'opt-video-preset', 'opt-video-rate', 'opt-video-bitrate', 'opt-video-height', 'opt-video-fps', 'opt-clip-secs', 'opt-audio-mix', 'opt-updates', 'opt-language']) {
   $(id).addEventListener('change', saveSettings);
 }
 $('opt-volume').oninput = () => { $('opt-volume-value').textContent = $('opt-volume').value; };
@@ -215,12 +235,12 @@ $('preview-error').onclick = () => invoke('preview_notice', { kind: 'error' });
 // First run (app.startup): the installer turns start with Windows on, and the banner
 // confirms it; without the installer it asks.
 function showStartupBanner(on) {
-  $('banner-title').textContent = on ? 'Laurel starts with Windows' : 'Start Laurel with Windows?';
+  $('banner-title').textContent = on ? t('Laurel starts with Windows') : t('Start Laurel with Windows?');
   $('banner-text').textContent = on
-    ? 'It waits in the tray, ready to record when you open a game. You can change this later in Settings, Startup.'
-    : 'Laurel then waits in the tray, ready to record when you open a game.';
-  $('banner-yes').textContent = on ? 'Keep it on' : 'Start with Windows';
-  $('banner-no').textContent = on ? 'Turn it off' : 'Not now';
+    ? t('It waits in the tray, ready to record when you open a game. You can change this later in Settings, Startup.')
+    : t('Laurel then waits in the tray, ready to record when you open a game.');
+  $('banner-yes').textContent = on ? t('Keep it on') : t('Start with Windows');
+  $('banner-no').textContent = on ? t('Turn it off') : t('Not now');
 }
 
 // Startup (app.startup): the Run key is the source of truth.
@@ -228,7 +248,7 @@ async function setAutostart(enabled) {
   try {
     fill(await invoke('set_autostart', { enabled }));
   } catch (e) {
-    $('settings-status').textContent = `Could not change startup: ${e}`;
+    $('settings-status').textContent = t('Could not change startup: {error}', { error: e });
   }
 }
 $('opt-autostart').onchange = () => setAutostart($('opt-autostart').checked);
@@ -244,28 +264,47 @@ $('change-folder').onclick = async () => {
   pendingFolder = folder;
   const items = (await invoke('library_list', {})).length;
   $('move-question').textContent = items
-    ? `Move your ${items} clips and screenshots to ${folder}?`
-    : `Use ${folder} for new clips and screenshots?`;
+    ? tp(items, 'Move your clip or screenshot to {folder}?', 'Move your {n} clips and screenshots to {folder}?', { folder })
+    : t('Use {folder} for new clips and screenshots?', { folder });
   $('move-no').hidden = items === 0;
-  $('move-yes').textContent = items ? 'Move them' : 'Use this folder';
+  $('move-yes').textContent = items ? t('Move them') : t('Use this folder');
   $('move-confirm').hidden = false;
 };
 
 async function applyFolder(moveItems) {
   $('move-confirm').hidden = true;
-  $('settings-status').textContent = moveItems ? 'Moving your files…' : 'Switching folders…';
+  $('settings-status').textContent = moveItems ? t('Moving your files…') : t('Switching folders…');
   try {
     const result = await invoke('change_folder', { folder: pendingFolder, moveItems });
     $('settings-status').textContent = result.failed.length
-      ? `Moved ${result.moved}; ${result.failed.length} could not be moved`
-      : moveItems ? `Moved ${result.moved} files` : 'Folder changed';
-    activity(`Capture folder changed to ${pendingFolder}`);
+      ? t('Moved {moved}; {failed} could not be moved', { moved: result.moved, failed: result.failed.length })
+      : moveItems ? tp(result.moved, 'Moved {n} file', 'Moved {n} files') : t('Folder changed');
+    activity(t('Capture folder changed to {folder}', { folder: pendingFolder }));
   } catch (e) {
     $('settings-status').textContent = `${e}`;
   }
   pendingFolder = null;
   loadSettings();
 }
+
+// Recently deleted (library.trash): emptied for good after a confirmation.
+$('deleted-empty').onclick = () => {
+  const n = settings.storage.deletedCount ?? 0;
+  $('deleted-question').textContent = `${tp(n, 'Delete the {n} item in Recently deleted for good?', 'Delete the {n} items in Recently deleted for good?')} ${goneNote()}`;
+  $('deleted-confirm').hidden = false;
+  $('deleted-yes').focus();
+};
+$('deleted-no').onclick = () => { $('deleted-confirm').hidden = true; };
+$('deleted-yes').onclick = async () => {
+  $('deleted-confirm').hidden = true;
+  try {
+    const result = await invoke('library_purge', {});
+    $('settings-status').textContent = tp(result.items.length, '{n} item deleted for good', '{n} items deleted for good');
+  } catch (e) {
+    $('settings-status').textContent = t('Could not delete: {error}', { error: e });
+  }
+  loadSettings();
+};
 
 $('move-yes').onclick = () => applyFolder(true);
 $('move-no').onclick = () => applyFolder(false);
@@ -281,7 +320,7 @@ async function loadLicenses() {
   licenseDocs = await invoke('licenses');
   for (const [file, font] of FONT_LICENSES) {
     try {
-      licenseDocs.push({ title: `${font} font: SIL Open Font License`, text: await (await fetch(`fonts/${file}`)).text() });
+      licenseDocs.push({ title: t('{font} font: SIL Open Font License', { font }), text: await (await fetch(`fonts/${file}`)).text() });
     } catch {
       // The interface still lists the others.
     }
@@ -311,12 +350,12 @@ function showUpdate(text, found = updateFound) {
 
 async function checkUpdate() {
   $('update-check').disabled = true;
-  showUpdate('Checking…', null);
+  showUpdate(t('Checking…'), null);
   try {
     const r = await invoke('update_check');
-    showUpdate(r.available ? `Laurel ${r.version} is available (you have ${r.current}).` : `Laurel ${r.current} is up to date.`, r.available ? r : null);
+    showUpdate(r.available ? t('Laurel {version} is available (you have {current}).', r) : t('Laurel {current} is up to date.', r), r.available ? r : null);
   } catch (e) {
-    showUpdate(`Could not check: ${e}`, null);
+    showUpdate(t('Could not check: {error}', { error: e }), null);
   }
   $('update-check').disabled = false;
 }
@@ -324,12 +363,12 @@ async function checkUpdate() {
 async function installUpdate() {
   $('update-install').disabled = true;
   $('update-now').disabled = true;
-  showUpdate(`Downloading Laurel ${updateFound?.version ?? ''}…`);
+  showUpdate(t('Downloading Laurel {version}…', { version: updateFound?.version ?? '' }));
   try {
     await invoke('update_install');
   } catch (e) {
-    showUpdate(`Could not install: ${e}`, null);
-    $('update-text').textContent = `Could not install: ${e}`;
+    showUpdate(t('Could not install: {error}', { error: e }), null);
+    $('update-text').textContent = t('Could not install: {error}', { error: e });
   }
   $('update-install').disabled = false;
   $('update-now').disabled = false;
@@ -340,19 +379,19 @@ $('update-install').onclick = installUpdate;
 $('update-now').onclick = installUpdate;
 $('update-later').onclick = () => { $('update-banner').hidden = true; };
 listen('update-available', (e) => {
-  showUpdate(`Laurel ${e.payload.version} is available (you have ${e.payload.current}).`, e.payload);
-  $('update-title').textContent = `Laurel ${e.payload.version} is ready`;
+  showUpdate(t('Laurel {version} is available (you have {current}).', e.payload), e.payload);
+  $('update-title').textContent = t('Laurel {version} is ready', e.payload);
   $('update-banner').hidden = false;
 });
 listen('update-progress', (e) => {
   const { received, total } = e.payload;
-  const text = total ? `Downloading… ${Math.round((received / total) * 100)}%` : `Downloading… ${(received / 1048576).toFixed(1)} MB`;
+  const text = total ? t('Downloading… {percent}%', { percent: Math.round((received / total) * 100) }) : t('Downloading… {size} MB', { size: fmtNum(received / 1048576, 1) });
   $('update-status').textContent = text;
   $('update-text').textContent = text;
 });
 invoke('update_info').then((info) => {
   if (!info.configured) {
-    $('update-status').textContent = 'Updates are not set up in this build.';
+    $('update-status').textContent = t('Updates are not set up in this build.');
     $('update-check').disabled = true;
   }
 });

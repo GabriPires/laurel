@@ -401,7 +401,7 @@ const PRESETS: [(&str, &[&str]); 3] = [
 /// of them take, the rate control and the preset level as the encoder names them.
 fn video_settings(obs: &Obs, id: &str, args: &Args) -> Data {
     let props = obs.encoder_list_properties(id);
-    let mut data = Data::new().int("bitrate", args.bitrate).int("keyint_sec", 1);
+    let mut data = Data::new().int("bitrate", args.bitrate).int("keyint_sec", recorder::KEYINT_SECS);
     let rate = props.iter().find(|p| p.name == "rate_control").and_then(|p| p.items.iter().find(|(_, v)| v.eq_ignore_ascii_case(&args.rate))).map(|(_, v)| v.clone());
     data = data.str("rate_control", &rate.unwrap_or_else(|| args.rate.to_uppercase()));
     let wanted = PRESETS.iter().find(|(level, _)| *level == args.preset).map_or(&[][..], |(_, values)| *values);

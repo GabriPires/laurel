@@ -6,6 +6,8 @@ use std::ffi::c_void;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 
+use crate::i18n::t;
+
 #[link(name = "user32", kind = "raw-dylib")]
 extern "system" {
     fn OpenClipboard(owner: isize) -> i32;
@@ -61,7 +63,7 @@ unsafe fn global(bytes: &[u8]) -> Result<isize, String> {
 fn set_clipboard(items: &[(u32, Vec<u8>)]) -> Result<(), String> {
     unsafe {
         if OpenClipboard(0) == 0 {
-            return Err("the clipboard is in use by another app".into());
+            return Err(t!("The clipboard is in use by another app"));
         }
         EmptyClipboard();
         let mut result = Ok(());
@@ -91,7 +93,7 @@ pub fn copy_text(text: &str) -> Result<(), String> {
 pub fn copy_file(path: &str) -> Result<(), String> {
     let path = windows_path(path);
     if !Path::new(&path).exists() {
-        return Err(format!("file not found: {path}"));
+        return Err(t!("File not found: {path}", path = path));
     }
     // DROPFILES: pFiles (offset of the list), pt.x, pt.y, fNC, fWide; then the
     // NUL-separated wide path list, ended by an extra NUL.
@@ -132,6 +134,6 @@ fn shell_open(target: &str) -> Result<(), String> {
     if code > 32 {
         Ok(())
     } else {
-        Err(format!("could not open the file (ShellExecute {code})"))
+        Err(t!("Could not open the file (ShellExecute {code})", code = code))
     }
 }

@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
+use crate::i18n::t;
 use crate::log::log;
 
 /// How long after the start the automatic check waits, so it never slows the start.
@@ -30,7 +31,7 @@ pub fn configured(app: &AppHandle) -> bool {
 pub async fn check(app: &AppHandle) -> Result<Value, String> {
     let current = app.package_info().version.to_string();
     if !configured(app) {
-        return Err("updates are not set up in this build".into());
+        return Err(t!("updates are not set up in this build"));
     }
     let found = match app.updater() {
         Ok(updater) => updater.check().await,

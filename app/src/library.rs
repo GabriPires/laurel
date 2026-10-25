@@ -1,15 +1,22 @@
 //! Clip and screenshot library (specs library.browse, library.thumbnails,
-//! edit.trim): a SQLite index of the files in the capture folders, reconciled with
-//! the disk, with thumbnails for every item.
+//! edit.trim, library.trash): a SQLite index of the files in the capture folders,
+//! reconciled with the disk, with thumbnails for every item. Deleted items wait in
+//! Recently deleted, a hidden folder in the capture folder, until they are restored
+//! or their days run out.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
-use crate::{media, mp4, share, win};
+use crate::i18n::t;
+use crate::{media, mp4, share, storage, win};
+
+/// Recently deleted, next to Clips and Screenshots: moving a file there is a rename.
+const TRASH: &str = ".deleted";
+const DAY_MS: i64 = 86_400_000;
 
 pub struct Library {
     db: Mutex<Connection>,
@@ -67,6 +74,17 @@ fn file_size(path: &Path) -> i64 {
     std::fs::metadata(path).map_or(0, |m| m.len() as i64)
 }
 
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+/// `dir/<file name>`, with " (2)", " (3)"... when that name is taken.
+fn free_name(dir: &Path, file: &Path) -> Result<PathBuf, String> {
+    let stem = file.file_stem().ok_or("bad file path")?.to_string_lossy();
+    let ext = file.extension().map(|e| e.to_string_lossy()).unwrap_or_default();
+    Ok(storage::unique(dir, &stem, &ext))
+}
+
 impl Library {
     pub fn open(work_dir: &Path, clips_dir: PathBuf, shots_dir: PathBuf, ffmpeg: Option<PathBuf>) -> Result<Library, String> {
         let db = Connection::open(work_dir.join("library.sqlite")).map_err(|e| e.to_string())?;
@@ -87,6 +105,17 @@ impl Library {
             );",
         )
         .map_err(|e| e.to_string())?;
+        // Recently deleted (library.trash), added after the first releases: when an
+        // item was deleted, and where it came from.
+        let columns: Vec<String> = db
+            .prepare("SELECT name FROM pragma_table_info('items')")
+            .and_then(|mut stmt| stmt.query_map([], |r| r.get(0))?.collect())
+            .map_err(|e| e.to_string())?;
+        for (column, kind) in [("deleted_ms", "INTEGER"), ("original_path", "TEXT")] {
+            if !columns.iter().any(|c| c == column) {
+                db.execute_batch(&format!("ALTER TABLE items ADD COLUMN {column} {kind};")).map_err(|e| e.to_string())?;
+            }
+        }
         let thumbs_dir = work_dir.join("thumbnails");
         std::fs::create_dir_all(&thumbs_dir).map_err(|e| e.to_string())?;
         Ok(Library { db: Mutex::new(db), dirs: Mutex::new((clips_dir, shots_dir)), thumbs_dir, ffmpeg })
@@ -102,6 +131,20 @@ impl Library {
         &self.thumbs_dir
     }
 
+    /// The Recently deleted folder, in the capture folder.
+    pub fn trash_dir(&self) -> PathBuf {
+        let clips = self.dirs.lock().unwrap().0.clone();
+        clips.parent().map_or_else(|| clips.join(TRASH), |folder| folder.join(TRASH))
+    }
+
+    /// Creates the Recently deleted folder if needed, hidden.
+    pub fn ensure_trash(&self) -> Result<PathBuf, String> {
+        let trash = self.trash_dir();
+        std::fs::create_dir_all(&trash).map_err(|e| format!("{}: {e}", trash.display()))?;
+        win::set_hidden(&trash);
+        Ok(trash)
+    }
+
     /// Points the library at a new capture folder; call `scan` afterwards.
     pub fn set_dirs(&self, clips_dir: PathBuf, shots_dir: PathBuf) {
         *self.dirs.lock().unwrap() = (clips_dir, shots_dir);
@@ -112,29 +155,26 @@ impl Library {
         self.db.lock().unwrap().query_row("SELECT COALESCE(SUM(size), 0) FROM items", [], |r| r.get::<_, i64>(0)).unwrap_or(0) as u64
     }
 
-    /// The oldest item not marked to keep (spec storage.limits).
+    /// The next item the size limit removes (spec storage.limits): the one deleted
+    /// first, else the oldest item not marked to keep.
     pub fn oldest_removable(&self) -> Option<String> {
-        self.db.lock().unwrap().query_row("SELECT path FROM items WHERE kept = 0 ORDER BY created_ms ASC LIMIT 1", [], |r| r.get(0)).ok()
+        self.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT path FROM items WHERE kept = 0 OR deleted_ms IS NOT NULL ORDER BY deleted_ms IS NULL, deleted_ms, created_ms LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .ok()
     }
 
     pub fn remove(&self, path: &str) {
         let _ = self.db.lock().unwrap().execute("DELETE FROM items WHERE path = ?1", [path]);
     }
 
-    /// Deletes an item at the user's request (spec library.browse): the file goes
-    /// to the Recycle Bin, and its thumbnail and timeline frames are removed.
-    pub fn delete(&self, path: &str) -> Result<(), String> {
-        let path = share::windows_path(path);
-        let item = self.get(&path)?.ok_or("item not found")?;
-        let file = Path::new(&path);
-        if file.exists() {
-            win::delete_file(file, true)?;
-        }
-        self.remove(&path);
-        if let Some(thumb) = item["thumbnail"].as_str() {
-            let _ = std::fs::remove_file(thumb);
-        }
-        // Timeline frames are cached as "<stem>-<size>-<modified>".
+    /// Removes a file's cached timeline frames, named "<stem>-<size>-<modified>".
+    fn remove_timeline(&self, file: &Path) {
         let stem = file.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         for entry in std::fs::read_dir(self.thumbs_dir.join("timeline")).into_iter().flatten().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -143,11 +183,103 @@ impl Library {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
         }
+    }
+
+    /// Deletes an item at the user's request (specs library.browse, library.trash):
+    /// the file moves to Recently deleted, where `restore` brings it back and
+    /// `expire` removes it for good after the days chosen; the thumbnail stays, the
+    /// timeline frames go. Returns the item at its new place, or null when its file
+    /// was already gone (the entry is then dropped).
+    pub fn delete(&self, path: &str) -> Result<Value, String> {
+        let path = share::windows_path(path);
+        self.get(&path)?.filter(|i| i["deletedMs"].is_null()).ok_or("item not found")?;
+        let file = Path::new(&path);
+        if !file.exists() {
+            self.purge(&path, false)?;
+            return Ok(Value::Null);
+        }
+        let target = free_name(&self.ensure_trash()?, file)?;
+        std::fs::rename(file, &target).map_err(|e| format!("{}: {e}", file.display()))?;
+        let key = target.to_string_lossy().into_owned();
+        self.db
+            .lock()
+            .unwrap()
+            .execute("UPDATE items SET path = ?2, original_path = ?1, deleted_ms = ?3 WHERE path = ?1", params![path, key, now_ms()])
+            .map_err(|e| e.to_string())?;
+        self.remove_timeline(file);
+        self.get(&key)?.ok_or_else(|| "item not indexed".into())
+    }
+
+    /// Brings a deleted item back where it was, under a free name if that one was
+    /// taken since.
+    pub fn restore(&self, path: &str) -> Result<Value, String> {
+        let path = share::windows_path(path);
+        let item = self.get(&path)?.ok_or("item not found")?;
+        let original = PathBuf::from(item["originalPath"].as_str().ok_or("the item is not in Recently deleted")?);
+        let dir = original.parent().ok_or("bad file path")?;
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let target = if original.exists() { free_name(dir, &original)? } else { original };
+        std::fs::rename(&path, &target).map_err(|e| format!("{path}: {e}"))?;
+        let key = target.to_string_lossy().into_owned();
+        self.db
+            .lock()
+            .unwrap()
+            .execute("UPDATE items SET path = ?2, original_path = NULL, deleted_ms = NULL WHERE path = ?1", [&path, &key])
+            .map_err(|e| e.to_string())?;
+        self.get(&key)?.ok_or_else(|| "item not indexed".into())
+    }
+
+    /// Removes an item for good, with its thumbnail and timeline frames: the file
+    /// goes to the Windows Recycle Bin when `recycle`, else it is deleted.
+    pub fn purge(&self, path: &str, recycle: bool) -> Result<(), String> {
+        let path = share::windows_path(path);
+        let item = self.get(&path)?;
+        let file = Path::new(&path);
+        if file.exists() {
+            win::delete_file(file, recycle)?;
+        }
+        self.remove(&path);
+        if let Some(thumb) = item.as_ref().and_then(|i| i["thumbnail"].as_str()) {
+            let _ = std::fs::remove_file(thumb);
+        }
+        self.remove_timeline(file);
         Ok(())
     }
 
-    pub fn rename(&self, from: &str, to: &str) {
-        let _ = self.db.lock().unwrap().execute("UPDATE items SET path = ?2 WHERE path = ?1", [from, to]);
+    /// Removes for good the items deleted `days` or more days ago; returns their paths.
+    pub fn expire(&self, days: u32, recycle: bool) -> Vec<String> {
+        let cutoff = now_ms() - days as i64 * DAY_MS;
+        let paths: Vec<String> = {
+            let db = self.db.lock().unwrap();
+            db.prepare("SELECT path FROM items WHERE deleted_ms IS NOT NULL AND deleted_ms <= ?1")
+                .and_then(|mut stmt| stmt.query_map([cutoff], |r| r.get(0))?.collect())
+                .unwrap_or_default()
+        };
+        paths
+            .into_iter()
+            .filter(|path| match self.purge(path, recycle) {
+                Ok(()) => true,
+                Err(e) => {
+                    crate::log::line(&format!("recently deleted: {e}"));
+                    false
+                }
+            })
+            .collect()
+    }
+
+    /// How many items wait in Recently deleted, and their size in bytes.
+    pub fn deleted_size(&self) -> (u64, u64) {
+        self.db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*), COALESCE(SUM(size), 0) FROM items WHERE deleted_ms IS NOT NULL", [], |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)))
+            .unwrap_or((0, 0))
+    }
+
+    /// Moves an entry to a new path, and its original place too when given (a
+    /// deleted item when the capture folder moves).
+    pub fn rename(&self, from: &str, to: &str, original: Option<&str>) {
+        let _ = self.db.lock().unwrap().execute("UPDATE items SET path = ?2, original_path = COALESCE(?3, original_path) WHERE path = ?1", params![from, to, original]);
     }
 
     pub fn set_kept(&self, path: &str, kept: bool) -> Result<Value, String> {
@@ -206,19 +338,22 @@ impl Library {
     }
 
     /// Reconciles the index with the folders: new files are added, removed files
-    /// leave the index, and missing thumbnails are regenerated.
+    /// leave the index, and missing thumbnails are regenerated. A file found in
+    /// Recently deleted without an entry (a rebuilt index) counts as deleted now.
     pub fn scan(&self) -> Result<(usize, usize), String> {
         let (clips_dir, shots_dir) = self.dirs.lock().unwrap().clone();
-        let mut on_disk = Vec::new();
-        for (dir, exts) in [(&clips_dir, &["mp4"][..]), (&shots_dir, &["png", "jpg"][..])] {
-            let Ok(entries) = std::fs::read_dir(dir) else { continue };
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().is_some_and(|e| exts.iter().any(|x| e.eq_ignore_ascii_case(x))) {
-                    on_disk.push(p.to_string_lossy().into_owned());
-                }
-            }
-        }
+        let media_in = |dir: &Path, exts: &[&str]| -> Vec<String> {
+            let Ok(entries) = std::fs::read_dir(dir) else { return vec![] };
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|p| p.extension().is_some_and(|e| exts.iter().any(|x| e.eq_ignore_ascii_case(x))))
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect()
+        };
+        let mut on_disk = media_in(&clips_dir, &["mp4"]);
+        on_disk.extend(media_in(&shots_dir, &["png", "jpg"]));
+        let in_trash = media_in(&self.trash_dir(), &["mp4", "png", "jpg"]);
         let indexed: Vec<(String, Option<String>)> = {
             let db = self.db.lock().unwrap();
             let mut stmt = db.prepare("SELECT path, thumbnail FROM items").map_err(|e| e.to_string())?;
@@ -227,9 +362,20 @@ impl Library {
         };
         let mut removed = 0;
         // Entries whose file is gone, or that are not in the capture folder any more.
-        for (path, _) in indexed.iter().filter(|(p, _)| !on_disk.contains(p)) {
+        for (path, _) in indexed.iter().filter(|(p, _)| !on_disk.contains(p) && !in_trash.contains(p)) {
             self.db.lock().unwrap().execute("DELETE FROM items WHERE path = ?1", [path]).map_err(|e| e.to_string())?;
             removed += 1;
+        }
+        for path in in_trash.iter().filter(|p| !indexed.iter().any(|(i, _)| i == *p)) {
+            self.add(path, None)?;
+            let file = Path::new(path);
+            let home = if file.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4")) { &clips_dir } else { &shots_dir };
+            let original = home.join(file.file_name().unwrap_or_default()).to_string_lossy().into_owned();
+            self.db
+                .lock()
+                .unwrap()
+                .execute("UPDATE items SET original_path = ?2, deleted_ms = ?3 WHERE path = ?1", params![path, original, now_ms()])
+                .map_err(|e| e.to_string())?;
         }
         // Items indexed without a game get the one in their file name.
         {
@@ -260,13 +406,21 @@ impl Library {
         Ok((added, removed))
     }
 
-    /// Items newest first, optionally of one kind and one game.
+    /// Items newest first, optionally of one kind and one game; deleted ones apart.
     pub fn list(&self, kind: Option<&str>, game: Option<&str>) -> Result<Vec<Value>, String> {
         let db = self.db.lock().unwrap();
         let mut stmt = db
-            .prepare("SELECT * FROM items WHERE (?1 IS NULL OR kind = ?1) AND (?2 IS NULL OR game = ?2) ORDER BY created_ms DESC")
+            .prepare("SELECT * FROM items WHERE deleted_ms IS NULL AND (?1 IS NULL OR kind = ?1) AND (?2 IS NULL OR game = ?2) ORDER BY created_ms DESC")
             .map_err(|e| e.to_string())?;
         let rows = stmt.query_map(params![kind, game], row_json).map_err(|e| e.to_string())?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// The items in Recently deleted, the last deleted first.
+    pub fn list_deleted(&self) -> Result<Vec<Value>, String> {
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare("SELECT * FROM items WHERE deleted_ms IS NOT NULL ORDER BY deleted_ms DESC").map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([], row_json).map_err(|e| e.to_string())?;
         Ok(rows.flatten().collect())
     }
 
@@ -274,7 +428,7 @@ impl Library {
     pub fn games(&self, kind: Option<&str>) -> Result<Vec<String>, String> {
         let db = self.db.lock().unwrap();
         let mut stmt = db
-            .prepare("SELECT DISTINCT game FROM items WHERE game IS NOT NULL AND (?1 IS NULL OR kind = ?1) ORDER BY game")
+            .prepare("SELECT DISTINCT game FROM items WHERE game IS NOT NULL AND deleted_ms IS NULL AND (?1 IS NULL OR kind = ?1) ORDER BY game")
             .map_err(|e| e.to_string())?;
         let rows = stmt.query_map([kind], |r| r.get(0)).map_err(|e| e.to_string())?;
         Ok(rows.flatten().collect())
@@ -287,7 +441,7 @@ impl Library {
     pub fn trim(&self, path: &str, start: f64, end: f64, exact: bool) -> Result<Value, String> {
         let ffmpeg = self.ffmpeg.as_ref().ok_or("ffmpeg.exe was not found")?;
         if end <= start {
-            return Err("the end must come after the start".into());
+            return Err(t!("The end must come after the start"));
         }
         let source = PathBuf::from(share::windows_path(path));
         let stem = source.file_stem().ok_or("bad clip path")?.to_string_lossy().into_owned();
@@ -366,5 +520,7 @@ fn row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "size": r.get::<_, i64>("size")?,
         "thumbnail": r.get::<_, Option<String>>("thumbnail")?,
         "kept": r.get::<_, i64>("kept")? != 0,
+        "deletedMs": r.get::<_, Option<i64>>("deleted_ms")?,
+        "originalPath": r.get::<_, Option<String>>("original_path")?,
     }))
 }

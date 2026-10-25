@@ -5,8 +5,9 @@
 //! (record.toggle), the mouse cursor (capture.cursor), screen recording
 //! (capture.screen, off by default per D13), the video and the clip length
 //! (quality.encoding, record.replay-buffer), and what the clips' main audio track
-//! mixes (audio.separate-tracks), and whether Laurel checks for updates (stage 6
-//! plan). Missing or invalid fields fall back to the defaults.
+//! mixes (audio.separate-tracks), whether Laurel checks for updates (stage 6
+//! plan), the interface language, and how long deleted items wait in Recently
+//! deleted (library.trash). Missing or invalid fields fall back to the defaults.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -43,6 +44,8 @@ pub struct Settings {
     pub recycle: bool,
     /// Recording pauses below this much free space on the capture drive.
     pub min_free_gb: u32,
+    /// Days a deleted item waits in Recently deleted (library.trash): 1, 7, 15 or 30.
+    pub deleted_days: u32,
     /// Whether the user already answered "start with Windows?".
     pub autostart_asked: bool,
     pub custom_games: Vec<CustomGame>,
@@ -77,11 +80,15 @@ pub struct Settings {
     pub audio_mix: String,
     /// Ask the update channel for a new version a little after each start.
     pub check_updates: bool,
+    /// system, en or pt-BR (see i18n.rs).
+    pub language: String,
 }
 
 pub const DEFAULT_NAMING: &str = "{game} {date} {time}";
 pub const DEFAULT_HOTKEY_CLIP: &str = "F8";
 pub const DEFAULT_HOTKEY_SCREENSHOT: &str = "Shift+F8";
+/// The choices for `deleted_days`, decided by the owner on 2026-10-25.
+pub const DELETED_DAYS: [u32; 4] = [1, 7, 15, 30];
 
 impl Default for Settings {
     fn default() -> Settings {
@@ -95,6 +102,7 @@ impl Default for Settings {
             limit_gb: 50,
             recycle: true,
             min_free_gb: 2,
+            deleted_days: 7,
             autostart_asked: false,
             custom_games: vec![],
             ignored_games: vec![],
@@ -116,6 +124,7 @@ impl Default for Settings {
             clip_secs: 30,
             audio_mix: "game-mic".into(),
             check_updates: true,
+            language: "system".into(),
         }
     }
 }
@@ -140,6 +149,7 @@ impl Settings {
             limit_gb: number("limitGb", d.limit_gb, 100_000).max(1),
             recycle: flag("recycle", d.recycle),
             min_free_gb: number("minFreeGb", d.min_free_gb, 1000),
+            deleted_days: Some(number("deletedDays", d.deleted_days, 30)).filter(|n| DELETED_DAYS.contains(n)).unwrap_or(d.deleted_days),
             autostart_asked: flag("autostartAsked", d.autostart_asked),
             custom_games: pairs("customGames", "path", "name").into_iter().map(|(path, name)| CustomGame { path, name }).collect(),
             ignored_games: pairs("ignoredGames", "key", "name").into_iter().map(|(key, name)| IgnoredGame { key, name }).collect(),
@@ -161,6 +171,7 @@ impl Settings {
             clip_secs: number("clipSecs", d.clip_secs, 600).max(5),
             audio_mix: choice("audioMix", &["game", "game-mic", "pc-mic"], &d.audio_mix),
             check_updates: flag("checkUpdates", d.check_updates),
+            language: choice("language", crate::i18n::LANGUAGES, &d.language),
         }
     }
 
@@ -181,6 +192,7 @@ impl Settings {
             "limitGb": self.limit_gb,
             "recycle": self.recycle,
             "minFreeGb": self.min_free_gb,
+            "deletedDays": self.deleted_days,
             "autostartAsked": self.autostart_asked,
             "customGames": self.custom_games.iter().map(|g| json!({ "path": g.path, "name": g.name })).collect::<Vec<_>>(),
             "ignoredGames": self.ignored_games.iter().map(|g| json!({ "key": g.key, "name": g.name })).collect::<Vec<_>>(),
@@ -202,6 +214,7 @@ impl Settings {
             "clipSecs": self.clip_secs,
             "audioMix": self.audio_mix,
             "checkUpdates": self.check_updates,
+            "language": self.language,
         })
     }
 }

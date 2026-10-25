@@ -42,7 +42,7 @@ pub fn sanitize(name: &str) -> String {
 }
 
 /// `dir/<name>.<ext>`, with " (2)", " (3)"... when that name is taken.
-fn unique(dir: &Path, name: &str, ext: &str) -> PathBuf {
+pub fn unique(dir: &Path, name: &str, ext: &str) -> PathBuf {
     let mut path = dir.join(format!("{name}.{ext}"));
     let mut n = 2;
     while path.exists() {
@@ -137,8 +137,8 @@ impl Storage {
         target.to_string_lossy().into_owned()
     }
 
-    /// Removes the oldest items that are not marked to keep until the capture
-    /// folder fits the limit; returns the removed paths.
+    /// Removes items until the capture folder fits the limit, Recently deleted
+    /// first, then the oldest items not marked to keep; returns the removed paths.
     pub fn enforce_limit(&self, library: &Library) -> Vec<String> {
         let settings = self.store.get();
         if !settings.limit_enabled {
@@ -151,11 +151,8 @@ impl Storage {
         let mut removed = Vec::new();
         while library.total_size() > limit {
             let Some(path) = library.oldest_removable() else { break };
-            match win::delete_file(Path::new(&path), recycle) {
-                Ok(()) => {
-                    library.remove(&path);
-                    removed.push(path);
-                }
+            match library.purge(&path, recycle) {
+                Ok(()) => removed.push(path),
                 Err(e) => {
                     crate::log::line(&format!("storage limit: {e}"));
                     break;
@@ -194,28 +191,35 @@ impl Storage {
 
     pub fn state(&self, library: &Library) -> Value {
         let (free, min) = self.free_space();
+        let (deleted_count, deleted_bytes) = library.deleted_size();
         json!({
             "folder": self.folder(),
             "usedBytes": library.total_size(),
+            "deletedCount": deleted_count,
+            "deletedBytes": deleted_bytes,
             "freeBytes": free,
             "minFreeBytes": min,
             "pausedForDisk": self.is_paused(),
         })
     }
 
-    /// Moves every indexed item from the old capture folder to the new one.
+    /// Moves every indexed item from the old capture folder to the new one, those in
+    /// Recently deleted included, with the place they would be restored to.
     pub fn move_items(library: &Library, from: &Path, to: &Path) -> (usize, Vec<String>) {
         let (mut moved, mut failed) = (0, Vec::new());
-        for item in library.list(None, None).unwrap_or_default() {
+        let mut items = library.list(None, None).unwrap_or_default();
+        items.extend(library.list_deleted().unwrap_or_default());
+        for item in items {
             let Some(path) = item["path"].as_str().map(PathBuf::from) else { continue };
             let Ok(rel) = path.strip_prefix(from) else { continue };
             let target = to.join(rel);
             if let Some(dir) = target.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
+            let original = item["originalPath"].as_str().and_then(|o| Path::new(o).strip_prefix(from).ok()).map(|rel| to.join(rel).to_string_lossy().into_owned());
             match move_file(&path, &target) {
                 Ok(()) => {
-                    library.rename(&path.to_string_lossy(), &target.to_string_lossy());
+                    library.rename(&path.to_string_lossy(), &target.to_string_lossy(), original.as_deref());
                     moved += 1;
                 }
                 Err(e) => failed.push(format!("{}: {e}", path.display())),

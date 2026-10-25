@@ -4,7 +4,7 @@
 
 Laurel keeps the last seconds of the game you are playing and saves them as a clip when you press a hotkey. It finds your games on its own, records their sound apart from your microphone, and keeps everything on your PC, in a library where you trim, keep and share your clips.
 
-> **Status: release candidate.** Laurel 0.1.0-rc.1 is a pre-release for a test with friends: an installer for Windows 10 (2004 or later) and 11, 64-bit, that updates itself. It is not signed yet, so Windows SmartScreen warns before it runs. The test guide, in Portuguese, is in [`docs/teste-dos-amigos.md`](docs/teste-dos-amigos.md).
+> **Status: release candidate.** Laurel 0.1.0-rc.2 is a pre-release for a test with friends: an installer for Windows 10 (2004 or later) and 11, 64-bit, that updates itself, in English or Brazilian Portuguese. It is not signed yet, so Windows SmartScreen warns before it runs. The test guide, in Portuguese, is in [`docs/teste-dos-amigos.md`](docs/teste-dos-amigos.md).
 
 *Resumo em português mais abaixo.*
 
@@ -14,7 +14,7 @@ Laurel keeps the last seconds of the game you are playing and saves them as a cl
 - **Finds your games.** Laurel reads the games installed through Steam, Epic Games, Riot and Xbox, plus a curated list and the games you add yourself. It starts capturing when a game opens and stops when it closes. There is no capture source to pick.
 - **Game audio and your voice, apart.** The game's own sound (not Discord or music) and the microphone go on separate tracks, with a mix on the first one.
 - **Captures that hold up.** Game capture through OBS Studio's hook, a window capture fallback, an offer to restart as administrator for games that need it, and an optional screen recording when no game is open (off by default).
-- **A library made for clips.** Clips and screenshots grouped by day, filtered by game, searched and sorted; a muted preview when the pointer rests on a clip; Keep to protect a clip from the size limit; Delete to the Recycle Bin.
+- **A library made for clips.** Clips and screenshots grouped by day, filtered by game, searched and sorted; a muted preview when the pointer rests on a clip; Keep to protect a clip from the size limit; several items selected at once; Delete to Recently deleted, with Undo, where items wait 1 to 30 days before they go for good.
 - **A viewer with a trim.** Laurel's own player, a timeline of frames with two handles, frame-exact cuts (a fast copy or an exact re-encode), copy the file to paste it in Discord, or show it in its folder.
 - **Stays out of the way.** Notices over the game, sounds, start with Windows, a tray icon that shows whether Laurel is recording, a storage limit and a pause when the disk is almost full.
 
@@ -81,8 +81,8 @@ Laurel is an independent project, not affiliated with, endorsed by or sponsored 
 
 ## Em português
 
-O **Laurel** é um gravador de clipes para jogos no Windows, gratuito e de código aberto: sem anúncios, sem paywall e sem conta, com todos os recursos liberados. Ele guarda os últimos segundos do jogo e salva um clipe quando você aperta um atalho (F8). Ele encontra os seus jogos sozinho e grava o som do jogo separado do microfone. Tudo fica no seu PC, numa biblioteca com prévia, corte por quadro e exclusão para a Lixeira.
+O **Laurel** é um gravador de clipes para jogos no Windows, gratuito e de código aberto: sem anúncios, sem paywall e sem conta, com todos os recursos liberados. Ele guarda os últimos segundos do jogo e salva um clipe quando você aperta um atalho (F8). Ele encontra os seus jogos sozinho e grava o som do jogo separado do microfone. Tudo fica no seu PC, numa biblioteca com prévia, corte por quadro, seleção de vários itens e uma área de excluídos recentemente, com Desfazer. O Laurel fala português e inglês.
 
-O projeto está em desenvolvimento e ainda não tem versão publicada nem instalador. A documentação, com specs, decisões e testes, é escrita em português e por enquanto fica numa base privada; este repositório tem o produto. O Medal serve de referência funcional, com sala limpa: nenhum código, recurso ou dado do Medal entra no repositório nem no Laurel. O Laurel não tem nenhuma ligação com a Medal B.V.
+O projeto está em desenvolvimento e em teste com amigos: a 0.1.0-rc.2 é uma pré-release com instalador para Windows, que se atualiza sozinha. A documentação, com specs, decisões e testes, é escrita em português e por enquanto fica numa base privada; este repositório tem o produto. O Medal serve de referência funcional, com sala limpa: nenhum código, recurso ou dado do Medal entra no repositório nem no Laurel. O Laurel não tem nenhuma ligação com a Medal B.V.
 
 Licença: GPL-2.0-or-later.

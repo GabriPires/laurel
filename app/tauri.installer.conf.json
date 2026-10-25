@@ -18,7 +18,7 @@
         "installMode": "currentUser",
         "installerIcon": "icons/icon.ico",
         "installerHooks": "installer/hooks.nsh",
-        "languages": ["English"],
+        "languages": ["English", "PortugueseBR"],
         "compression": "lzma"
       }
     }

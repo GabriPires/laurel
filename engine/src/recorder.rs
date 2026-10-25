@@ -26,6 +26,9 @@ const MIX_TRACK: u32 = 1 << 0;
 const GAME_TRACK: u32 = 1 << 1;
 const MIC_TRACK: u32 = 1 << 2;
 
+/// Seconds between keyframes, for every video encoder.
+pub const KEYINT_SECS: i64 = 1;
+
 /// The process the game capture source is hooked into, from its "hooked" signal.
 /// Feeds the library (game name) and, later, the game audio capture (D12).
 #[derive(Clone, Debug, Default)]
@@ -231,9 +234,13 @@ impl Recorder {
             .str("directory", &cfg.clips_dir.display().to_string())
             .str("format", "Laurel %CCYY-%MM-%DD %hh-%mm-%ss")
             .str("extension", "mp4")
-            .int("max_time_sec", cfg.buffer_secs)
+            // OBS keeps the buffer starting on a keyframe and drops a whole keyframe
+            // interval once it grows past max_time_sec, so a clip asked for N
+            // seconds would last between N - 1 and N; one interval more keeps every
+            // clip at least as long as asked (spec record.replay-buffer).
+            .int("max_time_sec", cfg.buffer_secs + KEYINT_SECS)
             // Size cap with headroom over bitrate * duration (video plus audio).
-            .int("max_size_mb", (cfg.bitrate_kbps + 640) * cfg.buffer_secs * 2 / 8 / 1000 + 64);
+            .int("max_size_mb", (cfg.bitrate_kbps + 640) * (cfg.buffer_secs + KEYINT_SECS) * 2 / 8 / 1000 + 64);
         let output = Output::new("replay_buffer", "replay-buffer", &out_settings)?;
         for (track, mask) in track_masks.iter().enumerate() {
             let mixer = mask.trailing_zeros() as usize;

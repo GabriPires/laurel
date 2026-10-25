@@ -22,7 +22,7 @@ function activity(text, kind = 'info') {
   const li = document.createElement('li');
   li.className = kind;
   const time = document.createElement('time');
-  time.textContent = new Date().toLocaleTimeString();
+  time.textContent = new Date().toLocaleTimeString(LOCALE);
   const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
   icon.setAttribute('viewBox', '0 0 24 24');
   icon.setAttribute('fill', 'none');
@@ -41,6 +41,22 @@ function activity(text, kind = 'info') {
 }
 
 const fileName = (path) => path.split(/[\\/]/).pop();
+
+// A short notice at the bottom of the window, with an optional action (Undo after
+// a delete); it leaves after a few seconds.
+let toastTimer = 0;
+function toast(text, actionLabel = null, action = null) {
+  clearTimeout(toastTimer);
+  $('toast-text').textContent = text;
+  $('toast-action').hidden = !action;
+  $('toast-action').textContent = actionLabel ?? '';
+  $('toast-action').onclick = () => {
+    $('toast').hidden = true;
+    action?.();
+  };
+  $('toast').hidden = false;
+  toastTimer = setTimeout(() => { $('toast').hidden = true; }, 8000);
+}
 
 // Readable game name: the name Laurel found for the game, else the engine's hooked
 // window title without the invisible characters some games pad it with, else the
@@ -79,8 +95,8 @@ const RESTORE_ICON = '<rect x="5" y="8" width="11" height="11" rx="1"/><path d="
 async function showMaximized() {
   const maximized = await appWindow.isMaximized();
   $('win-max').querySelector('svg').innerHTML = maximized ? RESTORE_ICON : MAXIMIZE_ICON;
-  $('win-max').setAttribute('aria-label', maximized ? 'Restore' : 'Maximize');
-  $('win-max').title = maximized ? 'Restore' : 'Maximize';
+  $('win-max').setAttribute('aria-label', maximized ? t('Restore') : t('Maximize'));
+  $('win-max').title = maximized ? t('Restore') : t('Maximize');
 }
 appWindow.onResized(showMaximized);
 showMaximized();
@@ -97,15 +113,15 @@ let gameState = { mode: 'detect', game: null, recording: false };
 function showStatus() {
   const chip = $('status-chip');
   let state = engineState.state;
-  let text = { starting: 'Starting', stopped: 'Engine stopped', failed: 'Engine failed' }[state] ?? state;
+  let text = { starting: t('Starting'), stopped: t('Engine stopped'), failed: t('Engine failed') }[state] ?? state;
   if (state === 'ready') {
-    if (gameState.enabled === false) [state, text] = ['off', 'Recording is off'];
-    else if (pausedForDisk) [state, text] = ['paused', 'Paused: disk almost full'];
-    else if (gameState.needsAdmin) [state, text] = ['admin', `${gameState.game?.name ?? 'The game'} needs administrator`];
-    else if (gameState.capture === 'screen') text = 'Recording the screen';
-    else if (gameState.game) text = `Recording ${gameState.game.name}`;
-    else if (gameState.mode === 'detect') [state, text] = ['waiting', 'Waiting for a game'];
-    else text = 'Recording';
+    if (gameState.enabled === false) [state, text] = ['off', t('Recording is off')];
+    else if (pausedForDisk) [state, text] = ['paused', t('Paused: disk almost full')];
+    else if (gameState.needsAdmin) [state, text] = ['admin', t('{game} needs administrator', { game: gameState.game?.name ?? t('The game') })];
+    else if (gameState.capture === 'screen') text = t('Recording the screen');
+    else if (gameState.game) text = t('Recording {game}', { game: gameState.game.name });
+    else if (gameState.mode === 'detect') [state, text] = ['waiting', t('Waiting for a game')];
+    else text = t('Recording|status');
   }
   chip.className = `status ${state}`;
   chip.textContent = text;
@@ -118,7 +134,7 @@ $('status-chip').onclick = () => window.openSettings?.('advanced');
 
 function showEngineInfo() {
   if (!engineInfo) return;
-  $('engine-info').textContent = `Laurel ${window.laurelVersion ?? ''} · libobs ${engineInfo.version}${gameState.elevated ? ' · administrator' : ''}`;
+  $('engine-info').textContent = `Laurel ${window.laurelVersion ?? ''} · libobs ${engineInfo.version}${gameState.elevated ? ` · ${t('administrator')}` : ''}`;
   $('about-libobs').textContent = engineInfo.version;
 }
 
@@ -127,14 +143,14 @@ function showGame(g) {
   showStatus();
   for (const input of document.querySelectorAll('.rec-input')) input.checked = g.enabled !== false;
   $('capture-hint').hidden = !(g.enabled !== false && g.mode === 'detect' && !g.game && g.capture !== 'screen');
-  const idle = g.enabled === false ? 'Recording is off' : (g.mode === 'detect' && !g.game && g.capture !== 'screen' ? 'Waiting for a game' : null);
+  const idle = g.enabled === false ? t('Recording is off') : (g.mode === 'detect' && !g.game && g.capture !== 'screen' ? t('Waiting for a game') : null);
   if (idle) {
     $('capture-state').textContent = idle;
     $('capture-state').classList.remove('live');
   }
   // A game that runs as administrator needs Laurel to run as administrator too.
   $('admin-banner').hidden = !g.needsAdmin;
-  if (g.needsAdmin && g.game) $('admin-title').textContent = `${g.game.name} runs as administrator`;
+  if (g.needsAdmin && g.game) $('admin-title').textContent = t('{game} runs as administrator', { game: g.game.name });
   showEngineInfo();
 }
 
@@ -145,18 +161,18 @@ function showState(s) {
   if (s.state === 'ready') {
     engineInfo = s.info;
     const name = encoderName(s.info, s.info.encoder);
-    $('engine-detail').textContent = `${name} · ${s.info.output.join('x')} · ${s.info.fps} fps · last ${s.info.bufferSecs} s`;
+    $('engine-detail').textContent = t('{encoder} · {size} · {fps} fps · last {secs} s', { encoder: name, size: s.info.output.join('x'), fps: s.info.fps, secs: s.info.bufferSecs });
     // Spec quality.encoding: an encoder that could not start is shown with why.
     const failed = s.info.encoderFallbacks ?? [];
     $('encoder-note').textContent = failed.length
-      ? `${encoderName(s.info, failed[0].encoder)} could not start (${failed[0].error}), so Laurel records with ${name}.`
-      : 'What every clip holds.';
+      ? t('{failed} could not start ({error}), so Laurel records with {encoder}.', { failed: encoderName(s.info, failed[0].encoder), error: failed[0].error, encoder: name })
+      : t('What every clip holds.');
     $('encoder-note').classList.toggle('warn', failed.length > 0);
     $('s-buffer').textContent = `${s.info.bufferSecs} s`;
     $('s-encoder').textContent = name;
     showEngineInfo();
   } else {
-    $('engine-detail').textContent = s.message ?? 'Waiting for the engine';
+    $('engine-detail').textContent = s.message ?? t('Waiting for the engine');
   }
 }
 
@@ -168,19 +184,20 @@ async function refreshStats() {
     // D13: Laurel captures the game on its own; the target is not a user choice.
     const live = s.captureSize[0] > 0;
     const game = gameState.game?.name ?? gameName(s.game);
-    let text = gameState.enabled === false ? 'Recording is off' : 'Waiting for a game';
-    if (live && gameState.capture === 'screen') text = `Recording the screen at ${s.captureSize.join('x')}`;
-    else if (live && gameState.capture === 'window') text = `Capturing ${game ?? 'the game'} by its window at ${s.captureSize.join('x')}`;
-    else if (live) text = `Capturing ${game ?? 'the game'} at ${s.captureSize.join('x')}`;
-    else if (gameState.game && gameState.enabled !== false) text = `${gameState.game.name} found, starting the capture`;
+    const size = s.captureSize.join('x');
+    let text = gameState.enabled === false ? t('Recording is off') : t('Waiting for a game');
+    if (live && gameState.capture === 'screen') text = t('Recording the screen at {size}', { size });
+    else if (live && gameState.capture === 'window') text = t('Capturing {game} by its window at {size}', { game: game ?? t('the game'), size });
+    else if (live) text = t('Capturing {game} at {size}', { game: game ?? t('the game'), size });
+    else if (gameState.game && gameState.enabled !== false) text = t('{game} found, starting the capture', { game: gameState.game.name });
     $('capture-state').textContent = text;
     $('capture-state').classList.toggle('live', live);
-    $('s-capture').textContent = live ? s.captureSize.join('x') : 'no image';
-    $('s-fps').textContent = s.activeFps.toFixed(1);
-    $('s-frames').textContent = s.totalFrames.toLocaleString('en-US');
+    $('s-capture').textContent = live ? size : t('no image');
+    $('s-fps').textContent = fmtNum(s.activeFps, 1);
+    $('s-frames').textContent = fmtNum(s.totalFrames);
     $('s-dropped').textContent = `${s.skippedFrames} / ${s.laggedFrames}`;
     // D12: track 2 is the game's own audio, following the hooked game.
-    $('s-audio').textContent = s.audio?.mode === 'game' ? (s.audio.follows ?? 'waiting for a game') : (s.audio?.mode ?? '–');
+    $('s-audio').textContent = s.audio?.mode === 'game' ? (s.audio.follows ?? t('waiting for a game')) : (s.audio?.mode ?? '–');
   } catch {
     // The engine may be restarting; the state event explains it.
   }
@@ -193,7 +210,7 @@ for (const input of document.querySelectorAll('.rec-input')) {
   input.onchange = async () => {
     const enabled = input.checked;
     showGame(await invoke('set_recording', { enabled }));
-    activity(enabled ? 'Recording turned on' : 'Recording turned off');
+    activity(enabled ? t('Recording turned on') : t('Recording turned off'));
   };
 }
 $('admin-restart').onclick = async () => {
@@ -201,27 +218,35 @@ $('admin-restart').onclick = async () => {
   try {
     await invoke('restart_as_admin');
   } catch (e) {
-    activity(e === 'cancelled' ? 'Restart as administrator cancelled' : `Could not restart as administrator: ${e}`, 'bad');
+    activity(e === 'cancelled' ? t('Restart as administrator cancelled') : t('Could not restart as administrator: {error}', { error: e }), 'bad');
     $('admin-restart').disabled = false;
   }
 };
 $('restart').onclick = () => invoke('engine_restart');
 
+const ENGINE_NEWS = {
+  stopped: (message) => t('Engine stopped: {message}', { message }),
+  failed: (message) => t('Engine failed: {message}', { message }),
+};
 listen('engine-state', (e) => {
   showState(e.payload);
-  if (e.payload.state !== 'ready' && e.payload.message) activity(`Engine ${e.payload.state}: ${e.payload.message}`, e.payload.state === 'failed' ? 'bad' : 'info');
+  const { state, message } = e.payload;
+  if (state !== 'ready' && message) activity(ENGINE_NEWS[state]?.(message) ?? `${state}: ${message}`, state === 'failed' ? 'bad' : 'info');
 });
-listen('clip-saved', (e) => activity(`Clip saved in ${e.payload.saveMs} ms: ${fileName(e.payload.path)}`, 'clip'));
-listen('screenshot-saved', (e) => activity(`Screenshot saved: ${fileName(e.payload.path)}`, 'shot'));
-listen('action-failed', (e) => activity(`${e.payload.action} failed: ${e.payload.message}`, 'bad'));
+listen('clip-saved', (e) => activity(t('Clip saved in {ms} ms: {file}', { ms: e.payload.saveMs, file: fileName(e.payload.path) }), 'clip'));
+listen('screenshot-saved', (e) => activity(t('Screenshot saved: {file}', { file: fileName(e.payload.path) }), 'shot'));
+listen('action-failed', (e) => {
+  const what = e.payload.action === 'saveClip' ? t('Clip not saved: {message}', e.payload) : t('Screenshot not saved: {message}', e.payload);
+  activity(what, 'bad');
+});
 listen('storage-state', (e) => { pausedForDisk = e.payload.pausedForDisk; showStatus(); });
-listen('storage-pruned', (e) => activity(`Storage limit: ${e.payload.paths.length} old item(s) removed`, 'info'));
+listen('storage-pruned', (e) => activity(tp(e.payload.paths.length, 'Storage limit: {n} old item removed', 'Storage limit: {n} old items removed'), 'info'));
 listen('game-state', (e) => {
   const before = gameState.game;
   showGame(e.payload);
   const now = e.payload.game;
-  if (before && before.key !== now?.key) activity(`${before.name} closed`);
-  if (now && now.key !== before?.key) activity(`Recording ${now.name}`);
+  if (before && before.key !== now?.key) activity(t('{game} closed', { game: before.name }));
+  if (now && now.key !== before?.key) activity(t('Recording {game}', { game: now.name }));
 });
 
 window.__TAURI__.app.getVersion().then((v) => {
@@ -233,10 +258,17 @@ invoke('engine_state').then(showState);
 invoke('game_state').then(showGame);
 setInterval(refreshStats, 2000);
 
-// The view the window opens in (development: LAUREL_START_VIEW), once every
-// script has set its view up.
+// The view the window opens in, once every script has set its view up: the one
+// it reloaded from (a new language), else LAUREL_START_VIEW in development.
 window.addEventListener('DOMContentLoaded', async () => {
-  const view = (await invoke('start_view')) ?? 'library';
+  let view = null;
+  try {
+    view = sessionStorage.getItem('laurel.view');
+    sessionStorage.removeItem('laurel.view');
+  } catch {
+    // No storage: the usual start view.
+  }
+  view = view ?? (await invoke('start_view')) ?? 'library';
   const [name, page] = view.split(':');
   if (name === 'settings') window.openSettings?.(page);
   else window.openLibrary?.({ clips: 'clip', screenshots: 'screenshot' }[name] ?? 'all');

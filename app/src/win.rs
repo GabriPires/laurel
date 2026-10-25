@@ -65,6 +65,9 @@ extern "system" {
     fn GetLastError() -> u32;
     fn QueryFullProcessImageNameW(process: isize, flags: u32, name: *mut u16, size: *mut u32) -> i32;
     fn CloseHandle(handle: isize) -> i32;
+    fn GetUserDefaultUILanguage() -> u16;
+    fn GetFileAttributesW(path: *const u16) -> u32;
+    fn SetFileAttributesW(path: *const u16, attributes: u32) -> i32;
 }
 
 #[link(name = "shell32", kind = "raw-dylib")]
@@ -116,6 +119,7 @@ extern "system" {
     fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
     fn RegisterRawInputDevices(devices: *const RawInputDevice, count: u32, size: u32) -> i32;
     fn GetRawInputData(input: isize, command: u32, data: *mut c_void, size: *mut u32, header_size: u32) -> u32;
+    fn GetRawInputDeviceInfoW(device: isize, command: u32, data: *mut c_void, size: *mut u32) -> u32;
     fn GetAsyncKeyState(vk: i32) -> i16;
     fn MapVirtualKeyW(code: u32, map_type: u32) -> u32;
     fn SendInput(count: u32, inputs: *const KeyInput, size: i32) -> u32;
@@ -228,6 +232,19 @@ pub fn delete_file(path: &std::path::Path, recycle: bool) -> Result<(), String> 
     match unsafe { SHFileOperationW(&mut op) } {
         0 if op.any_aborted == 0 => Ok(()),
         code => Err(format!("could not move {} to the Recycle Bin (code {code})", path.display())),
+    }
+}
+
+/// Marks a file or folder hidden, keeping its other attributes.
+pub fn set_hidden(path: &std::path::Path) {
+    const HIDDEN: u32 = 0x2;
+    const DIRECTORY: u32 = 0x10;
+    let name = wide(&path.to_string_lossy());
+    unsafe {
+        let attributes = GetFileAttributesW(name.as_ptr());
+        if attributes != u32::MAX && attributes & HIDDEN == 0 {
+            SetFileAttributesW(name.as_ptr(), (attributes | HIDDEN) & !DIRECTORY);
+        }
     }
 }
 
@@ -431,10 +448,35 @@ const MAPVK_VK_TO_CHAR: u32 = 2;
 const INPUT_KEYBOARD: u32 = 1;
 const KEYEVENTF_KEYUP: u32 = 0x0002;
 
-/// A key or mouse button event from Raw Input.
+/// A key or mouse button event from Raw Input. `device` is the Raw Input device
+/// handle, 0 for input that a program injected (SendInput) rather than a device.
 pub enum RawInput {
-    Key { vk: u16, down: bool, e0: bool },
-    MouseDown(u8),
+    Key { vk: u16, down: bool, e0: bool, device: isize },
+    MouseDown { button: u8, device: isize },
+}
+
+/// Whether Windows shows its own text in Portuguese (any country), for the
+/// interface language "system".
+pub fn ui_language_is_portuguese() -> bool {
+    const LANG_PORTUGUESE: u16 = 0x16;
+    unsafe { GetUserDefaultUILanguage() & 0x3FF == LANG_PORTUGUESE }
+}
+
+const RIDI_DEVICENAME: u32 = 0x2000_0007;
+
+/// The vendor and product of a Raw Input device ("VID_046D&PID_C33F") from its
+/// device path, or the path itself when it has none (a virtual device).
+pub fn raw_input_device_id(device: isize) -> Option<String> {
+    let mut buf = [0u16; 512];
+    let mut len = buf.len() as u32;
+    let n = unsafe { GetRawInputDeviceInfoW(device, RIDI_DEVICENAME, buf.as_mut_ptr().cast(), &mut len) };
+    if n == u32::MAX || n == 0 {
+        return None;
+    }
+    let path = String::from_utf16_lossy(&buf[..(n as usize).min(buf.len())]).trim_end_matches('\0').to_string();
+    let upper = path.to_ascii_uppercase();
+    let id = upper.find("VID_").and_then(|i| upper.get(i..i + 17)).filter(|id| id.get(8..13) == Some("&PID_"));
+    Some(id.map_or(path, String::from))
 }
 
 static RAW_HANDLER: std::sync::OnceLock<fn(RawInput)> = std::sync::OnceLock::new();
@@ -474,16 +516,18 @@ extern "system" fn raw_input_proc(hwnd: isize, msg: u32, wparam: usize, lparam: 
                 let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast(), n as usize) };
                 let u16_at = |i: usize| u16::from_le_bytes([bytes[i], bytes[i + 1]]);
                 let kind = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                // RAWINPUTHEADER: dwType, dwSize, hDevice, wParam.
+                let device = i64::from_le_bytes(bytes[8..16].try_into().unwrap()) as isize;
                 let event = match kind {
                     // RAWKEYBOARD: MakeCode, Flags, Reserved, VKey, ...
                     RIM_TYPEKEYBOARD => {
                         let flags = u16_at(24 + 2);
-                        Some(RawInput::Key { vk: u16_at(24 + 6), down: flags & RI_KEY_BREAK == 0, e0: flags & RI_KEY_E0 != 0 })
+                        Some(RawInput::Key { vk: u16_at(24 + 6), down: flags & RI_KEY_BREAK == 0, e0: flags & RI_KEY_E0 != 0, device })
                     }
                     // RAWMOUSE: usFlags, padding, usButtonFlags, usButtonData, ...
                     RIM_TYPEMOUSE => {
                         let buttons = u16_at(24 + 4);
-                        MOUSE_DOWN_FLAGS.iter().find(|(flag, _)| buttons & flag != 0).map(|(_, n)| RawInput::MouseDown(*n))
+                        MOUSE_DOWN_FLAGS.iter().find(|(flag, _)| buttons & flag != 0).map(|(_, n)| RawInput::MouseDown { button: *n, device })
                     }
                     _ => None,
                 };

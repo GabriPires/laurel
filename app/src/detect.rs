@@ -20,6 +20,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::engine::Engine;
 use crate::games::{Catalog, GameId, Verdict};
+use crate::i18n::t;
 use crate::log::log;
 use crate::overlay::{Kind, Notifier};
 use crate::settings::Store;
@@ -378,7 +379,7 @@ impl Detector {
             let _ = self.app.emit("game-state", self.snapshot());
             if let Some(game) = started.filter(|_| self.recording()) {
                 let secs = self.app.state::<Engine>().state()["info"]["bufferSecs"].as_u64().unwrap_or_default();
-                self.app.state::<Notifier>().notify(Kind::Info, "Recording", &format!("{} · Laurel keeps the last {secs} s", game.id.name));
+                self.app.state::<Notifier>().notify(Kind::Info, &t!("Recording|notice"), &t!("{game} · Laurel keeps the last {secs} s", game = game.id.name, secs = secs));
             }
         }
         self.check_hook();
@@ -432,11 +433,11 @@ impl Detector {
         let notifier = self.app.state::<Notifier>();
         if needs_admin {
             let _ = self.app.emit("game-state", self.snapshot());
-            notifier.notify(Kind::Error, &format!("Can't record {}", game.id.name), "It runs as administrator. Open Laurel and restart it as administrator.");
+            notifier.notify(Kind::Error, &t!("Can't record {game}", game = game.id.name), &t!("It runs as administrator. Open Laurel and restart it as administrator."));
         } else {
             self.apply();
             let _ = self.app.emit("game-state", self.snapshot());
-            notifier.notify(Kind::Info, &format!("Recording {} by its window", game.id.name), "Game capture did not start, so Laurel records the game's window");
+            notifier.notify(Kind::Info, &t!("Recording {game} by its window", game = game.id.name), &t!("Game capture did not start, so Laurel records the game's window"));
         }
     }
 
@@ -473,7 +474,7 @@ impl Detector {
         self.state.lock().unwrap().applied = Some((target, recording));
         if screen_started {
             let secs = engine.state()["info"]["bufferSecs"].as_u64().unwrap_or_default();
-            self.app.state::<Notifier>().notify(Kind::Info, "Recording the screen", &format!("Laurel keeps the last {secs} s of your screen"));
+            self.app.state::<Notifier>().notify(Kind::Info, &t!("Recording the screen"), &t!("Laurel keeps the last {secs} s of your screen", secs = secs));
         }
     }
 }

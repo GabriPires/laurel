@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::i18n::{t, t_later};
 use crate::log::log;
 use crate::win;
 
@@ -157,18 +158,19 @@ impl Combo {
     }
 }
 
-/// Why a combination cannot be a hotkey (spec clip.hotkeys), if it cannot.
+/// Why a combination cannot be a hotkey (spec clip.hotkeys), if it cannot, in
+/// English (translated where it is shown).
 pub fn reject_reason(c: &Combo) -> Option<&'static str> {
     let typing = |vk: u16| matches!(vk, 0x08 | 0x09 | 0x0D | 0x20 | 0x25..=0x28 | 0x30..=0x39 | 0x41..=0x5A | 0xBA..=0xE2);
     match c.key {
-        Key::Mouse(1 | 2) => Some("The left and right mouse buttons are needed in games"),
-        _ if c.mods & WIN != 0 => Some("Shortcuts with the Windows key belong to Windows"),
-        Key::Vk(VK_ESCAPE) => Some("Esc is used to cancel; choose another key"),
-        Key::Vk(0x73) if c.mods == ALT => Some("Alt+F4 closes the game"),
-        Key::Vk(0x09 | 0x20) if c.mods == ALT => Some("Windows uses this shortcut"),
-        Key::Vk(0x0D) if c.mods == ALT => Some("Alt+Enter switches fullscreen in many games"),
+        Key::Mouse(1 | 2) => Some(t_later!("The left and right mouse buttons are needed in games")),
+        _ if c.mods & WIN != 0 => Some(t_later!("Shortcuts with the Windows key belong to Windows")),
+        Key::Vk(VK_ESCAPE) => Some(t_later!("Esc is used to cancel; choose another key")),
+        Key::Vk(0x73) if c.mods == ALT => Some(t_later!("Alt+F4 closes the game")),
+        Key::Vk(0x09 | 0x20) if c.mods == ALT => Some(t_later!("Windows uses this shortcut")),
+        Key::Vk(0x0D) if c.mods == ALT => Some(t_later!("Alt+Enter switches fullscreen in many games")),
         Key::Vk(vk) if typing(vk) && c.mods & (CTRL | ALT) == 0 => {
-            Some("Letters, digits, arrows and typing keys need Ctrl or Alt, or they would fire while you play or chat")
+            Some(t_later!("Letters, digits, arrows and typing keys need Ctrl or Alt, or they would fire while you play or chat"))
         }
         _ => None,
     }
@@ -328,10 +330,22 @@ fn numpad_vk(vk: u16, e0: bool) -> u16 {
     }
 }
 
+/// Where a key press came from, for the log: a program can inject keys that look
+/// like the hotkey (SendInput arrives with no device).
+fn input_source(device: isize) -> String {
+    if device == 0 {
+        return "injected by a program (no device)".into();
+    }
+    match win::raw_input_device_id(device) {
+        Some(id) => format!("from device {id}"),
+        None => "from an unknown device".into(),
+    }
+}
+
 fn on_raw_input(input: win::RawInput) {
     let Some(shared) = SHARED.get() else { return };
-    let key = match input {
-        win::RawInput::Key { vk, down, e0 } => {
+    let (key, device) = match input {
+        win::RawInput::Key { vk, down, e0, device } => {
             if let Some(bit) = modifier_bit(vk) {
                 let mut mods = shared.mods.lock().unwrap();
                 match (down, mods.iter().any(|(b, _)| *b == bit)) {
@@ -353,9 +367,9 @@ fn on_raw_input(input: win::RawInput) {
             if !held.insert((vk, e0)) {
                 return; // auto-repeat
             }
-            Key::Vk(vk)
+            (Key::Vk(vk), device)
         }
-        win::RawInput::MouseDown(n) => Key::Mouse(n),
+        win::RawInput::MouseDown { button, device } => (Key::Mouse(button), device),
     };
     let combo = Combo { mods: current_mods(shared), key };
 
@@ -371,7 +385,7 @@ fn on_raw_input(input: win::RawInput) {
             return;
         }
         let taken = shared.bindings.lock().unwrap().iter().find(|(a, c)| *a != action && *c == combo).map(|(a, _)| *a);
-        let reason = reject_reason(&combo).map(String::from).or_else(|| taken.map(|a| format!("Already used for {}", action_label(a))));
+        let reason = reject_reason(&combo).map(crate::i18n::tr).or_else(|| taken.map(|a| t!("Already used for {action}", action = action_label(a))));
         match reason {
             Some(reason) => (shared.handler)(Event::Rejected(action, combo, reason)),
             None => {
@@ -384,15 +398,16 @@ fn on_raw_input(input: win::RawInput) {
     let action = shared.bindings.lock().unwrap().iter().find(|(_, c)| *c == combo).map(|(a, _)| *a);
     if let Some(action) = action {
         shared.presses.fetch_add(1, Ordering::SeqCst);
+        log!("hotkeys: {} pressed for {action}, {}", combo.name(), input_source(device));
         (shared.handler)(Event::Pressed(action));
     }
 }
 
-pub fn action_label(action: &str) -> &'static str {
+pub fn action_label(action: &str) -> String {
     match action {
-        "clip" => "Save clip",
-        "screenshot" => "Screenshot",
-        "toggle" => "Recording on/off",
-        _ => "another action",
+        "clip" => t!("Save clip"),
+        "screenshot" => t!("Screenshot"),
+        "toggle" => t!("Recording on/off"),
+        _ => t!("another action"),
     }
 }

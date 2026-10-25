@@ -1,10 +1,15 @@
-; Laurel's additions to the NSIS installer that Tauri's bundler writes (tools/installer.sh):
+﻿; Laurel's additions to the NSIS installer that Tauri's bundler writes (tools/installer.sh):
 ; Laurel and its engine closed before their files change, the Microsoft Visual C++
 ; Runtime when it is missing, start with Windows on a fresh install (spec app.startup),
 ; and on uninstall the game capture hook that win-capture shares with OBS Studio
 ; (wiki/projeto/runtime-obs.md). Tauri's template already removes the start entry
 ; (not on updates) and, when the user ticks its box, the app data. Clips are never
 ; removed.
+
+; This file is UTF-8 with a BOM, the encoding makensis reads it in. The installer
+; speaks English or Brazilian Portuguese (tauri.installer.conf.json); the messages
+; here pick theirs by $LANGUAGE.
+!define LAUREL_LANG_PT_BR 1046
 
 ; The start entry is named after the product, the value Tauri's uninstaller removes.
 !define LAUREL_RUN_KEY "Software\Microsoft\Windows\CurrentVersion\Run"
@@ -24,7 +29,11 @@
   IntCmp $R1 0 laurel_close_done
   IfSilent laurel_close_now
   IntCmp $PassiveMode 1 laurel_close_now
-  MessageBox MB_OKCANCEL|MB_ICONINFORMATION "Laurel is running. Close it and continue?" IDOK laurel_close_now
+  ${If} $LANGUAGE == ${LAUREL_LANG_PT_BR}
+    MessageBox MB_OKCANCEL|MB_ICONINFORMATION "O Laurel está aberto. Fechar e continuar?" IDOK laurel_close_now
+  ${Else}
+    MessageBox MB_OKCANCEL|MB_ICONINFORMATION "Laurel is running. Close it and continue?" IDOK laurel_close_now
+  ${EndIf}
   Abort
   laurel_close_now:
     nsExec::Exec `"${LAUREL_POWERSHELL}" -NoProfile -NonInteractive -Command "Get-Process laurel-app,laurel-engine,ffmpeg -ErrorAction SilentlyContinue | Where-Object { $$_.Path -like '$INSTDIR\*' } | Stop-Process -Force; Start-Sleep -Milliseconds 500"`
@@ -56,7 +65,11 @@
     ${If} $R3 != 0
     ${AndIf} $R3 != 3010
     ${AndIf} $R3 != 1638
-      MessageBox MB_ICONEXCLAMATION|MB_OK "The Microsoft Visual C++ Runtime was not installed (code $R3). Laurel needs it to record: install the Visual C++ Redistributable (x64) from Microsoft, or run this installer again." /SD IDOK
+      ${If} $LANGUAGE == ${LAUREL_LANG_PT_BR}
+        MessageBox MB_ICONEXCLAMATION|MB_OK "O Microsoft Visual C++ Runtime não foi instalado (código $R3). O Laurel precisa dele para gravar: instale o Visual C++ Redistributable (x64) da Microsoft ou rode este instalador de novo." /SD IDOK
+      ${Else}
+        MessageBox MB_ICONEXCLAMATION|MB_OK "The Microsoft Visual C++ Runtime was not installed (code $R3). Laurel needs it to record: install the Visual C++ Redistributable (x64) from Microsoft, or run this installer again." /SD IDOK
+      ${EndIf}
     ${EndIf}
   ${EndIf}
 !macroend
