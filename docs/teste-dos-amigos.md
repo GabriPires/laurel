@@ -4,6 +4,13 @@ O Laurel guarda os últimos segundos do jogo que você está jogando e salva um 
 
 Esta é uma versão de teste. Ela pode ter erros, e é exatamente isso que queremos achar com a sua ajuda.
 
+## O que mudou na 0.1.0-rc.5
+
+Esta versão prepara os **testes de estabilidade**: jogue normalmente e, depois de algumas sessões, mande os logs.
+
+- **Salvar logs para enviar.** Em **Configurações > Avançado**, o botão cria um único `.zip` na pasta **Downloads** e abre a pasta com ele selecionado. É esse arquivo que você manda. Ele traz as cinco últimas sessões do Laurel e o log do motor de gravação, agora com a hora de cada linha, e o seu nome de usuário do Windows fica escondido.
+- **Um Laurel por vez.** Abrir o Laurel de novo pelo menu Iniciar, com ele já esperando na bandeja, abria uma segunda cópia que gravava o mesmo jogo outra vez. Agora isso só mostra a janela do Laurel que já está aberto.
+
 ## O que mudou na 0.1.0-rc.4
 
 - **Clipes das conquistas da Steam.** Enquanto você joga um jogo da Steam, o Laurel salva um clipe sozinho quando você desbloqueia uma conquista rara: menos de 10% dos jogadores (**Rara**) ou menos de 5% (**Ultra rara**). O clipe sai uns 15 segundos depois da conquista, para mostrar o que veio em seguida, e leva o nome dela, por exemplo `Elsie 2026-10-26 12-48-50 - Hi Mom!.mp4`. Toca um som próprio, três notas subindo.
@@ -70,7 +77,7 @@ Mande pelo nosso canal de sempre:
 
 - o que você fez, o que esperava e o que aconteceu;
 - o jogo, a sua placa de vídeo e a versão do Windows;
-- os logs: em **Configurações > Avançado**, clique em **Abrir a pasta de logs** e mande os arquivos **app.log** e **engine.log**, e também **app.old.log** e **engine.old.log** se existirem. O app.log recomeça cada vez que o Laurel abre, e a sessão anterior fica no app.old.log.
+- os logs: em **Configurações > Avançado**, clique em **Salvar logs para enviar**. O Laurel cria um único arquivo `.zip` na pasta **Downloads** e abre a pasta com ele selecionado; é só mandar esse arquivo. Ele traz as cinco últimas sessões do Laurel, o log do motor de gravação com a hora de cada linha e as versões do Laurel e do Windows, com o seu nome de usuário do Windows escondido.
 
 ## Privacidade
 

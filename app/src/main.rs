@@ -434,6 +434,16 @@ fn report(app: &AppHandle, event: &str, action: &str, result: Result<Value, Stri
     }
 }
 
+/// Shows the main window when another start of Laurel asks for it.
+fn listen_for_show(app: &AppHandle) {
+    let app = app.clone();
+    win::on_show_request(move || {
+        log!("another start of Laurel: showing this one");
+        let handle = app.clone();
+        let _ = app.run_on_main_thread(move || show_main(&handle));
+    });
+}
+
 fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
@@ -972,6 +982,41 @@ fn open_logs() -> Result<(), String> {
     share::open(&log::dir().ok_or("the logs folder is not set")?.display().to_string())
 }
 
+/// Settings → Advanced → Save logs to send: one .zip in Downloads with every log
+/// and an info.txt (versions, Windows, the engine, the settings, the game being
+/// recorded), the Windows user name hidden; Explorer opens on it.
+#[tauri::command]
+async fn logs_export(app: AppHandle) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dest = export_logs(&app, &win::downloads_folder().ok_or("no Downloads folder")?)?;
+        let _ = share::show_in_folder(&dest.to_string_lossy());
+        Ok(dest.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn export_logs(app: &AppHandle, dir: &std::path::Path) -> Result<PathBuf, String> {
+    let (date, time) = win::date_time();
+    let dest = storage::unique(dir, &format!("Laurel logs {date} {time}"), "zip");
+    let windows = |name: &str| win::reg_string(win::HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", name).unwrap_or_default();
+    let info = format!(
+        "Laurel {}\nWindows: {} {} (build {})\nSaved: {date} {time}\nAdministrator: {}\n\nEngine:\n{}\n\nGame:\n{}\n\nSteam achievements:\n{}\n\nSettings:\n{}\n",
+        app.package_info().version,
+        windows("ProductName"),
+        windows("DisplayVersion"),
+        windows("CurrentBuild"),
+        win::self_elevated(),
+        serde_json::to_string_pretty(&app.state::<Engine>().state()).unwrap_or_default(),
+        serde_json::to_string_pretty(&app.state::<Arc<Detector>>().snapshot()).unwrap_or_default(),
+        serde_json::to_string_pretty(&app.state::<Arc<steam::Achievements>>().status()).unwrap_or_default(),
+        serde_json::to_string_pretty(&app.state::<Arc<Store>>().get().to_json()).unwrap_or_default(),
+    );
+    let files = log::export(&dest, &[("info.txt", info)])?;
+    log!("logs saved to send: {} ({files} files)", dest.display());
+    Ok(dest)
+}
+
 /// The view the main window opens in (development: LAUREL_START_VIEW).
 #[tauri::command]
 fn start_view() -> Option<String> {
@@ -1115,6 +1160,7 @@ fn selftest(app: AppHandle) {
     let run = || -> Result<(), String> {
         wait_ready("at start")?;
         check_log_rotation()?;
+        check_single_instance(&app)?;
         check_language()?;
         std::thread::sleep(Duration::from_secs(8)); // let the "Recording" notice expire
         let first = clip()?;
@@ -1428,12 +1474,32 @@ fn check_toggle_and_cursor(app: &AppHandle, engine: &Engine) -> Result<(), Strin
 
 /// Self-test of the log rotation: a log over its limit moves to `.old.log` and starts
 /// again, so it stays within twice the limit, and a fresh open keeps the previous one.
+/// Self-test of the single instance: a second start of the program (as a probe)
+/// finds this one running and asks it to show its window, which then shows.
+fn check_single_instance(app: &AppHandle) -> Result<(), String> {
+    let main = app.get_webview_window("main").ok_or("no main window")?;
+    let _ = main.hide();
+    std::thread::sleep(Duration::from_millis(300));
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let code = std::process::Command::new(exe).arg("--instance-probe").status().map_err(|e| e.to_string())?.code();
+    let shown = Instant::now();
+    while !main.is_visible().unwrap_or(false) && shown.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let visible = main.is_visible().unwrap_or(false);
+    log!("[selftest] single instance: a second start exited with {code:?}; this window shown again: {visible}");
+    if code != Some(3) || !visible {
+        return Err("a second start was not stopped or did not show this window".into());
+    }
+    Ok(())
+}
+
 fn check_log_rotation() -> Result<(), String> {
     let dir = std::env::temp_dir().join("laurel-selftest-logs");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join("test.log");
-    let mut log = log::Rotating::open(&path, false, 10_000);
+    let mut log = log::Rotating::open(&path, 0, 10_000);
     for i in 0..300 {
         log.line(&format!("{i:04} {}", "x".repeat(94)));
     }
@@ -1441,13 +1507,38 @@ fn check_log_rotation() -> Result<(), String> {
     let size = |p: &std::path::Path| std::fs::metadata(p).map_or(0, |m| m.len());
     let (current, old) = (size(&path), size(&log::Rotating::old_path(&path)));
     let last = std::fs::read_to_string(&path).unwrap_or_default().lines().last().unwrap_or_default().chars().take(4).collect::<String>();
-    let reopened = log::Rotating::open(&path, true, 10_000);
-    drop(reopened);
-    let (fresh, kept) = (size(&path), size(&log::Rotating::old_path(&path)));
-    let _ = std::fs::remove_dir_all(&dir);
-    log!("[selftest] log rotation: 30000 bytes written with a 10000-byte limit left {current} + {old} old, last line {last}; a fresh open left {fresh} and kept {kept}");
-    if current > 10_100 || old == 0 || old > 10_100 || last != "0299" || fresh != 0 || kept != current {
+    // Three new sessions keeping two: the first one ends up in .2, the one after in .1.
+    drop(log::Rotating::open(&path, 2, 10_000));
+    let mut second = log::Rotating::open(&path, 2, 10_000);
+    second.line("second session");
+    drop(second);
+    drop(log::Rotating::open(&path, 2, 10_000));
+    let (fresh, one, two, three) = (size(&path), std::fs::read_to_string(log::Rotating::session_path(&path, 1)).unwrap_or_default(), size(&log::Rotating::session_path(&path, 2)), log::Rotating::session_path(&path, 3).exists());
+    log!("[selftest] log rotation: 30000 bytes written with a 10000-byte limit left {current} + {old} old, last line {last}; three new sessions keeping two left {fresh} bytes, .1 {:?}, .2 {two} bytes, .3 {three}", one.trim());
+    if current > 10_100 || old == 0 || old > 10_100 || last != "0299" || fresh != 0 || one.trim() != "second session" || two != 0 || three {
+        let _ = std::fs::remove_dir_all(&dir);
         return Err("the log rotation did not behave".into());
+    }
+
+    // The .zip to send: the masked user name, a log, and a readable archive.
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    let masked = log::mask_user(&format!(r"C:\Users\{user}\Videos and C:\\Users\\{user}\\x and C:/Users/{user}/y and C:\Users\{user}x\z"), &user);
+    let wanted = format!(r"C:\Users\{{user}}\Videos and C:\\Users\\{{user}}\\x and C:/Users/{{user}}/y and C:\Users\{user}x\z");
+    log!("[selftest] user name masked: {}", masked == wanted || user.len() < 2);
+    if user.len() >= 2 && masked != wanted {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(format!("masking gave {masked}"));
+    }
+    // Left in the temporary folder, to open it with other tools after the run.
+    let zip = std::env::temp_dir().join("laurel-selftest-logs.zip");
+    let files = log::export(&zip, &[("info.txt", format!(r"work dir C:\Users\{user}\AppData"))])?;
+    let bytes = std::fs::read(&zip).map_err(|e| e.to_string())?;
+    let entries = bytes.windows(4).filter(|w| *w == [0x50, 0x4b, 0x01, 0x02]).count();
+    let end_ok = bytes.len() > 22 && bytes[bytes.len() - 22..bytes.len() - 18] == [0x50, 0x4b, 0x05, 0x06];
+    let _ = std::fs::remove_dir_all(&dir);
+    log!("[selftest] logs .zip: {files} files, {entries} central entries, end record {end_ok}, {} bytes", bytes.len());
+    if files < 2 || entries != files || !end_ok {
+        return Err("the logs .zip is not as expected".into());
     }
     Ok(())
 }
@@ -1742,15 +1833,17 @@ fn check_autoclip(app: &AppHandle) -> Result<(), String> {
     let achievements = app.state::<Arc<steam::Achievements>>();
     achievements.set_delay(Duration::from_secs(1));
     achievements.seed_percents(480, [("LAUREL_SELFTEST_1".to_string(), 2.0), ("LAUREL_SELFTEST_2".to_string(), 7.5)].into_iter().collect());
+    let library = app.state::<Arc<Library>>();
+    // Only a clip of this run counts: the self-test's library keeps earlier ones.
+    let earlier: Vec<Value> = library.list(Some("clip"), None)?.into_iter().filter(|i| i["achievement"]["id"] == "LAUREL_SELFTEST_1").map(|i| i["path"].clone()).collect();
     let started = Instant::now();
     achievements.on_unlock(480, "Laurel self-test", &json!({ "id": "LAUREL_SELFTEST_1", "name": "Self-test trophy", "description": "Checks the auto-clip" }));
     std::thread::sleep(Duration::from_millis(300));
     achievements.on_unlock(480, "Laurel self-test", &json!({ "id": "LAUREL_SELFTEST_2", "name": "Second trophy", "description": "" }));
-    let library = app.state::<Arc<Library>>();
     let mut found = None;
     while found.is_none() && started.elapsed() < Duration::from_secs(20) {
         std::thread::sleep(Duration::from_millis(250));
-        found = library.list(Some("clip"), None)?.into_iter().find(|i| i["achievement"]["id"] == "LAUREL_SELFTEST_1");
+        found = library.list(Some("clip"), None)?.into_iter().find(|i| i["achievement"]["id"] == "LAUREL_SELFTEST_1" && !earlier.contains(&i["path"]));
     }
     achievements.set_delay(steam::AUTO_CLIP_DELAY);
     let _ = store.set(before);
@@ -1849,6 +1942,16 @@ fn main() {
     if let Some(pid) = args.iter().position(|a| a == "--wait-pid").and_then(|i| args.get(i + 1)).and_then(|p| p.parse().ok()) {
         win::wait_for_exit(pid, 15_000);
     }
+    // One Laurel at a time: a second start (the Start menu while Laurel waits in the
+    // tray) shows the running one's window instead of recording the game twice.
+    // --instance-probe (self-test) only reports it: exit code 3 when another runs.
+    let first = win::single_instance();
+    if args.iter().any(|a| a == "--instance-probe") {
+        std::process::exit(if first { 0 } else { 3 });
+    }
+    if !first {
+        return;
+    }
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -1907,6 +2010,7 @@ fn main() {
             licenses,
             open_source_page,
             open_logs,
+            logs_export,
             update_info,
             update_check,
             update_install,
@@ -1921,6 +2025,7 @@ fn main() {
             };
             log::init(&work_dir.join("logs"))?;
             log!("Laurel {} starting; work dir {}; administrator: {}", app.package_info().version, work_dir.display(), win::self_elevated());
+            listen_for_show(app.handle());
             let store = Arc::new(Store::open(&work_dir.join("settings.json")));
             app.manage(store.clone());
             i18n::set(&store.get().language);

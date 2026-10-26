@@ -1,6 +1,6 @@
 [package]
 name = "laurel-steam"
-version = "0.1.0-rc.4"
+version = "0.1.0-rc.5"
 edition.workspace = true
 license = "MIT"
 description = "Laurel's Steam helper: watches the player's achievements for the running Steam game through the Steam API library already on the PC, and reports new unlocks to Laurel. A separate program under the MIT license, apart from Laurel's GPL code."

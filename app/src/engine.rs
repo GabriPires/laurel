@@ -1,6 +1,7 @@
 //! Supervises the laurel-engine process: starts it, restarts it when it dies and
 //! exchanges JSON-RPC messages with it over its stdin/stdout (engine/src/rpc.rs).
-//! The engine's stderr (its log) goes to `<work-dir>/logs/engine.log`.
+//! The engine's stderr (its log) goes to `<work-dir>/logs/engine.log`, each line with
+//! the local time.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -206,10 +207,10 @@ impl Engine {
         });
         let log_path = cfg.work_dir.join("logs").join("engine.log");
         std::thread::spawn(move || {
-            let mut file = crate::log::Rotating::open(&log_path, false, crate::log::MAX_BYTES);
-            file.line(&format!("==== engine start at {}", crate::win::clock()));
+            let mut file = crate::log::Rotating::open(&log_path, 0, crate::log::MAX_BYTES);
+            file.line(&format!("[{}] ==== engine start", crate::win::clock()));
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                file.line(&line);
+                file.line(&format!("[{}] {line}", crate::win::clock()));
             }
         });
 

@@ -40,6 +40,8 @@ struct Guid(u32, u16, u16, [u8; 8]);
 
 /// FOLDERID_Videos.
 const FOLDERID_VIDEOS: Guid = Guid(0x18989B1D, 0x99B5, 0x455B, [0x84, 0x1C, 0xAB, 0x7C, 0x74, 0xE4, 0xDD, 0xFC]);
+/// FOLDERID_Downloads.
+const FOLDERID_DOWNLOADS: Guid = Guid(0x374DE290, 0x123F, 0x4565, [0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B]);
 
 /// SHFILEOPSTRUCTW (natural alignment on 64-bit Windows).
 #[repr(C)]
@@ -67,6 +69,10 @@ extern "system" {
     fn CloseHandle(handle: isize) -> i32;
     fn GetUserDefaultUILanguage() -> u16;
     fn GetFileAttributesW(path: *const u16) -> u32;
+    fn CreateMutexW(attributes: *const c_void, initial_owner: i32, name: *const u16) -> isize;
+    fn CreateEventW(attributes: *const c_void, manual_reset: i32, initial_state: i32, name: *const u16) -> isize;
+    fn OpenEventW(access: u32, inherit: i32, name: *const u16) -> isize;
+    fn SetEvent(event: isize) -> i32;
     fn SetFileAttributesW(path: *const u16, attributes: u32) -> i32;
 }
 
@@ -254,6 +260,13 @@ pub fn https_get(host: &str, path: &str) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Local date and time in the MS-DOS format of ZIP entries: (time, date).
+pub fn dos_time() -> (u16, u16) {
+    let mut t = SystemTime::default();
+    unsafe { GetLocalTime(&mut t) };
+    (t.hour << 11 | t.minute << 5 | t.second / 2, (t.year.saturating_sub(1980)) << 9 | t.month << 5 | t.day)
+}
+
 /// Local date and time as (`YYYY-MM-DD`, `hh-mm-ss`), for file names.
 pub fn date_time() -> (String, String) {
     let mut t = SystemTime::default();
@@ -270,9 +283,18 @@ pub fn free_bytes(dir: &std::path::Path) -> Option<u64> {
 
 /// The user's Videos folder (it can be redirected, for example to OneDrive).
 pub fn videos_folder() -> Option<std::path::PathBuf> {
+    known_folder(&FOLDERID_VIDEOS)
+}
+
+/// The user's Downloads folder.
+pub fn downloads_folder() -> Option<std::path::PathBuf> {
+    known_folder(&FOLDERID_DOWNLOADS)
+}
+
+fn known_folder(id: &Guid) -> Option<std::path::PathBuf> {
     unsafe {
         let mut p: *mut u16 = std::ptr::null_mut();
-        if SHGetKnownFolderPath(&FOLDERID_VIDEOS, 0, 0, &mut p) != 0 || p.is_null() {
+        if SHGetKnownFolderPath(id, 0, 0, &mut p) != 0 || p.is_null() {
             return None;
         }
         let len = (0..).take_while(|&i| *p.add(i) != 0).count();
@@ -743,6 +765,48 @@ pub fn process_elevated(pid: u32) -> Option<bool> {
 }
 
 /// Waits up to `ms` for a process to exit.
+const ERROR_ALREADY_EXISTS: u32 = 183;
+const EVENT_MODIFY_STATE: u32 = 0x0002;
+const INFINITE: u32 = u32::MAX;
+const INSTANCE_MUTEX: &str = r"Local\Laurel.dev.laurel.app.instance";
+const SHOW_EVENT: &str = r"Local\Laurel.dev.laurel.app.show";
+
+/// One Laurel per Windows session: true when this process now holds the named
+/// mutex (kept until it exits). Otherwise another Laurel holds it, or an elevated
+/// one this process may not open, and the other one is asked to show its window.
+pub fn single_instance() -> bool {
+    unsafe {
+        let name = wide(INSTANCE_MUTEX);
+        let mutex = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        let error = GetLastError();
+        if mutex != 0 && error != ERROR_ALREADY_EXISTS {
+            return true;
+        }
+        if mutex != 0 {
+            CloseHandle(mutex);
+        }
+        let event = OpenEventW(EVENT_MODIFY_STATE, 0, wide(SHOW_EVENT).as_ptr());
+        if event != 0 {
+            SetEvent(event);
+            CloseHandle(event);
+        }
+        false
+    }
+}
+
+/// Calls `show` each time another start of Laurel asks this one to show its window.
+pub fn on_show_request(show: impl Fn() + Send + 'static) {
+    std::thread::spawn(move || unsafe {
+        let event = CreateEventW(std::ptr::null(), 0, 0, wide(SHOW_EVENT).as_ptr());
+        if event == 0 {
+            return;
+        }
+        while WaitForSingleObject(event, INFINITE) == 0 {
+            show();
+        }
+    });
+}
+
 pub fn wait_for_exit(pid: u32, ms: u32) {
     unsafe {
         let process = OpenProcess(SYNCHRONIZE, 0, pid);

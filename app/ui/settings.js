@@ -362,6 +362,14 @@ function showLicense() {
 $('license-doc').onchange = showLicense;
 $('about-source').onclick = () => invoke('open_source_page');
 $('open-logs').onclick = () => invoke('open_logs').catch((e) => { $('settings-status').textContent = `${e}`; });
+$('save-logs').onclick = async () => {
+  try {
+    const path = await invoke('logs_export');
+    $('settings-status').textContent = t('Saved in Downloads: {name}', { name: path.split(/[\\/]/).pop() });
+  } catch (e) {
+    $('settings-status').textContent = t('Could not save the logs: {error}', { error: e });
+  }
+};
 
 // Updates (stage 6 plan): the check runs a little after the start when the setting is
 // on, or here on demand; installing is always the user's choice.
