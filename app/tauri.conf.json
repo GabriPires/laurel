@@ -1,6 +1,6 @@
 {
   "productName": "Laurel",
-  "version": "0.1.0-rc.5",
+  "version": "0.1.0-rc.6",
   "identifier": "dev.laurel.app",
   "build": { "frontendDist": "./ui" },
   "app": {

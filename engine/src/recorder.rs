@@ -89,6 +89,32 @@ fn window_spec(game: &GameInfo) -> String {
 /// finds games by executable (spec game.detection); titles can change.
 const MATCH_TITLE_THEN_EXE: i64 = 2;
 
+/// The game window a capture names: the app names the detected game's window both
+/// for game capture and for the window capture it falls back to.
+fn named_window(capture: &Capture) -> Option<&str> {
+    match capture {
+        Capture::Window(spec) | Capture::Game(Some(spec)) => Some(spec),
+        _ => None,
+    }
+}
+
+/// The executable of a window spec, unescaped.
+fn spec_exe(spec: &str) -> String {
+    spec.rsplit(':').next().unwrap_or_default().replace("#3A", ":").replace("#22", "#")
+}
+
+/// Game audio source settings that capture a window's process (spec audio.per-app).
+fn follow_settings(spec: &str) -> Data {
+    Data::new().str("window", spec).int("priority", MATCH_TITLE_THEN_EXE)
+}
+
+/// Records that the game audio now follows this window's process.
+fn followed(spec: &str, watch: &GameWatch) {
+    let exe = spec_exe(spec);
+    log!("[laurel] game audio follows {exe}");
+    *watch.audio_bound.lock().unwrap() = Some(exe);
+}
+
 #[derive(Clone, Debug)]
 pub enum Capture {
     /// Monitor by index in the `monitor_capture` device list, with the capture
@@ -211,10 +237,12 @@ impl Recorder {
         let mut binder_thread = None;
         let mut game_audio = None;
         if cfg.desktop_audio {
-            let window = cfg.game_audio.clone().unwrap_or_default();
-            let source = Source::new("wasapi_process_output_capture", "game-audio", &Data::new().str("window", &window).int("priority", MATCH_TITLE_THEN_EXE))?;
+            // Tests name the window; otherwise the game the app named is followed
+            // from the start, without waiting for a hook that may never come.
+            let window = cfg.game_audio.as_deref().or(named_window(&cfg.capture)).unwrap_or_default();
+            let source = Source::new("wasapi_process_output_capture", "game-audio", &follow_settings(window))?;
             if !window.is_empty() {
-                *game.audio_bound.lock().unwrap() = Some(window);
+                followed(window, &game);
             }
             binder_thread = Some(spawn_audio_binder(SharedSource::of(&source), game.clone()));
             source.set_output_channel(GAME_AUDIO_CHANNEL);
@@ -377,7 +405,9 @@ impl Recorder {
         self.game.audio_bound.lock().unwrap().clone()
     }
 
-    /// Replaces the capture source while recording continues.
+    /// Replaces the capture source while recording continues. The game audio follows
+    /// the game the app names right away: a game recorded by its window never sends
+    /// the hook's "hooked" signal.
     pub fn switch_capture(&mut self, obs: &Obs, capture: &Capture) -> Result<(), String> {
         let next = create_capture(obs, capture, self.cursor)?;
         self.unwatch_game();
@@ -386,6 +416,10 @@ impl Recorder {
         }
         self.scene.set(next.as_ref());
         self.capture = next; // drops our reference to the previous source
+        if let (Some(audio), Some(spec)) = (&self.game_audio, named_window(capture)) {
+            audio.update(&follow_settings(spec));
+            followed(spec, &self.game);
+        }
         Ok(())
     }
 
@@ -562,9 +596,9 @@ fn spawn_audio_binder(source: SharedSource, watch: Arc<GameWatch>) -> JoinHandle
     drop(tx);
     std::thread::spawn(move || {
         for game in rx {
-            source.update(&Data::new().str("window", &window_spec(&game)).int("priority", MATCH_TITLE_THEN_EXE));
-            log!("[laurel] game audio follows {}", game.exe);
-            *watch.audio_bound.lock().unwrap() = Some(game.exe);
+            let spec = window_spec(&game);
+            source.update(&follow_settings(&spec));
+            followed(&spec, &watch);
         }
     })
 }

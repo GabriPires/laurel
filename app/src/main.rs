@@ -1304,6 +1304,13 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
             if snapshot["capture"] != "window" || !target.as_str().unwrap_or_default().starts_with("window:") {
                 return Err("the window capture fallback did not start".into());
             }
+            // No hook reports a game recorded by its window, and the game audio
+            // still has to follow its process (spec audio.per-app).
+            let follows = status("audio")?["follows"].clone();
+            log!("[selftest] game audio follows {follows}");
+            if !follows.as_str().is_some_and(|exe| exe.eq_ignore_ascii_case("powershell.exe")) {
+                return Err(format!("the game audio does not follow the game's window: {follows}"));
+            }
             Ok(())
         });
         let _ = child.kill();

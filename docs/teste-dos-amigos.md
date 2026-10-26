@@ -4,6 +4,10 @@ O Laurel guarda os últimos segundos do jogo que você está jogando e salva um 
 
 Esta é uma versão de teste. Ela pode ter erros, e é exatamente isso que queremos achar com a sua ajuda.
 
+## O que mudou na 0.1.0-rc.6
+
+- **Som do jogo nos clipes.** Quando o Laurel não conseguia entrar no jogo logo que ele abria, ele passava a gravar a janela do jogo (com o aviso "Gravando {jogo} pela janela"), mas deixava o som do jogo de fora. Com **Jogo e microfone**, o clipe ficava só com a sua voz; com **Só o jogo**, ficava mudo. Isso acontecia muito no Overwatch. Agora o som do jogo entra também nesse caso. Os clipes que já saíram sem o som do jogo não têm como recuperá-lo.
+
 ## O que mudou na 0.1.0-rc.5
 
 Esta versão prepara os **testes de estabilidade**: jogue normalmente e, depois de algumas sessões, mande os logs.
@@ -61,7 +65,7 @@ Não precisa fazer tudo. O que você conseguir já ajuda muito.
 1. **Instalação ou atualização:** instalou ou atualizou sem erro? Pediu administrador? Seu PC tinha OBS instalado?
 2. **Jogo encontrado:** abriu um jogo e o Laurel mostrou **Gravando** com o nome certo?
 3. **Clipe:** o F8 salvou o clipe? Tocou o som de clipe salvo? O clipe tem imagem e som, e pelo menos 30 segundos?
-4. **Som:** com o padrão (jogo e microfone), o Discord e a música ficaram fora do clipe? Teste também as outras opções de **Som do clipe**.
+4. **Som:** com o padrão (jogo e microfone), o Discord e a música ficaram fora do clipe? Teste também as outras opções de **Som do clipe**. Se aparecer o aviso **Gravando {jogo} pela janela**, confira se o clipe tem o som do jogo.
 5. **Placa de vídeo:** em **Configurações > Gravação**, o item **Gravando agora** mostra o codificador em uso. Diga qual apareceu e qual é a sua placa (NVIDIA, AMD ou Intel). Testar em placas AMD e Intel é muito importante.
 6. **Desempenho:** sentiu queda de FPS ou travadas, principalmente quando o jogo abriu ou quando salvou um clipe? Se quiser, ligue **Configurações > Notificações > Mostrar avisos sobre os jogos** e diga se sentiu alguma diferença ao salvar com o aviso na tela. Diga também se o seu monitor usa G-Sync ou FreeSync.
 7. **Português:** o Laurel abriu em português? Algum texto ficou estranho, cortado ou em inglês? Mande uma captura de tela.
