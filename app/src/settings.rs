@@ -93,7 +93,9 @@ pub const DELETED_DAYS: [u32; 4] = [1, 7, 15, 30];
 impl Default for Settings {
     fn default() -> Settings {
         Settings {
-            overlay: true,
+            // Off since 0.1.0-rc.3: a notice over the game takes it out of
+            // independent flip while it shows (owner's decision of 2026-10-26).
+            overlay: false,
             sounds: true,
             volume: 70,
             folder: String::new(),
@@ -140,7 +142,9 @@ impl Settings {
             v[key].as_array().into_iter().flatten().filter_map(|e| Some((e[a].as_str()?.to_string(), e[b].as_str()?.to_string()))).collect()
         };
         Settings {
-            overlay: flag("overlay", d.overlay),
+            // Stored as "overlayNotices" since 0.1.0-rc.3; the old "overlay" key is
+            // ignored, so the new default reaches the earlier installs once.
+            overlay: flag("overlayNotices", d.overlay),
             sounds: flag("sounds", d.sounds),
             volume: number("volume", d.volume as u32, 100) as u8,
             folder: text("folder", &d.folder),
@@ -183,7 +187,7 @@ impl Settings {
 
     pub fn to_json(&self) -> Value {
         json!({
-            "overlay": self.overlay,
+            "overlayNotices": self.overlay,
             "sounds": self.sounds,
             "volume": self.volume,
             "folder": self.folder,

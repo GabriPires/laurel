@@ -1,6 +1,6 @@
 [package]
 name = "laurel-app"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 description = "Laurel desktop app (PoC-U1): tray, windows, hotkeys and supervision of laurel-engine."
 edition.workspace = true
 license.workspace = true

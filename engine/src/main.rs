@@ -129,6 +129,14 @@ fn local_timestamp() -> String {
     format!("{:04}-{:02}-{:02} {:02}-{:02}-{:02}", t.year, t.month, t.day, t.hour, t.minute, t.second)
 }
 
+/// Local time as `hh:mm:ss.mmm`, the app log's clock, to line script events up with
+/// PresentMon's `--date_time` frames.
+fn clock() -> String {
+    let mut t = SystemTime::default();
+    unsafe { GetLocalTime(&mut t) };
+    format!("{:02}:{:02}:{:02}.{:03}", t.hour, t.minute, t.second, t.millis)
+}
+
 /// `dir/Laurel <timestamp>.png`, with a counter if that name is taken.
 fn screenshot_path(dir: &Path) -> PathBuf {
     let stem = format!("Laurel {}", local_timestamp());
@@ -542,6 +550,7 @@ fn run(args: Args) -> Result<(), String> {
                 std::thread::sleep(Duration::from_secs_f64(secs));
             }
             Some("save") => {
+                log!("[laurel] save at {}", clock());
                 let t = Instant::now();
                 match rec.save_clip(Duration::from_secs(30)) {
                     Ok(p) => log!("[laurel] clip saved in {} ms: {}", t.elapsed().as_millis(), p.display()),
@@ -549,6 +558,7 @@ fn run(args: Args) -> Result<(), String> {
                 }
             }
             Some("screenshot") => {
+                log!("[laurel] screenshot at {}", clock());
                 let path = screenshot_path(&shots_dir);
                 let t = Instant::now();
                 match rec.screenshot(&path, rec.output_size(), Duration::from_secs(5)) {

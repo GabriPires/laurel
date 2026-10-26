@@ -112,6 +112,15 @@ function showMix(mix) {
   $('audio-mix-desc').classList.toggle('warn', mix === 'pc-mic');
 }
 
+// Notices over games (overlay.in-game): off by default, since the game leaves
+// independent flip while one is on screen; when on, the row says so in yellow.
+function showOverlay(on) {
+  $('overlay-desc').textContent = on
+    ? t('Some games may run a little unevenly while a notice is on screen. If you notice it, turn this off.')
+    : t('A short notice in the corner of the game.');
+  $('overlay-desc').classList.toggle('warn', on);
+}
+
 // Options that only apply when another one is on stay visible but dimmed.
 function dim(row, off) {
   row.classList.toggle('dim', off);
@@ -120,7 +129,8 @@ function dim(row, off) {
 
 function fill(s) {
   settings = s;
-  $('opt-overlay').checked = s.overlay;
+  $('opt-overlay').checked = s.overlayNotices;
+  showOverlay(s.overlayNotices);
   $('opt-sounds').checked = s.sounds;
   $('opt-volume').value = s.volume;
   $('opt-volume-value').textContent = s.volume;
@@ -178,7 +188,7 @@ async function loadSettings() {
 async function saveSettings() {
   const next = {
     ...settings,
-    overlay: $('opt-overlay').checked,
+    overlayNotices: $('opt-overlay').checked,
     sounds: $('opt-sounds').checked,
     volume: Number($('opt-volume').value),
     naming: $('opt-naming').value,

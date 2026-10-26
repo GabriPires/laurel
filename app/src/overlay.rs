@@ -49,11 +49,20 @@ impl Kind {
         }
     }
 
-    /// How long a notice stays; the window hides a little after the last one.
+    /// How long a notice stays; the window hides `EXIT` after the last one. While
+    /// the window is visible the game leaves independent flip (measured on
+    /// 2026-10-26), so clip and screenshot notices keep it 1.5 s in all.
     fn hold(self) -> Duration {
-        Duration::from_millis(if self == Kind::Error { 6000 } else { 4000 })
+        Duration::from_millis(match self {
+            Kind::Clip | Kind::Screenshot => 1300,
+            Kind::Info => 4000,
+            Kind::Error => 6000,
+        })
     }
 }
+
+/// The notice's exit animation (ui/overlay.css, 180 ms) and a little slack.
+const EXIT: Duration = Duration::from_millis(200);
 
 #[derive(Clone)]
 pub struct Notifier(Arc<Inner>);
@@ -129,8 +138,7 @@ impl Notifier {
             let (w, h, m) = ((WIDTH * scale) as i32, (HEIGHT * scale) as i32, (MARGIN * scale) as i32);
             win::show_no_activate(hwnd, anchor.right - w - m, anchor.top + m, w, h);
         });
-        // A little longer than the notice itself, for its exit animation.
-        let until = Instant::now() + kind.hold() + Duration::from_millis(600);
+        let until = Instant::now() + kind.hold() + EXIT;
         {
             let mut visible_until = self.0.visible_until.lock().unwrap();
             *visible_until = (*visible_until).max(until);

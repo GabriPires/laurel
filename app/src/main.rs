@@ -1723,6 +1723,21 @@ fn check_overlay(engine: &Engine, notifier: &Notifier) -> Result<(), String> {
     if win::is_visible(hwnd) {
         return Err("overlay did not hide".into());
     }
+
+    // A clip notice keeps the overlay up about 1.5 s: the game leaves independent
+    // flip while it shows.
+    notifier.notify(Kind::Clip, "Laurel self-test", "Checking the clip notice");
+    let shown = Instant::now();
+    std::thread::sleep(Duration::from_millis(100));
+    let was_visible = win::is_visible(hwnd);
+    while win::is_visible(hwnd) && shown.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let ms = shown.elapsed().as_millis();
+    log!("[selftest] clip notice visible={was_visible} hidden after {ms} ms");
+    if !was_visible || !(1300..=1900).contains(&ms) {
+        return Err("the clip notice did not last about 1.5 s".into());
+    }
     Ok(())
 }
 

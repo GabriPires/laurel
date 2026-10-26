@@ -4,6 +4,11 @@ O Laurel guarda os últimos segundos do jogo que você está jogando e salva um 
 
 Esta é uma versão de teste. Ela pode ter erros, e é exatamente isso que queremos achar com a sua ajuda.
 
+## O que mudou na 0.1.0-rc.3
+
+- **Avisos no jogo desligados por padrão.** Medimos que, enquanto o aviso **Clipe salvo** aparece por cima do jogo, o Windows deixa de mostrar a imagem do jogo pelo caminho mais rápido, e alguns jogos podem ter uma leve instabilidade. Por isso, o aviso visual agora vem desligado, e o som de clipe salvo continua. A atualização desliga o aviso uma vez, mesmo para quem já tinha o Laurel.
+- **Avisos mais curtos.** Para quem ligar os avisos em **Configurações > Notificações > Mostrar avisos sobre os jogos**, o aviso de clipe e o de captura de tela agora ficam só 1,5 segundo na tela. Ao ligar, aparece em amarelo o lembrete de que alguns jogos podem ter uma leve instabilidade.
+
 ## O que mudou na 0.1.0-rc.2
 
 - **Português.** O Laurel abre no idioma do Windows: português ou inglês. Para trocar, vá em **Configurações > Idioma**.
@@ -12,7 +17,7 @@ Esta é uma versão de teste. Ela pode ter erros, e é exatamente isso que quere
 - **Clipes de 30 segundos inteiros.** Antes, alguns clipes saíam com 29 e pouco; agora têm pelo menos o tempo escolhido.
 - **Logs mais úteis.** Os logs registram o que pediu cada clipe (o atalho, a bandeja ou o botão), para entendermos casos de clipe salvo sem ninguém apertar o F8.
 
-Quem já tem a versão anterior recebe a atualização pelo próprio Laurel: aparece o aviso de versão nova, e é só clicar em **Install and restart** (a versão anterior ainda está em inglês).
+Quem já tem a versão anterior recebe a atualização pelo próprio Laurel: aparece o aviso de versão nova, e é só clicar em **Instalar e reiniciar** (na 0.1.0-rc.1, que ainda era em inglês, **Install and restart**).
 
 ## Antes de instalar
 
@@ -41,10 +46,10 @@ Não precisa fazer tudo. O que você conseguir já ajuda muito.
 
 1. **Instalação ou atualização:** instalou ou atualizou sem erro? Pediu administrador? Seu PC tinha OBS instalado?
 2. **Jogo encontrado:** abriu um jogo e o Laurel mostrou **Gravando** com o nome certo?
-3. **Clipe:** o F8 salvou o clipe? Apareceu o aviso **Clipe salvo** no jogo? O clipe tem imagem e som, e pelo menos 30 segundos?
+3. **Clipe:** o F8 salvou o clipe? Tocou o som de clipe salvo? O clipe tem imagem e som, e pelo menos 30 segundos?
 4. **Som:** com o padrão (jogo e microfone), o Discord e a música ficaram fora do clipe? Teste também as outras opções de **Som do clipe**.
 5. **Placa de vídeo:** em **Configurações > Gravação**, o item **Gravando agora** mostra o codificador em uso. Diga qual apareceu e qual é a sua placa (NVIDIA, AMD ou Intel). Testar em placas AMD e Intel é muito importante.
-6. **Desempenho:** sentiu queda de FPS ou travadas, principalmente quando o jogo abriu ou quando salvou um clipe? Se sentiu ao salvar, desligue **Configurações > Notificações > Mostrar avisos sobre os jogos**, teste de novo e diga se mudou.
+6. **Desempenho:** sentiu queda de FPS ou travadas, principalmente quando o jogo abriu ou quando salvou um clipe? Se quiser, ligue **Configurações > Notificações > Mostrar avisos sobre os jogos** e diga se sentiu alguma diferença ao salvar com o aviso na tela. Diga também se o seu monitor usa G-Sync ou FreeSync.
 7. **Português:** o Laurel abriu em português? Algum texto ficou estranho, cortado ou em inglês? Mande uma captura de tela.
 8. **Seleção e Excluídos:** excluir vários clipes de uma vez funcionou? O **Desfazer** trouxe de volta? **Restaurar** devolveu o clipe para a biblioteca?
 9. **Corte:** cortar um clipe na biblioteca funcionou?
