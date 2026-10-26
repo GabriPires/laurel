@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["engine", "app"]
+members = ["engine", "app", "steam"]
 # Spikes are standalone crates with their own Cargo.toml.
 exclude = ["poc"]
 

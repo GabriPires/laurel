@@ -1,0 +1,20 @@
+[package]
+name = "steam-achievements"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Spike: watch a Steam game's achievements through the Steam API library already on the PC (route A), in a process apart from Laurel, and measure its cost."
+publish = false
+
+[dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_System_LibraryLoader",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Registry",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+] }
+
+[profile.release]
+debug = "line-tables-only"

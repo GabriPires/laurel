@@ -4,6 +4,13 @@ O Laurel guarda os últimos segundos do jogo que você está jogando e salva um 
 
 Esta é uma versão de teste. Ela pode ter erros, e é exatamente isso que queremos achar com a sua ajuda.
 
+## O que mudou na 0.1.0-rc.4
+
+- **Clipes das conquistas da Steam.** Enquanto você joga um jogo da Steam, o Laurel salva um clipe sozinho quando você desbloqueia uma conquista rara: menos de 10% dos jogadores (**Rara**) ou menos de 5% (**Ultra rara**). O clipe sai uns 15 segundos depois da conquista, para mostrar o que veio em seguida, e leva o nome dela, por exemplo `Elsie 2026-10-26 12-48-50 - Hi Mom!.mp4`. Toca um som próprio, três notas subindo.
+- **Opções** em **Configurações > Clipes automáticos**: ligar e desligar tudo, o som, as três opções (**Ultra rara**, **Rara** e **Qualquer conquista**, que vem desligada) e uma chave para cada jogo da Steam, para deixar um jogo de fora.
+- **Na biblioteca**, os clipes de conquista têm um **troféu azul** na miniatura (passe o mouse para ver a conquista e quantos jogadores a têm), o filtro **Conquistas** na lateral e a linha **Conquista** nos detalhes.
+- **Como funciona.** Enquanto o jogo roda, um programa pequeno do Laurel lê as suas conquistas pela própria Steam. Ele não mexe no jogo e fecha junto com ele. A raridade vem da Valve, numa consulta por jogo.
+
 ## O que mudou na 0.1.0-rc.3
 
 - **Avisos no jogo desligados por padrão.** Medimos que, enquanto o aviso **Clipe salvo** aparece por cima do jogo, o Windows deixa de mostrar a imagem do jogo pelo caminho mais rápido, e alguns jogos podem ter uma leve instabilidade. Por isso, o aviso visual agora vem desligado, e o som de clipe salvo continua. A atualização desliga o aviso uma vez, mesmo para quem já tinha o Laurel.
@@ -55,6 +62,7 @@ Não precisa fazer tudo. O que você conseguir já ajuda muito.
 9. **Corte:** cortar um clipe na biblioteca funcionou?
 10. **Iniciar com o Windows:** depois de reiniciar o PC, o Laurel abriu sozinho na bandeja e gravou o jogo?
 11. **Atualização:** quando sair uma versão de teste nova, o Laurel vai oferecer a atualização sozinho. Diga se funcionou.
+12. **Conquistas da Steam:** jogando um jogo da Steam, desbloqueie uma conquista. Se ela for comum, ligue antes **Configurações > Clipes automáticos > Qualquer conquista**. O clipe apareceu uns 15 segundos depois, com o troféu na biblioteca? Tocou o som? Em **Clipes automáticos**, a linha de estado mostrou o jogo e as conquistas? Em jogos com anti-cheat, notou algo diferente? Mande o **app.log** se algo não sair.
 
 ## Como relatar um problema
 

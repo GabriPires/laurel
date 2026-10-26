@@ -1,6 +1,6 @@
 [package]
 name = "laurel-engine"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 description = "Laurel headless recording engine (PoC-E1): capture, replay buffer, screenshots and multi-track audio on top of libobs."
 edition.workspace = true
 license.workspace = true

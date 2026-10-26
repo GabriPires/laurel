@@ -6,8 +6,10 @@
 //! (capture.screen, off by default per D13), the video and the clip length
 //! (quality.encoding, record.replay-buffer), and what the clips' main audio track
 //! mixes (audio.separate-tracks), whether Laurel checks for updates (stage 6
-//! plan), the interface language, and how long deleted items wait in Recently
-//! deleted (library.trash). Missing or invalid fields fall back to the defaults.
+//! plan), the interface language, how long deleted items wait in Recently
+//! deleted (library.trash), and the automatic clips of Steam achievements
+//! (autoclip.steam-achievements). Missing or invalid fields fall back to the
+//! defaults.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -82,6 +84,16 @@ pub struct Settings {
     pub check_updates: bool,
     /// system, en or pt-BR (see i18n.rs).
     pub language: String,
+    /// Automatic clips (autoclip.steam-achievements): the main switch, the Steam
+    /// achievements group and its three events (any, under 10%, under 5% of the
+    /// players), the Steam games left out, and the auto-clip sound.
+    pub auto_clip: bool,
+    pub steam_achievements: bool,
+    pub steam_any: bool,
+    pub steam_rare: bool,
+    pub steam_ultra: bool,
+    pub steam_excluded: Vec<IgnoredGame>,
+    pub auto_clip_sound: bool,
 }
 
 pub const DEFAULT_NAMING: &str = "{game} {date} {time}";
@@ -127,6 +139,13 @@ impl Default for Settings {
             audio_mix: "game-mic".into(),
             check_updates: true,
             language: "system".into(),
+            auto_clip: true,
+            steam_achievements: true,
+            steam_any: false,
+            steam_rare: true,
+            steam_ultra: true,
+            steam_excluded: vec![],
+            auto_clip_sound: true,
         }
     }
 }
@@ -176,6 +195,13 @@ impl Settings {
             audio_mix: choice("audioMix", &["game", "game-mic", "pc-mic"], &d.audio_mix),
             check_updates: flag("checkUpdates", d.check_updates),
             language: choice("language", crate::i18n::LANGUAGES, &d.language),
+            auto_clip: flag("autoClip", d.auto_clip),
+            steam_achievements: flag("steamAchievements", d.steam_achievements),
+            steam_any: flag("steamAny", d.steam_any),
+            steam_rare: flag("steamRare", d.steam_rare),
+            steam_ultra: flag("steamUltra", d.steam_ultra),
+            steam_excluded: pairs("steamExcluded", "key", "name").into_iter().map(|(key, name)| IgnoredGame { key, name }).collect(),
+            auto_clip_sound: flag("autoClipSound", d.auto_clip_sound),
         }
     }
 
@@ -219,6 +245,13 @@ impl Settings {
             "audioMix": self.audio_mix,
             "checkUpdates": self.check_updates,
             "language": self.language,
+            "autoClip": self.auto_clip,
+            "steamAchievements": self.steam_achievements,
+            "steamAny": self.steam_any,
+            "steamRare": self.steam_rare,
+            "steamUltra": self.steam_ultra,
+            "steamExcluded": self.steam_excluded.iter().map(|g| json!({ "key": g.key, "name": g.name })).collect::<Vec<_>>(),
+            "autoClipSound": self.auto_clip_sound,
         })
     }
 }

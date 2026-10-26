@@ -28,6 +28,7 @@ Each release carries `Laurel-<version>-sources.zip`, made by `tools/gpl-sources.
 ## Used at run time, not distributed with Laurel
 
 - **Microsoft Edge WebView2 Runtime**, part of Windows, renders the user interface.
+- **Steam API library** (`steam_api64.dll`, Valve), already on the user's PC inside installed Steam games. Laurel's Steam helper (`laurel-steam.exe`, MIT license, see `steam/LICENSE`) loads it at run time to read the player's achievements for the running game; Laurel does not ship it or any Steamworks SDK file. Valve's public Web API gives the achievements' global percentages.
 - **Microsoft Visual C++ Runtime**, needed by the engine, OBS and FFmpeg; the installer adds it when it is missing.
 
 ## Development tools, not distributed

@@ -4,6 +4,7 @@
 # %LOCALAPPDATA%\Laurel without administrator rights:
 #
 #   laurel-app.exe, LICENSE, THIRD-PARTY-NOTICES.md
+#   laurel-steam.exe, LICENSE-laurel-steam.txt (the Steam helper, MIT license)
 #   engine\                  OBS runtime (tools/obs-runtime.py) with laurel-engine.exe
 #                            and ffmpeg.exe (tools/ffmpeg-build.py) in engine\bin\64bit
 #
@@ -61,10 +62,11 @@ echo "[installer] makensis $(makensis -VERSION)"
 cd "$ROOT"
 stage=$ROOT/target/laurel-installer
 mkdir -p "$stage/engine/bin/64bit"
-cargo xwin build --release --target "$TARGET" -p laurel-engine
+cargo xwin build --release --target "$TARGET" -p laurel-engine -p laurel-steam
 python3 -I tools/obs-runtime.py stage "$stage/engine"
 python3 -I tools/ffmpeg-build.py stage "$stage/engine"
 cp "target/$TARGET/release/laurel-engine.exe" "$stage/engine/bin/64bit/"
+cp "target/$TARGET/release/laurel-steam.exe" "$stage/"
 
 vc=$CACHE/vcredist/vc_redist.x64.exe
 if [ ! -f "$vc" ] || [ "$(sha256sum "$vc" | cut -d' ' -f1)" != "$VC_SHA256" ]; then

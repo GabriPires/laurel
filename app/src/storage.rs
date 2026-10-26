@@ -112,12 +112,21 @@ impl Storage {
     /// {game}, {date}, {time}) and moves the engine's thumbnail along. Returns the
     /// new path; on failure the file keeps its engine name.
     pub fn apply_naming(&self, saved: &str, game: Option<&str>, thumbs_dir: &Path) -> String {
+        self.apply_naming_with(saved, game, None, thumbs_dir)
+    }
+
+    /// Same as apply_naming, with ` - <extra>` after the pattern (an automatic clip's
+    /// achievement, autoclip.steam-achievements).
+    pub fn apply_naming_with(&self, saved: &str, game: Option<&str>, extra: Option<&str>, thumbs_dir: &Path) -> String {
         let path = PathBuf::from(crate::share::windows_path(saved));
         let (Some(dir), Some(ext), Some(old_stem)) = (path.parent(), path.extension(), path.file_stem()) else {
             return saved.to_string();
         };
         let (date, time) = saved_at(&old_stem.to_string_lossy());
-        let name = self.store.get().naming.replace("{game}", game.unwrap_or("Laurel")).replace("{date}", &date).replace("{time}", &time);
+        let mut name = self.store.get().naming.replace("{game}", game.unwrap_or("Laurel")).replace("{date}", &date).replace("{time}", &time);
+        if let Some(extra) = extra.filter(|e| !e.trim().is_empty()) {
+            name = format!("{name} - {extra}");
+        }
         let ext = ext.to_string_lossy();
         // The engine already names files "Laurel <date> <time>"; the same name stays
         // as it is instead of becoming "… (2)".

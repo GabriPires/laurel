@@ -9,6 +9,8 @@
     "longDescription": "Laurel keeps the last seconds of the game you are playing and saves them as a clip when you press a hotkey.",
     "resources": {
       "../target/laurel-installer/engine/": "engine/",
+      "../target/laurel-installer/laurel-steam.exe": "laurel-steam.exe",
+      "../steam/LICENSE": "LICENSE-laurel-steam.txt",
       "../LICENSE": "LICENSE",
       "../THIRD-PARTY-NOTICES.md": "THIRD-PARTY-NOTICES.md"
     },

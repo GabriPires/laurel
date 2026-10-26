@@ -5,6 +5,7 @@ const { listen } = window.__TAURI__.event;
 const MAX_VISIBLE = 3;
 const ICONS = {
   clip: '<path d="M5 12l4 4 10-10"/>',
+  'auto-clip': '<path d="M8 4h8v5a4 4 0 01-8 0V4z"/><path d="M8 6H5.5a2.5 2.5 0 002.7 3.5M16 6h2.5a2.5 2.5 0 01-2.7 3.5"/><path d="M12 13v4M8.5 20h7M10 17h4"/>',
   screenshot: '<path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/>',
   info: '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/>',
   error: '<path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9L2.6 17a2 2 0 001.7 3h15.4a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/>',

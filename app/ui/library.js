@@ -11,7 +11,8 @@ const { convertFileSrc } = window.__TAURI__.core;
 
 const library = { items: [], deleted: [], filter: { type: 'all' }, sort: 'new', query: '', current: null, selected: new Set(), anchor: null, confirm: null };
 
-const typeTitle = (type) => ({ all: t('All'), clip: t('Clips'), screenshot: t('Screenshots'), kept: t('Kept'), deleted: t('Recently deleted') })[type];
+const typeTitle = (type) => ({ all: t('All'), clip: t('Clips'), screenshot: t('Screenshots'), kept: t('Kept'), achievement: t('Achievements'), deleted: t('Recently deleted') })[type];
+const TROPHY = '<path d="M8 4h8v5a4 4 0 01-8 0V4z"/><path d="M8 6H5.5a2.5 2.5 0 002.7 3.5M16 6h2.5a2.5 2.5 0 01-2.7 3.5"/><path d="M12 13v4M8.5 20h7M10 17h4"/>';
 const DAY_MS = 86400000;
 const deletedDays = () => settings?.deletedDays ?? 7;
 // Whole days before a deleted item goes for good, at least one.
@@ -55,6 +56,13 @@ function fmtDay(ms) {
 
 const fmtWhen = (ms) => `${fmtDay(ms)} ${fmtTime(new Date(ms))}`;
 
+// "Hi Mom! · 2.1% of players", the achievement an automatic clip was saved for.
+function achievementText(a) {
+  const share = a.percent != null ? ` · ${t('{percent}% of players', { percent: fmtNum(a.percent, 1) })}` : '';
+  const more = a.others?.length ? ` · ${tp(a.others.length, '+{n} more', '+{n} more')}` : '';
+  return `${t('Achievement: {name}', { name: a.name || a.id })}${share}${more}`;
+}
+
 function fmtSize(bytes) {
   const mb = bytes / 1048576;
   const gb = mb / 1024;
@@ -82,6 +90,7 @@ const gameKey = (item) => gameOf(item).toLowerCase().replace(/[^\p{L}\p{N}]/gu, 
 function matches(item, filter) {
   if (filter.type === 'clip' || filter.type === 'screenshot') return item.kind === filter.type;
   if (filter.type === 'kept') return item.kept;
+  if (filter.type === 'achievement') return item.achievement != null;
   if (filter.type === 'game') return gameKey(item) === filter.key;
   return true;
 }
@@ -106,7 +115,8 @@ function visible() {
   const query = library.query.trim().toLowerCase();
   const source = inTrash() ? library.deleted : library.items;
   const items = source.filter((item) => (inTrash() || matches(item, library.filter))
-    && (!query || gameOf(item).toLowerCase().includes(query) || fileName(item.path).toLowerCase().includes(query)));
+    && (!query || gameOf(item).toLowerCase().includes(query) || fileName(item.path).toLowerCase().includes(query)
+      || (item.achievement?.name ?? '').toLowerCase().includes(query)));
   if (library.sort === 'old') items.sort((a, b) => sortTime(a) - sortTime(b));
   else if (library.sort === 'size') items.sort((a, b) => b.size - a.size);
   else items.sort((a, b) => sortTime(b) - sortTime(a));
@@ -121,10 +131,11 @@ function svgIcon(paths, size = 16) {
 }
 
 function renderSide() {
-  const counts = { all: library.items.length, clip: 0, screenshot: 0, kept: 0, deleted: library.deleted.length };
+  const counts = { all: library.items.length, clip: 0, screenshot: 0, kept: 0, achievement: 0, deleted: library.deleted.length };
   for (const item of library.items) {
     counts[item.kind] += 1;
     if (item.kept) counts.kept += 1;
+    if (item.achievement) counts.achievement += 1;
   }
   for (const [type, n] of Object.entries(counts)) $(`count-${type}`).textContent = n || '';
   for (const button of document.querySelectorAll('#view-library .side-item[data-filter]')) {
@@ -219,13 +230,24 @@ function card(item, withDay) {
     left.textContent = tp(daysLeft(item), 'Goes in {n} day', 'Goes in {n} days');
     thumb.append(left);
   }
+  const marks = document.createElement('span');
+  marks.className = 'marks';
   if (item.kept) {
     const kept = document.createElement('span');
     kept.className = 'kept';
     kept.textContent = `★ ${t('Kept|state')}`;
     kept.title = t('Kept: never removed by the storage limit');
-    thumb.append(kept);
+    marks.append(kept);
   }
+  if (item.achievement) {
+    const trophy = document.createElement('span');
+    trophy.className = 'trophy';
+    trophy.append(svgIcon(TROPHY, 13));
+    trophy.title = achievementText(item.achievement);
+    trophy.setAttribute('aria-label', trophy.title);
+    marks.append(trophy);
+  }
+  if (marks.childElementCount) thumb.append(marks);
   if (item.kind === 'clip') {
     const play = document.createElement('span');
     play.className = 'play';
@@ -271,6 +293,7 @@ function emptyText() {
   return {
     screenshot: t('No screenshots yet. Press {key} in a game.', { key: shotKey }),
     kept: t('Nothing kept yet. Keep a clip in the viewer and the storage limit never removes it.'),
+    achievement: t('No achievement clips yet. With Settings, Auto-clip on, Laurel saves a clip when you unlock a rare Steam achievement.'),
     deleted: tp(deletedDays(), 'Nothing here. Deleted clips and screenshots wait here for {n} day before they go for good.', 'Nothing here. Deleted clips and screenshots wait here for {n} days before they go for good.'),
   }[library.filter.type] ?? t('No clips yet. Press {key} in a game to save the last seconds.', { key: clipKey });
 }
@@ -591,6 +614,14 @@ function showDetails(item) {
     $('fact-audio').textContent = trackText(item.audioTracks);
   }
   $('fact-size').textContent = fmtSize(item.size);
+  const a = item.achievement;
+  $('fact-achievement').hidden = $('fact-achievement-label').hidden = !a;
+  if (a) {
+    const share = a.percent != null ? ` · ${t('{percent}% of players', { percent: fmtNum(a.percent, 1) })}` : '';
+    const more = a.others?.length ? ` · ${a.others.join(', ')}` : '';
+    $('fact-achievement').textContent = `${a.name || a.id}${share}${more}`;
+    $('fact-achievement').title = a.description ?? '';
+  }
   $('viewer-path').textContent = item.path;
   $('viewer-open-label').textContent = clip ? t('Open in player') : t('Open in image viewer');
   showKept(item.kept);

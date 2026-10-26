@@ -25,6 +25,8 @@ const MARGIN: f64 = 20.0;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Kind {
     Clip,
+    /// A clip Laurel saved by itself (an achievement).
+    AutoClip,
     Screenshot,
     Info,
     Error,
@@ -34,6 +36,7 @@ impl Kind {
     fn name(self) -> &'static str {
         match self {
             Kind::Clip => "clip",
+            Kind::AutoClip => "auto-clip",
             Kind::Screenshot => "screenshot",
             Kind::Info => "info",
             Kind::Error => "error",
@@ -43,6 +46,7 @@ impl Kind {
     fn alert(self) -> Option<Alert> {
         match self {
             Kind::Clip => Some(Alert::Clip),
+            Kind::AutoClip => Some(Alert::AutoClip),
             Kind::Screenshot => Some(Alert::Screenshot),
             Kind::Error => Some(Alert::Error),
             Kind::Info => None,
@@ -54,7 +58,7 @@ impl Kind {
     /// 2026-10-26), so clip and screenshot notices keep it 1.5 s in all.
     fn hold(self) -> Duration {
         Duration::from_millis(match self {
-            Kind::Clip | Kind::Screenshot => 1300,
+            Kind::Clip | Kind::AutoClip | Kind::Screenshot => 1300,
             Kind::Info => 4000,
             Kind::Error => 6000,
         })
@@ -120,7 +124,8 @@ impl Notifier {
     /// each according to the settings.
     pub fn notify(&self, kind: Kind, title: &str, detail: &str) {
         let settings = self.settings();
-        if let (true, Some(alert)) = (settings.sounds && settings.volume > 0, kind.alert()) {
+        let sound = settings.sounds && settings.volume > 0 && (kind != Kind::AutoClip || settings.auto_clip_sound);
+        if let (true, Some(alert)) = (sound, kind.alert()) {
             let mut sounds = self.0.sounds.lock().unwrap();
             if sounds.0 != settings.volume {
                 *sounds = (settings.volume, Sounds::new(settings.volume));

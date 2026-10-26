@@ -36,7 +36,7 @@
   ${EndIf}
   Abort
   laurel_close_now:
-    nsExec::Exec `"${LAUREL_POWERSHELL}" -NoProfile -NonInteractive -Command "Get-Process laurel-app,laurel-engine,ffmpeg -ErrorAction SilentlyContinue | Where-Object { $$_.Path -like '$INSTDIR\*' } | Stop-Process -Force; Start-Sleep -Milliseconds 500"`
+    nsExec::Exec `"${LAUREL_POWERSHELL}" -NoProfile -NonInteractive -Command "Get-Process laurel-app,laurel-engine,laurel-steam,ffmpeg -ErrorAction SilentlyContinue | Where-Object { $$_.Path -like '$INSTDIR\*' } | Stop-Process -Force; Start-Sleep -Milliseconds 500"`
     Pop $R0
   laurel_close_done:
 !macroend

@@ -14,6 +14,8 @@ pub enum Alert {
     Screenshot,
     /// Two falling low notes (G4, E-flat 4).
     Error,
+    /// Three rising notes (E6, G6, C7): a clip Laurel saved by itself.
+    AutoClip,
 }
 
 impl Alert {
@@ -22,15 +24,17 @@ impl Alert {
             Alert::Clip => &[(880.0, 90), (1318.5, 170)],
             Alert::Screenshot => &[(1568.0, 80)],
             Alert::Error => &[(392.0, 150), (311.1, 240)],
+            Alert::AutoClip => &[(1318.5, 80), (1568.0, 80), (2093.0, 200)],
         }
     }
 }
 
-/// The three alert sounds rendered at one volume.
+/// The alert sounds rendered at one volume.
 pub struct Sounds {
     clip: &'static [u8],
     screenshot: &'static [u8],
     error: &'static [u8],
+    auto_clip: &'static [u8],
 }
 
 impl Sounds {
@@ -39,7 +43,7 @@ impl Sounds {
     pub fn new(volume: u8) -> Sounds {
         let gain = (volume.min(100) as f32 / 100.0).powi(2);
         let render = |a: Alert| -> &'static [u8] { Box::leak(wav(a.notes(), gain).into_boxed_slice()) };
-        Sounds { clip: render(Alert::Clip), screenshot: render(Alert::Screenshot), error: render(Alert::Error) }
+        Sounds { clip: render(Alert::Clip), screenshot: render(Alert::Screenshot), error: render(Alert::Error), auto_clip: render(Alert::AutoClip) }
     }
 
     pub fn play(&self, alert: Alert) {
@@ -47,6 +51,7 @@ impl Sounds {
             Alert::Clip => self.clip,
             Alert::Screenshot => self.screenshot,
             Alert::Error => self.error,
+            Alert::AutoClip => self.auto_clip,
         });
     }
 }

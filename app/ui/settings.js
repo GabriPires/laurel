@@ -129,6 +129,15 @@ function dim(row, off) {
 
 function fill(s) {
   settings = s;
+  $('opt-autoclip').checked = s.autoClip;
+  $('opt-autoclip-sound').checked = s.autoClipSound;
+  $('opt-steam').checked = s.steamAchievements;
+  $('opt-steam-ultra').checked = s.steamUltra;
+  $('opt-steam-rare').checked = s.steamRare;
+  $('opt-steam-any').checked = s.steamAny;
+  dim($('opt-autoclip-sound').closest('.row-item'), !s.autoClip);
+  dim($('opt-steam').closest('.row-item'), !s.autoClip);
+  for (const id of ['opt-steam-ultra', 'opt-steam-rare', 'opt-steam-any']) dim($(id).closest('.row-item'), !(s.autoClip && s.steamAchievements));
   $('opt-overlay').checked = s.overlayNotices;
   showOverlay(s.overlayNotices);
   $('opt-sounds').checked = s.sounds;
@@ -189,6 +198,12 @@ async function saveSettings() {
   const next = {
     ...settings,
     overlayNotices: $('opt-overlay').checked,
+    autoClip: $('opt-autoclip').checked,
+    autoClipSound: $('opt-autoclip-sound').checked,
+    steamAchievements: $('opt-steam').checked,
+    steamUltra: $('opt-steam-ultra').checked,
+    steamRare: $('opt-steam-rare').checked,
+    steamAny: $('opt-steam-any').checked,
     sounds: $('opt-sounds').checked,
     volume: Number($('opt-volume').value),
     naming: $('opt-naming').value,
@@ -233,7 +248,7 @@ async function saveSettings() {
   }
 }
 
-for (const id of ['opt-overlay', 'opt-sounds', 'opt-volume', 'opt-naming', 'opt-limit', 'opt-limit-gb', 'opt-recycle', 'opt-min-free', 'opt-deleted-days', 'opt-cursor', 'opt-screen', 'opt-screen-monitor', 'opt-screen-switch',
+for (const id of ['opt-autoclip', 'opt-autoclip-sound', 'opt-steam', 'opt-steam-ultra', 'opt-steam-rare', 'opt-steam-any', 'opt-overlay', 'opt-sounds', 'opt-volume', 'opt-naming', 'opt-limit', 'opt-limit-gb', 'opt-recycle', 'opt-min-free', 'opt-deleted-days', 'opt-cursor', 'opt-screen', 'opt-screen-monitor', 'opt-screen-switch',
   'opt-video-encoder', 'opt-video-codec', 'opt-video-preset', 'opt-video-rate', 'opt-video-bitrate', 'opt-video-height', 'opt-video-fps', 'opt-clip-secs', 'opt-audio-mix', 'opt-updates', 'opt-language']) {
   $(id).addEventListener('change', saveSettings);
 }

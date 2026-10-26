@@ -111,7 +111,9 @@ impl Library {
             .prepare("SELECT name FROM pragma_table_info('items')")
             .and_then(|mut stmt| stmt.query_map([], |r| r.get(0))?.collect())
             .map_err(|e| e.to_string())?;
-        for (column, kind) in [("deleted_ms", "INTEGER"), ("original_path", "TEXT")] {
+        // The achievement an automatic clip was saved for (autoclip.steam-achievements),
+        // as JSON, added in 0.1.0-rc.4.
+        for (column, kind) in [("deleted_ms", "INTEGER"), ("original_path", "TEXT"), ("achievement", "TEXT")] {
             if !columns.iter().any(|c| c == column) {
                 db.execute_batch(&format!("ALTER TABLE items ADD COLUMN {column} {kind};")).map_err(|e| e.to_string())?;
             }
@@ -333,6 +335,13 @@ impl Library {
         self.get(&key)?.ok_or_else(|| "item not indexed".into())
     }
 
+    /// Marks an item as an automatic clip of an achievement and returns it.
+    pub fn set_achievement(&self, path: &str, achievement: &Value) -> Result<Value, String> {
+        let key = share::windows_path(path);
+        self.db.lock().unwrap().execute("UPDATE items SET achievement = ?2 WHERE path = ?1", [key.as_str(), &achievement.to_string()]).map_err(|e| e.to_string())?;
+        self.get(&key)?.ok_or_else(|| "item not indexed".into())
+    }
+
     fn get(&self, path: &str) -> Result<Option<Value>, String> {
         self.db.lock().unwrap().query_row("SELECT * FROM items WHERE path = ?1", [path], row_json).optional().map_err(|e| e.to_string())
     }
@@ -522,5 +531,6 @@ fn row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "kept": r.get::<_, i64>("kept")? != 0,
         "deletedMs": r.get::<_, Option<i64>>("deleted_ms")?,
         "originalPath": r.get::<_, Option<String>>("original_path")?,
+        "achievement": r.get::<_, Option<String>>("achievement")?.and_then(|a| serde_json::from_str::<Value>(&a).ok()),
     }))
 }

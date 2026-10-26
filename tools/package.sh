@@ -3,6 +3,7 @@
 # install (Phase 4, stage 1):
 #
 #   <out>\Laurel\laurel-app.exe
+#   <out>\Laurel\laurel-steam.exe and LICENSE-laurel-steam.txt (the MIT Steam helper)
 #   <out>\Laurel\LICENSE
 #   <out>\Laurel\engine\            OBS runtime staged by tools/obs-runtime.py
 #   <out>\Laurel\engine\bin\64bit\laurel-engine.exe
@@ -30,7 +31,7 @@ done
 
 export PATH=$HOME/.cargo/bin:$PATH
 cd "$ROOT"
-cargo xwin build --release --target "$TARGET" -p laurel-engine -p laurel-app
+cargo xwin build --release --target "$TARGET" -p laurel-engine -p laurel-app -p laurel-steam
 release=$ROOT/target/$TARGET/release
 version=$(cargo metadata --no-deps --format-version 1 | python3 -I -c '
 import json, sys
@@ -41,7 +42,8 @@ mkdir -p "$dest/engine/bin/64bit"
 python3 -I "$ROOT/tools/obs-runtime.py" stage "$dest/engine"
 python3 -I "$ROOT/tools/ffmpeg-build.py" stage "$dest/engine"
 cp "$release/laurel-engine.exe" "$dest/engine/bin/64bit/"
-cp "$release/laurel-app.exe" "$ROOT/LICENSE" "$ROOT/THIRD-PARTY-NOTICES.md" "$dest/"
+cp "$release/laurel-app.exe" "$release/laurel-steam.exe" "$ROOT/LICENSE" "$ROOT/THIRD-PARTY-NOTICES.md" "$dest/"
+cp "$ROOT/steam/LICENSE" "$dest/LICENSE-laurel-steam.txt"
 echo "[package] Laurel $version in $dest"
 
 if [ "$zip" = 1 ]; then

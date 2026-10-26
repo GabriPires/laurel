@@ -1,0 +1,17 @@
+[package]
+name = "laurel-steam"
+version = "0.1.0-rc.4"
+edition.workspace = true
+license = "MIT"
+description = "Laurel's Steam helper: watches the player's achievements for the running Steam game through the Steam API library already on the PC, and reports new unlocks to Laurel. A separate program under the MIT license, apart from Laurel's GPL code."
+publish = false
+
+[dependencies]
+serde_json = "1"
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_System_LibraryLoader",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+] }

@@ -77,6 +77,19 @@ extern "system" {
     fn ShellExecuteExW(info: *mut ShellExecuteInfo) -> i32;
 }
 
+#[link(name = "winhttp", kind = "raw-dylib")]
+extern "system" {
+    fn WinHttpOpen(agent: *const u16, access: u32, proxy: *const u16, bypass: *const u16, flags: u32) -> isize;
+    fn WinHttpSetTimeouts(handle: isize, resolve: i32, connect: i32, send: i32, receive: i32) -> i32;
+    fn WinHttpConnect(session: isize, server: *const u16, port: u16, reserved: u32) -> isize;
+    fn WinHttpOpenRequest(connect: isize, verb: *const u16, object: *const u16, version: *const u16, referrer: *const u16, accept: *const *const u16, flags: u32) -> isize;
+    fn WinHttpSendRequest(request: isize, headers: *const u16, headers_len: u32, optional: *const c_void, optional_len: u32, total_len: u32, context: usize) -> i32;
+    fn WinHttpReceiveResponse(request: isize, reserved: *mut c_void) -> i32;
+    fn WinHttpQueryHeaders(request: isize, info: u32, name: *const u16, buffer: *mut c_void, len: *mut u32, index: *mut u32) -> i32;
+    fn WinHttpReadData(request: isize, buffer: *mut c_void, to_read: u32, read: *mut u32) -> i32;
+    fn WinHttpCloseHandle(handle: isize) -> i32;
+}
+
 #[link(name = "ole32", kind = "raw-dylib")]
 extern "system" {
     fn CoTaskMemFree(p: *mut c_void);
@@ -182,6 +195,63 @@ const FOF_NOERRORUI: u16 = 0x0400;
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+const WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY: u32 = 4;
+const WINHTTP_FLAG_SECURE: u32 = 0x0080_0000;
+const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
+const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
+
+/// An HTTPS GET of `path` on `host` through WinHTTP (system proxy settings, 10 s
+/// timeouts); the body when the status is 200.
+pub fn https_get(host: &str, path: &str) -> Result<Vec<u8>, String> {
+    let close = |h: isize| {
+        if h != 0 {
+            unsafe { WinHttpCloseHandle(h) };
+        }
+    };
+    unsafe {
+        let session = WinHttpOpen(wide("Laurel").as_ptr(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, std::ptr::null(), std::ptr::null(), 0);
+        if session == 0 {
+            return Err(format!("WinHttpOpen failed ({})", GetLastError()));
+        }
+        WinHttpSetTimeouts(session, 10_000, 10_000, 10_000, 10_000);
+        let connect = WinHttpConnect(session, wide(host).as_ptr(), 443, 0);
+        let request = if connect != 0 {
+            WinHttpOpenRequest(connect, wide("GET").as_ptr(), wide(path).as_ptr(), std::ptr::null(), std::ptr::null(), std::ptr::null(), WINHTTP_FLAG_SECURE)
+        } else {
+            0
+        };
+        let result = (|| {
+            if request == 0 {
+                return Err(format!("could not open the request ({})", GetLastError()));
+            }
+            if WinHttpSendRequest(request, std::ptr::null(), 0, std::ptr::null(), 0, 0, 0) == 0 || WinHttpReceiveResponse(request, std::ptr::null_mut()) == 0 {
+                return Err(format!("request failed ({})", GetLastError()));
+            }
+            let (mut status, mut len) = (0u32, 4u32);
+            WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, std::ptr::null(), &mut status as *mut u32 as _, &mut len, std::ptr::null_mut());
+            if status != 200 {
+                return Err(format!("HTTP {status}"));
+            }
+            let mut body = Vec::new();
+            let mut chunk = vec![0u8; 16384];
+            loop {
+                let mut read = 0u32;
+                if WinHttpReadData(request, chunk.as_mut_ptr() as _, chunk.len() as u32, &mut read) == 0 {
+                    return Err(format!("read failed ({})", GetLastError()));
+                }
+                if read == 0 {
+                    return Ok(body);
+                }
+                body.extend_from_slice(&chunk[..read as usize]);
+            }
+        })();
+        close(request);
+        close(connect);
+        close(session);
+        result
+    }
 }
 
 /// Local date and time as (`YYYY-MM-DD`, `hh-mm-ss`), for file names.

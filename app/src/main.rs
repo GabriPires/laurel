@@ -23,6 +23,7 @@ mod overlay;
 mod settings;
 mod share;
 mod sound;
+mod steam;
 mod storage;
 mod tray_icons;
 mod updates;
@@ -227,6 +228,13 @@ fn engine_config(work_dir: PathBuf, storage: Arc<Storage>, detector: Arc<Detecto
 /// Saves a clip and tells the windows and the player; used by the hotkey, the tray
 /// and the UI. `source` goes to the log, to tell later what asked for each clip.
 fn save_clip(app: &AppHandle, source: &str) {
+    save_clip_for(app, source, None);
+}
+
+/// save_clip for an automatic clip too: `achievement` (autoclip.steam-achievements)
+/// names the file, marks the library item and picks the auto-clip notice and sound;
+/// an automatic clip that cannot be saved is only logged.
+pub fn save_clip_for(app: &AppHandle, source: &str, achievement: Option<Value>) {
     log!("clip requested by {source}");
     let app = app.clone();
     std::thread::spawn(move || {
@@ -242,6 +250,10 @@ fn save_clip(app: &AppHandle, source: &str) {
             None
         };
         if let Some(message) = refused {
+            if achievement.is_some() {
+                log!("automatic clip not saved: {message}");
+                return;
+            }
             notifier.notify(Kind::Error, &t!("Clip not saved"), &message);
             report(&app, "clip-saved", "saveClip", Err(message));
             return;
@@ -251,13 +263,19 @@ fn save_clip(app: &AppHandle, source: &str) {
             Ok(saved) => {
                 attach_game(&app, saved);
                 let secs = engine.state()["info"]["bufferSecs"].as_u64().unwrap_or_default();
-                let detail = match library::game_name(&saved["game"]) {
-                    Some(game) => t!("Last {secs} s · {game}", secs = secs, game = game),
-                    None => t!("Last {secs} s", secs = secs),
-                };
-                notifier.notify(Kind::Clip, &t!("Clip saved"), &detail);
-                finish_saved(&app, saved);
+                match &achievement {
+                    Some(a) => notifier.notify(Kind::AutoClip, &t!("Achievement clip saved"), a["name"].as_str().unwrap_or_default()),
+                    None => {
+                        let detail = match library::game_name(&saved["game"]) {
+                            Some(game) => t!("Last {secs} s · {game}", secs = secs, game = game),
+                            None => t!("Last {secs} s", secs = secs),
+                        };
+                        notifier.notify(Kind::Clip, &t!("Clip saved"), &detail);
+                    }
+                }
+                finish_saved_for(&app, saved, achievement.as_ref());
             }
+            Err(e) if achievement.is_some() => log!("automatic clip not saved: {e}"),
             Err(e) => notifier.notify(Kind::Error, &t!("Clip not saved"), e),
         }
         report(&app, "clip-saved", "saveClip", result);
@@ -313,13 +331,22 @@ fn attach_game(app: &AppHandle, saved: &mut Value) {
 /// it to the library and applies the folder size limit. `saved["path"]` is
 /// updated to the final name.
 fn finish_saved(app: &AppHandle, saved: &mut Value) {
+    finish_saved_for(app, saved, None);
+}
+
+fn finish_saved_for(app: &AppHandle, saved: &mut Value, achievement: Option<&Value>) {
     let Some(path) = saved["path"].as_str().map(String::from) else { return };
     let library = app.state::<Arc<Library>>();
     let storage = app.state::<Arc<Storage>>();
     let game = library::game_name(&saved["game"]);
-    let path = storage.apply_naming(&path, game.as_deref(), library.thumbs_dir());
+    let extra = achievement.and_then(|a| a["name"].as_str().filter(|n| !n.is_empty()).or(a["id"].as_str()));
+    let path = storage.apply_naming_with(&path, game.as_deref(), extra, library.thumbs_dir());
     saved["path"] = Value::String(path.clone());
-    match library.add(&path, game) {
+    let added = library.add(&path, game).and_then(|item| match achievement {
+        Some(a) => library.set_achievement(&path, a),
+        None => Ok(item),
+    });
+    match added {
         Ok(item) => {
             let _ = app.emit("library-changed", item);
         }
@@ -417,6 +444,7 @@ fn show_main(app: &AppHandle) {
 
 fn quit(app: &AppHandle) {
     log!("quit requested");
+    app.state::<Arc<steam::Achievements>>().shutdown();
     app.state::<Engine>().shutdown();
     app.exit(0);
 }
@@ -638,6 +666,24 @@ fn games_overview(detector: tauri::State<'_, Arc<Detector>>, store: tauri::State
     v["installed"] = Value::Array(installed);
     v["custom"] = settings.custom_games.iter().map(|g| json!({ "path": g.path, "name": g.name })).collect();
     v["ignored"] = settings.ignored_games.iter().map(|g| json!({ "key": g.key, "name": g.name })).collect();
+    v
+}
+
+/// Settings → Auto-clip: the game whose achievements are watched now, and the
+/// installed Steam games with whether achievement clips are left out for them.
+#[tauri::command]
+fn autoclip_status(achievements: tauri::State<'_, Arc<steam::Achievements>>, detector: tauri::State<'_, Arc<Detector>>, store: tauri::State<'_, Arc<Store>>) -> Value {
+    let excluded = store.get().steam_excluded;
+    let mut games: Vec<Value> = detector
+        .catalog()
+        .installed()
+        .iter()
+        .filter(|g| g.id.source == "steam")
+        .map(|g| json!({ "key": g.id.key, "name": g.id.name, "excluded": excluded.iter().any(|e| e.key == g.id.key) }))
+        .collect();
+    games.sort_by_key(|g| g["name"].as_str().unwrap_or_default().to_lowercase());
+    let mut v = achievements.status();
+    v["steamGames"] = Value::Array(games);
     v
 }
 
@@ -1075,6 +1121,7 @@ fn selftest(app: AppHandle) {
         check_library(&app, &first)?;
         check_storage(&app, &engine)?;
         check_overlay(&engine, &notifier)?;
+        check_autoclip(&app)?;
         log!("[selftest] screenshot ok: {}", engine.request("screenshot", Value::Null, SHOT_TIMEOUT)?);
         check_video(&app, &engine, &wait_ready)?;
         check_audio(&app, &engine)?;
@@ -1664,6 +1711,59 @@ fn check_storage(app: &AppHandle, engine: &Engine) -> Result<(), String> {
     Ok(())
 }
 
+/// Self-test of the Steam achievement auto-clips (autoclip.steam-achievements),
+/// without Steam: the rules that pick which unlocks are clipped, then two unlocks
+/// given to the module a moment apart, which must make one clip named after the
+/// first and marked with both in the library.
+fn check_autoclip(app: &AppHandle) -> Result<(), String> {
+    let base = Settings { steam_any: false, steam_rare: true, steam_ultra: true, ..Settings::default() };
+    let cases = [
+        (base.clone(), Some(2.0), Some("ultra-rare")),
+        (base.clone(), Some(7.5), Some("rare")),
+        (base.clone(), Some(50.0), None),
+        (base.clone(), None, None),
+        (Settings { steam_ultra: false, ..base.clone() }, Some(2.0), Some("rare")),
+        (Settings { steam_any: true, ..base.clone() }, Some(50.0), Some("any")),
+        (Settings { steam_any: true, ..base.clone() }, None, Some("any")),
+    ];
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter(|(s, p, want)| steam::clipped_as(s, *p) != *want)
+        .map(|(s, p, want)| format!("{p:?} any={} rare={} ultra={} wanted {want:?}", s.steam_any, s.steam_rare, s.steam_ultra))
+        .collect();
+    log!("[selftest] auto-clip rules: {} cases, wrong: {wrong:?}", cases.len());
+    if !wrong.is_empty() {
+        return Err("auto-clip rules".into());
+    }
+
+    let store = app.state::<Arc<Store>>();
+    let before = store.get();
+    let _ = store.set(Settings { auto_clip: true, steam_achievements: true, steam_any: false, steam_rare: true, steam_ultra: true, steam_excluded: vec![], ..before.clone() });
+    let achievements = app.state::<Arc<steam::Achievements>>();
+    achievements.set_delay(Duration::from_secs(1));
+    achievements.seed_percents(480, [("LAUREL_SELFTEST_1".to_string(), 2.0), ("LAUREL_SELFTEST_2".to_string(), 7.5)].into_iter().collect());
+    let started = Instant::now();
+    achievements.on_unlock(480, "Laurel self-test", &json!({ "id": "LAUREL_SELFTEST_1", "name": "Self-test trophy", "description": "Checks the auto-clip" }));
+    std::thread::sleep(Duration::from_millis(300));
+    achievements.on_unlock(480, "Laurel self-test", &json!({ "id": "LAUREL_SELFTEST_2", "name": "Second trophy", "description": "" }));
+    let library = app.state::<Arc<Library>>();
+    let mut found = None;
+    while found.is_none() && started.elapsed() < Duration::from_secs(20) {
+        std::thread::sleep(Duration::from_millis(250));
+        found = library.list(Some("clip"), None)?.into_iter().find(|i| i["achievement"]["id"] == "LAUREL_SELFTEST_1");
+    }
+    achievements.set_delay(steam::AUTO_CLIP_DELAY);
+    let _ = store.set(before);
+    let item = found.ok_or("no clip marked with the self-test achievement")?;
+    let a = &item["achievement"];
+    let path = item["path"].as_str().unwrap_or_default();
+    log!("[selftest] auto-clip after {} ms: {path}; achievement {a}", started.elapsed().as_millis());
+    if !path.contains("Self-test trophy") || a["tier"] != "ultra-rare" || a["percent"] != 2.0 || a["others"] != json!(["Second trophy"]) {
+        return Err("the auto-clip is not named or marked as expected".into());
+    }
+    Ok(())
+}
+
 /// Self-test of the overlay: a notice shows without taking the focus, with the
 /// overlay window styles, and hides again; a screenshot of the monitor under it is
 /// taken while it is visible, for the capture-exclusion check done outside the app
@@ -1770,6 +1870,7 @@ fn main() {
                 .unwrap_or_default()
         })
         .invoke_handler(tauri::generate_handler![
+            autoclip_status,
             engine_request,
             engine_state,
             engine_restart,
@@ -1882,9 +1983,12 @@ fn main() {
             if let Err(e) = app.state::<Notifier>().init_window() {
                 log!("overlay unavailable: {e}");
             }
+            let achievements = steam::Achievements::new(app.handle().clone(), store.clone(), &work_dir);
+            app.manage(achievements.clone());
             let cfg = engine_config(work_dir, storage, detector.clone(), store.clone());
             app.manage(Engine::start(app.handle().clone(), cfg));
             detector.start();
+            achievements.start();
             watch_disk(app.handle().clone());
             setup_tray(app.handle())?;
             watch_tray(app.handle().clone());
