@@ -14,6 +14,8 @@ pub struct Mp4Info {
     pub height: u32,
     pub fps: f64,
     pub audio_tracks: u32,
+    /// Average bits per second of the video track, from its sample sizes.
+    pub video_bitrate: u64,
 }
 
 pub fn probe(path: &Path) -> Result<Mp4Info, String> {
@@ -185,11 +187,18 @@ fn parse_moov(moov: &[u8]) -> Mp4Info {
         }
         // Frame rate from the most common frame duration in the time-to-sample
         // table; samples divided by duration drifts on short clips.
-        let (scale, _) = child(mdia, b"mdhd").map(timing).unwrap_or((0, 0));
-        let stts = child(mdia, b"minf").and_then(|m| child(m, b"stbl")).and_then(|s| child(s, b"stts")).unwrap_or_default();
+        let (scale, duration) = child(mdia, b"mdhd").map(timing).unwrap_or((0, 0));
+        let stbl = child(mdia, b"minf").and_then(|m| child(m, b"stbl")).unwrap_or_default();
+        let stts = child(stbl, b"stts").unwrap_or_default();
         let delta = (0..be32(stts, 4) as usize).map(|i| (be32(stts, 8 + i * 8), be32(stts, 12 + i * 8))).max_by_key(|(count, _)| *count).map_or(0, |(_, d)| d);
         if scale > 0 && delta > 0 {
             info.fps = scale as f64 / delta as f64;
+        }
+        // Sample sizes: one size for every sample, or a table of them.
+        if let (Some(stsz), true) = (child(stbl, b"stsz"), scale > 0 && duration > 0) {
+            let (size, count) = (be32(stsz, 4), be32(stsz, 8) as usize);
+            let bytes = if size > 0 { size * count as u64 } else { (0..count).map(|i| be32(stsz, 12 + i * 4)).sum() };
+            info.video_bitrate = bytes * 8 * scale / duration;
         }
     }
     info

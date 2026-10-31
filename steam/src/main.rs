@@ -2,14 +2,16 @@
 //!
 //! Laurel starts it when it detects a running Steam game and stops it when the game
 //! closes. It loads the Steam API library that is already on the PC (the game's own
-//! steam_api64.dll, else another installed game's), starts it as the game's app, and
+//! steam_api64.dll, else another installed game's, also when the game's own is too
+//! old to have the functions it uses), starts it as the game's app, and
 //! reports the player's new achievement unlocks. It ships nothing from Valve and
 //! never touches the game's process. While it runs, Steam counts it as part of the
 //! game, which is already running.
 //!
 //! Usage: laurel-steam --appid N [--dll PATH] [--interval MS]
 //! Output: one JSON object per line on standard output:
-//!   {"event":"ready","appid":N,"library":"...","origin":"game"|"other"|"given","achievements":N,"unlocked":N}
+//!   {"event":"ready","appid":N,"library":"...","origin":"game"|"other"|"given","achievements":N,"unlocked":N,"skipped":"..."}
+//!   ("skipped": a library passed over for lacking those functions, when there was one)
 //!   {"event":"unlocked","id":"...","name":"...","description":"...","atMs":N}
 //!   {"event":"error","message":"..."}          (then it exits with code 1)
 //!   {"event":"stopped","passes":N,"cpuMs":N,"workingSetMb":N}
@@ -24,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use windows::core::{w, HSTRING, PCSTR};
-use windows::Win32::Foundation::{FILETIME, HMODULE};
+use windows::Win32::Foundation::{FreeLibrary, FILETIME, HMODULE};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
@@ -89,24 +91,60 @@ fn find_dll(dir: &Path, depth: u32) -> Option<PathBuf> {
     dirs.iter().find_map(|d| find_dll(d, depth - 1))
 }
 
-/// The game's own steam_api64.dll, else the first one in another installed game:
-/// the library only talks to the Steam client, which serves the app named by
-/// SteamAppId.
-fn locate_dll(appid: u32) -> Option<(PathBuf, &'static str)> {
-    let steam = steam_path()?;
-    let mut libraries = vdf_values(&std::fs::read_to_string(steam.join(r"steamapps\libraryfolders.vdf")).unwrap_or_default(), "path");
-    libraries.push(steam.to_string_lossy().into_owned());
-    for lib in &libraries {
+/// The Steam API libraries to try, in order: the game's own steam_api64.dll, then
+/// one per other installed game. The library only talks to the Steam client, which
+/// serves the app named by SteamAppId, so another game's works too.
+fn candidate_dlls(appid: u32) -> impl Iterator<Item = (PathBuf, &'static str)> {
+    let steam = steam_path();
+    let mut libraries = steam
+        .as_ref()
+        .map(|s| vdf_values(&std::fs::read_to_string(s.join(r"steamapps\libraryfolders.vdf")).unwrap_or_default(), "path"))
+        .unwrap_or_default();
+    libraries.extend(steam.map(|s| s.to_string_lossy().into_owned()));
+    let own = libraries.iter().find_map(|lib| {
         let apps = Path::new(lib).join("steamapps");
-        let Ok(manifest) = std::fs::read_to_string(apps.join(format!("appmanifest_{appid}.acf"))) else { continue };
-        if let Some(dll) = vdf_values(&manifest, "installdir").first().and_then(|dir| find_dll(&apps.join("common").join(dir), 8)) {
-            return Some((dll, "game"));
+        let manifest = std::fs::read_to_string(apps.join(format!("appmanifest_{appid}.acf"))).ok()?;
+        vdf_values(&manifest, "installdir").first().and_then(|dir| find_dll(&apps.join("common").join(dir), 8))
+    });
+    let games: Vec<PathBuf> = libraries.iter().flat_map(|lib| std::fs::read_dir(Path::new(lib).join(r"steamapps\common")).into_iter().flatten().flatten().map(|e| e.path())).collect();
+    let others = games.into_iter().filter_map(|game| find_dll(&game, 8)).map(|dll| (dll, "other"));
+    own.map(|dll| (dll, "game")).into_iter().chain(others)
+}
+
+/// Loads the first library that has every function the helper uses: the one given,
+/// else the game's own, else another game's. An old library lacks the flat user
+/// stats accessor (DEATH STRANDING DIRECTOR'S CUT's, stability tests finding A12).
+/// Returns the library, its path and origin, and the first one passed over.
+fn load_api(appid: u32, given: Option<PathBuf>) -> (Api, PathBuf, &'static str, Option<PathBuf>) {
+    let mut skipped: Option<PathBuf> = None;
+    let candidates: Box<dyn Iterator<Item = (PathBuf, &'static str)>> = match given {
+        Some(p) => Box::new(std::iter::once((p, "given")).chain(candidate_dlls(appid))),
+        None => Box::new(candidate_dlls(appid)),
+    };
+    let mut tried = vec![];
+    for (dll, origin) in candidates {
+        if tried.contains(&dll) {
+            continue;
         }
+        tried.push(dll.clone());
+        let module = match unsafe { LoadLibraryW(&HSTRING::from(dll.as_os_str())) } {
+            Ok(m) => m,
+            Err(e) if tried.len() == 1 => fail(&format!("cannot load {}: {e}", dll.display())),
+            Err(_) => continue,
+        };
+        let api = Api(module);
+        if api.missing().is_none() {
+            return (api, dll, origin, skipped);
+        }
+        unsafe {
+            let _ = FreeLibrary(module);
+        }
+        skipped.get_or_insert(dll);
     }
-    libraries.iter().find_map(|lib| {
-        let common = Path::new(lib).join(r"steamapps\common");
-        std::fs::read_dir(common).into_iter().flatten().flatten().find_map(|game| find_dll(&game.path(), 8)).map(|dll| (dll, "other"))
-    })
+    match skipped {
+        Some(dll) => fail(&format!("the library has no SteamUserStats accessor ({}), and no other library has one", dll.display())),
+        None => fail("no steam_api64.dll in the Steam libraries"),
+    }
 }
 
 struct Api(HMODULE);
@@ -121,6 +159,21 @@ impl Api {
     /// The newest SteamAPI_SteamUserStats_vNNN accessor the library exports.
     fn user_stats(&self) -> Option<Accessor> {
         (8..=20).rev().find_map(|v| self.get::<Accessor>(&format!("SteamAPI_SteamUserStats_v{v:03}")))
+    }
+
+    /// The first function the helper needs that the library does not export.
+    fn missing(&self) -> Option<&'static str> {
+        if self.user_stats().is_none() {
+            return Some("SteamAPI_SteamUserStats_vNNN");
+        }
+        [
+            "SteamAPI_ISteamUserStats_GetNumAchievements",
+            "SteamAPI_ISteamUserStats_GetAchievementName",
+            "SteamAPI_ISteamUserStats_GetAchievementAndUnlockTime",
+            "SteamAPI_ISteamUserStats_GetAchievementDisplayAttribute",
+        ]
+        .into_iter()
+        .find(|name| self.get::<NoArgs>(name).is_none())
     }
 
     /// Starts the library with the newer flat init, else the older one.
@@ -175,10 +228,6 @@ fn now_ms() -> u64 {
 fn main() {
     let appid: u32 = arg("--appid").and_then(|a| a.parse().ok()).unwrap_or_else(|| fail("usage: laurel-steam --appid N [--dll PATH] [--interval MS]"));
     let interval = Duration::from_millis(arg("--interval").and_then(|a| a.parse().ok()).unwrap_or(1000));
-    let (dll, origin) = match arg("--dll") {
-        Some(p) => (PathBuf::from(p), "given"),
-        None => locate_dll(appid).unwrap_or_else(|| fail("no steam_api64.dll in the Steam libraries")),
-    };
 
     // Standard input closing (Laurel quit or stopped it) or "quit" ends the watch.
     let stop = Arc::new(AtomicBool::new(false));
@@ -197,8 +246,7 @@ fn main() {
 
     std::env::set_var("SteamAppId", appid.to_string());
     std::env::set_var("SteamGameId", appid.to_string());
-    let module = unsafe { LoadLibraryW(&HSTRING::from(dll.as_os_str())) }.unwrap_or_else(|e| fail(&format!("cannot load {}: {e}", dll.display())));
-    let api = Api(module);
+    let (api, dll, origin, skipped) = load_api(appid, arg("--dll").map(PathBuf::from));
     if let Err(e) = api.init() {
         fail(&e);
     }
@@ -244,6 +292,7 @@ fn main() {
     emit(json!({
         "event": "ready", "appid": appid, "library": dll.to_string_lossy(), "origin": origin,
         "achievements": names.len(), "unlocked": unlocked.iter().filter(|u| **u).count(),
+        "skipped": skipped.map(|p| p.to_string_lossy().into_owned()),
     }));
 
     let mut passes = 0u64;

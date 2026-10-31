@@ -56,6 +56,28 @@ pub fn unique(dir: &Path, name: &str, ext: &str) -> PathBuf {
 /// The date and time of the save, from the engine's name for the file ("Laurel
 /// <date> <time>", maybe with " (2)" after it), so the final name keeps the moment
 /// the engine chose even when the save ends a second later; else the time now.
+/// Renames a clip the engine just saved, trying again for a while when another
+/// process still has it open (os error 32, a sharing violation): a moment after a
+/// save, something sometimes does (stability tests, finding A11).
+pub fn rename_when_free(from: &Path, to: &Path) -> std::io::Result<()> {
+    const SHARING_VIOLATION: i32 = 32;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut tries = 1;
+    loop {
+        match std::fs::rename(from, to) {
+            Err(e) if e.raw_os_error() == Some(SHARING_VIOLATION) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                tries += 1;
+            }
+            Ok(()) if tries > 1 => {
+                crate::log::line(&format!("renamed {} on try {tries}: it was in use", from.display()));
+                return Ok(());
+            }
+            result => return result,
+        }
+    }
+}
+
 fn saved_at(stem: &str) -> (String, String) {
     let mut parts = stem.split(' ');
     let digits = |s: &str, dashes: &[usize]| s.char_indices().all(|(i, c)| if dashes.contains(&i) { c == '-' } else { c.is_ascii_digit() });
@@ -135,7 +157,7 @@ impl Storage {
             return path.to_string_lossy().into_owned();
         }
         let target = unique(dir, &sanitize(&name), &ext);
-        if let Err(e) = std::fs::rename(&path, &target) {
+        if let Err(e) = rename_when_free(&path, &target) {
             crate::log::line(&format!("could not rename {}: {e}", path.display()));
             return path.to_string_lossy().into_owned();
         }

@@ -334,10 +334,12 @@ impl Source {
 
 /// A one-item scene that fits its source into the canvas: scaled to fit, keeping
 /// the aspect ratio, and centered (OBS_BOUNDS_SCALE_INNER). A source on an output
-/// channel by itself is drawn at its own size in the canvas' top left corner.
+/// channel by itself is drawn at its own size in the canvas' top left corner. A
+/// second item can sit on top of the first (see set_top).
 pub struct Scene {
     scene: *mut ffi::obs_scene_t,
     item: *mut ffi::obs_sceneitem_t,
+    top: *mut ffi::obs_sceneitem_t,
     canvas: (u32, u32),
 }
 
@@ -348,19 +350,42 @@ impl Scene {
         if scene.is_null() {
             return Err("obs_scene_create failed".into());
         }
-        Ok(Scene { scene, item: std::ptr::null_mut(), canvas })
+        Ok(Scene { scene, item: std::ptr::null_mut(), top: std::ptr::null_mut(), canvas })
     }
 
     /// Shows `source` (or nothing), replacing the previous one.
     pub fn set(&mut self, source: Option<&Source>) {
-        if !self.item.is_null() {
-            unsafe { ffi::obs_sceneitem_remove(self.item) };
-            self.item = std::ptr::null_mut();
+        remove_item(&mut self.item);
+        if let Some(source) = source {
+            self.item = self.add(source);
         }
-        let Some(source) = source else { return };
+    }
+
+    /// Shows `source` (or nothing) over the main item, replacing the previous top
+    /// one. A source that draws nothing, like a game capture before its hook, lets
+    /// the main item show through.
+    pub fn set_top(&mut self, source: Option<&Source>) {
+        remove_item(&mut self.top);
+        if let Some(source) = source {
+            self.top = self.add(source);
+        }
+    }
+
+    /// Makes the top item's `source` the main one. Its new item goes in before the
+    /// old ones go, so the source never stops showing: a game capture that stops
+    /// showing drops its hook.
+    pub fn promote_top(&mut self, source: &Source) {
+        let item = self.add(source);
+        remove_item(&mut self.item);
+        remove_item(&mut self.top);
+        self.item = item;
+    }
+
+    /// Adds `source` on top of the scene, fitted into the canvas.
+    fn add(&self, source: &Source) -> *mut ffi::obs_sceneitem_t {
         let item = unsafe { ffi::obs_scene_add(self.scene, source.0) };
         if item.is_null() {
-            return;
+            return item;
         }
         let bounds = ffi::vec2 { x: self.canvas.0 as f32, y: self.canvas.1 as f32 };
         unsafe {
@@ -368,7 +393,7 @@ impl Scene {
             ffi::obs_sceneitem_set_bounds_alignment(item, ffi::OBS_ALIGN_CENTER);
             ffi::obs_sceneitem_set_bounds(item, &bounds);
         }
-        self.item = item;
+        item
     }
 
     /// Routes the scene to a global output channel.
@@ -377,8 +402,16 @@ impl Scene {
     }
 }
 
+fn remove_item(item: &mut *mut ffi::obs_sceneitem_t) {
+    if !item.is_null() {
+        unsafe { ffi::obs_sceneitem_remove(*item) };
+        *item = std::ptr::null_mut();
+    }
+}
+
 impl Drop for Scene {
     fn drop(&mut self) {
+        self.set_top(None);
         self.set(None);
         unsafe { ffi::obs_scene_release(self.scene) };
     }

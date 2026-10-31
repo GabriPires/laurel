@@ -125,6 +125,7 @@ extern "system" {
     fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
     fn IsWindowVisible(hwnd: isize) -> i32;
     fn IsIconic(hwnd: isize) -> i32;
+    fn IsWindow(hwnd: isize) -> i32;
     fn EnumWindows(callback: extern "system" fn(isize, isize) -> i32, param: isize) -> i32;
     fn GetWindow(hwnd: isize, cmd: u32) -> isize;
     fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
@@ -174,6 +175,8 @@ const HWND_TOPMOST: isize = -1;
 const SWP_NOACTIVATE: u32 = 0x0010;
 const SWP_SHOWWINDOW: u32 = 0x0040;
 const SW_HIDE: i32 = 0;
+const SW_SHOWNOACTIVATE: i32 = 4;
+const SW_SHOWMINNOACTIVE: i32 = 7;
 const MONITOR_DEFAULTTONEAREST: u32 = 2;
 const DWMWA_EXTENDED_FRAME_BOUNDS: u32 = 9;
 const DWMWA_CLOAKED: u32 = 14;
@@ -470,6 +473,23 @@ pub fn hide(hwnd: isize) {
 
 pub fn is_visible(hwnd: isize) -> bool {
     unsafe { IsWindowVisible(hwnd) != 0 }
+}
+
+/// Whether `hwnd` still exists and belongs to process `pid`, minimized, hidden or
+/// cloaked included (app_windows leaves those out).
+pub fn window_of(hwnd: isize, pid: u32) -> bool {
+    let mut owner = 0;
+    unsafe { IsWindow(hwnd) != 0 && GetWindowThreadProcessId(hwnd, &mut owner) != 0 && owner == pid }
+}
+
+/// Minimizes a window without activating another one (self-test).
+pub fn minimize_no_activate(hwnd: isize) {
+    unsafe { ShowWindow(hwnd, SW_SHOWMINNOACTIVE) };
+}
+
+/// Restores a minimized window without activating it (self-test).
+pub fn restore_no_activate(hwnd: isize) {
+    unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
 }
 
 #[repr(C)]

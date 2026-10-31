@@ -98,6 +98,14 @@ fn named_window(capture: &Capture) -> Option<&str> {
     }
 }
 
+/// Whether a capture records a game, whose audio the game audio source follows.
+/// On its output channel the source is active, and an active process audio source
+/// without its window tries again every 3 s, logging each try (OBS win-wasapi): it
+/// stays off the channel while there is no game.
+fn expects_game(capture: &Capture) -> bool {
+    matches!(capture, Capture::Window(_) | Capture::Game(_))
+}
+
 /// The executable of a window spec, unescaped.
 fn spec_exe(spec: &str) -> String {
     spec.rsplit(':').next().unwrap_or_default().replace("#3A", ":").replace("#22", "#")
@@ -174,6 +182,11 @@ pub struct Recorder {
     mix: AudioMix,
     desktop_audio: bool,
     capture: Option<Source>,
+    /// What `capture` records.
+    target: Capture,
+    /// While a game is recorded by its window (the fallback), a game capture of the
+    /// same window tried on top of it, with that window's spec (see set_probe).
+    probe: Option<(String, Source)>,
     /// Fits the capture into the canvas; it is what the video channel shows.
     scene: Scene,
     /// Shared with the signal callbacks (stable pointer) and the audio binder.
@@ -219,6 +232,8 @@ impl Recorder {
                 mix: cfg.mix,
                 desktop_audio: false,
                 capture,
+                target: cfg.capture.clone(),
+                probe: None,
                 scene,
                 game,
                 watching_game,
@@ -245,7 +260,9 @@ impl Recorder {
                 followed(window, &game);
             }
             binder_thread = Some(spawn_audio_binder(SharedSource::of(&source), game.clone()));
-            source.set_output_channel(GAME_AUDIO_CHANNEL);
+            if !window.is_empty() || expects_game(&cfg.capture) {
+                source.set_output_channel(GAME_AUDIO_CHANNEL);
+            }
             game_audio = Some(source);
             track_masks.push(GAME_TRACK);
         }
@@ -288,6 +305,8 @@ impl Recorder {
             mix: cfg.mix,
             desktop_audio: cfg.desktop_audio,
             capture,
+            target: cfg.capture.clone(),
+            probe: None,
             scene,
             game,
             watching_game,
@@ -407,20 +426,94 @@ impl Recorder {
 
     /// Replaces the capture source while recording continues. The game audio follows
     /// the game the app names right away: a game recorded by its window never sends
-    /// the hook's "hooked" signal.
+    /// the hook's "hooked" signal. Without a game, the game audio leaves its channel.
     pub fn switch_capture(&mut self, obs: &Obs, capture: &Capture) -> Result<(), String> {
+        if self.promote_probe(capture) {
+            return Ok(());
+        }
         let next = create_capture(obs, capture, self.cursor)?;
+        self.drop_probe();
         self.unwatch_game();
         if let Some(source) = &next {
             self.watching_game = connect_game_signals(source, capture, &self.game);
         }
         self.scene.set(next.as_ref());
         self.capture = next; // drops our reference to the previous source
-        if let (Some(audio), Some(spec)) = (&self.game_audio, named_window(capture)) {
-            audio.update(&follow_settings(spec));
-            followed(spec, &self.game);
+        self.target = capture.clone();
+        if let Some(audio) = &self.game_audio {
+            if let Some(spec) = named_window(capture) {
+                audio.update(&follow_settings(spec));
+                followed(spec, &self.game);
+            }
+            if expects_game(capture) {
+                audio.set_output_channel(GAME_AUDIO_CHANNEL);
+            } else {
+                clear_output_channel(GAME_AUDIO_CHANNEL);
+                if self.game.audio_bound.lock().unwrap().take().is_some() {
+                    log!("[laurel] game audio off: no game");
+                }
+            }
         }
         Ok(())
+    }
+
+    /// While a game is recorded by its window (the app's fallback when its hook did
+    /// not start), tries a game capture of the same window on top of it, or stops
+    /// trying. The game capture draws nothing until it hooks the game; then it covers
+    /// the window, and switch_capture to that game makes it the capture. The app
+    /// keeps the tries short: a waiting game capture logs a few lines every 2 s.
+    pub fn set_probe(&mut self, enabled: bool) -> Result<bool, String> {
+        if !enabled {
+            self.drop_probe();
+            return Ok(false);
+        }
+        if self.probe.is_some() {
+            return Ok(true);
+        }
+        let Capture::Window(spec) = &self.target else {
+            return Err("not recording a game by its window".into());
+        };
+        let spec = spec.clone();
+        let source = game_capture("game-try", Some(&spec), self.cursor)?;
+        connect_game_signals(&source, &Capture::Game(Some(spec.clone())), &self.game);
+        self.scene.set_top(Some(&source));
+        log!("[laurel] trying the game hook over the window capture");
+        self.probe = Some((spec, source));
+        Ok(true)
+    }
+
+    /// Whether a game capture is being tried over the window capture.
+    pub fn probing(&self) -> bool {
+        self.probe.is_some()
+    }
+
+    /// Makes the tried game capture the capture once it hooked the game the app now
+    /// names: no second hook, and the window capture (with the border Windows 10
+    /// draws around it) goes away.
+    fn promote_probe(&mut self, capture: &Capture) -> bool {
+        let Capture::Game(Some(spec)) = capture else { return false };
+        if !self.probe.as_ref().is_some_and(|(window, _)| window == spec) || self.game().is_none() {
+            return false;
+        }
+        let Some((_, probe)) = self.probe.take() else { return false };
+        self.scene.promote_top(&probe);
+        self.capture = Some(probe); // drops the window capture
+        self.watching_game = true; // set_probe connected its signals
+        self.target = capture.clone();
+        log!("[laurel] the game capture took over from the window capture");
+        true
+    }
+
+    /// Stops trying the game capture over the window capture.
+    fn drop_probe(&mut self) {
+        let Some((_, probe)) = self.probe.take() else { return };
+        probe.disconnect("hooked", on_game_hooked, self.game_ptr());
+        probe.disconnect("unhooked", on_game_unhooked, self.game_ptr());
+        self.scene.set_top(None);
+        if !self.watching_game {
+            *self.game.game.lock().unwrap() = None;
+        }
+        log!("[laurel] stopped trying the game hook");
     }
 
     /// Shows or hides the mouse cursor in the current capture and the next ones,
@@ -428,7 +521,7 @@ impl Recorder {
     /// sources ignore settings they do not have.
     pub fn set_cursor(&mut self, cursor: bool) {
         self.cursor = cursor;
-        if let Some(source) = &self.capture {
+        for source in self.capture.iter().chain(self.probe.as_ref().map(|(_, probe)| probe)) {
             source.update(&Data::new().bool("capture_cursor", cursor).bool("cursor", cursor));
         }
         log!("[laurel] cursor {}", if cursor { "shown" } else { "hidden" });
@@ -533,6 +626,7 @@ impl Recorder {
 
 impl Drop for Recorder {
     fn drop(&mut self) {
+        self.drop_probe();
         self.unwatch_game();
         // Closing the channel ends the binder, which releases its source reference.
         *self.game.binder.lock().unwrap() = None;
@@ -687,13 +781,16 @@ fn create_capture(obs: &Obs, capture: &Capture, cursor: bool) -> Result<Option<S
             "capture",
             &Data::new().str("window", spec).int("priority", MATCH_TITLE_THEN_EXE).bool("cursor", cursor).int("method", 2).bool("client_area", true),
         )?,
-        Capture::Game(window) => {
-            let settings = match window {
-                Some(spec) => Data::new().str("capture_mode", "window").str("window", spec).int("priority", MATCH_TITLE_THEN_EXE),
-                None => Data::new().str("capture_mode", "any_fullscreen"),
-            };
-            Source::new("game_capture", "capture", &settings.bool("capture_cursor", cursor).bool("anti_cheat_hook", true))?
-        }
+        Capture::Game(window) => game_capture("capture", window.as_deref(), cursor)?,
     };
     Ok(Some(source))
+}
+
+/// A game capture of `window` (a libobs window spec), or of any fullscreen game.
+fn game_capture(name: &str, window: Option<&str>, cursor: bool) -> Result<Source, String> {
+    let settings = match window {
+        Some(spec) => Data::new().str("capture_mode", "window").str("window", spec).int("priority", MATCH_TITLE_THEN_EXE),
+        None => Data::new().str("capture_mode", "any_fullscreen"),
+    };
+    Source::new("game_capture", name, &settings.bool("capture_cursor", cursor).bool("anti_cheat_hook", true))
 }

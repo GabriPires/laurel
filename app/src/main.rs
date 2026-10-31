@@ -793,8 +793,12 @@ async fn for_each_item(paths: Vec<String>, action: impl Fn(&str) -> Result<Value
             match action(&path) {
                 Ok(item) => items.push(item),
                 Err(e) => {
-                    log!("{path}: {e}");
-                    failed.push(format!("{path}: {e}"));
+                    // Some errors already start with the path; the player sees the file name.
+                    let full = share::windows_path(&path);
+                    let reason = e.strip_prefix(&format!("{full}: ")).unwrap_or(&e);
+                    log!("{full}: {reason}");
+                    let name = std::path::Path::new(&full).file_name().map_or(full.clone(), |n| n.to_string_lossy().into_owned());
+                    failed.push(format!("{name}: {reason}"));
                 }
             }
         }
@@ -996,16 +1000,26 @@ async fn logs_export(app: AppHandle) -> Result<String, String> {
     .map_err(|e| e.to_string())?
 }
 
+/// The registry's ProductName still says Windows 10 on Windows 11, whose builds
+/// start at 22000 (stability tests, finding A6).
+fn windows_name(product: &str, build: &str) -> String {
+    match product.strip_prefix("Windows 10") {
+        Some(edition) if build.parse::<u32>().is_ok_and(|b| b >= 22000) => format!("Windows 11{edition}"),
+        _ => product.to_string(),
+    }
+}
+
 fn export_logs(app: &AppHandle, dir: &std::path::Path) -> Result<PathBuf, String> {
     let (date, time) = win::date_time();
     let dest = storage::unique(dir, &format!("Laurel logs {date} {time}"), "zip");
     let windows = |name: &str| win::reg_string(win::HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", name).unwrap_or_default();
+    let build = windows("CurrentBuild");
     let info = format!(
         "Laurel {}\nWindows: {} {} (build {})\nSaved: {date} {time}\nAdministrator: {}\n\nEngine:\n{}\n\nGame:\n{}\n\nSteam achievements:\n{}\n\nSettings:\n{}\n",
         app.package_info().version,
-        windows("ProductName"),
+        windows_name(&windows("ProductName"), &build),
         windows("DisplayVersion"),
-        windows("CurrentBuild"),
+        build,
         win::self_elevated(),
         serde_json::to_string_pretty(&app.state::<Engine>().state()).unwrap_or_default(),
         serde_json::to_string_pretty(&app.state::<Arc<Detector>>().snapshot()).unwrap_or_default(),
@@ -1261,7 +1275,7 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
         Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition 'public class QuietForm : System.Windows.Forms.Form { protected override bool ShowWithoutActivation { get { return true; } } }'; \
         $f = New-Object QuietForm; $f.Text = 'Laurel self-test game'; $f.StartPosition = 'Manual'; \
         $f.Location = New-Object System.Drawing.Point(-6000, -6000); $f.Size = New-Object System.Drawing.Size(960, 600); \
-        $t = New-Object System.Windows.Forms.Timer; $t.Interval = 60000; $t.Add_Tick({ $f.Close() }); $t.Start(); \
+        $t = New-Object System.Windows.Forms.Timer; $t.Interval = 120000; $t.Add_Tick({ $f.Close() }); $t.Start(); \
         [System.Windows.Forms.Application]::Run($f)";
     let outcome = (|| -> Result<(), String> {
         let status = |key: &str| engine.request("status", Value::Null, SHOT_TIMEOUT).map(|s| s[key].clone());
@@ -1291,10 +1305,24 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
             if !path.contains(name) || !std::path::Path::new(path).exists() {
                 return Err(format!("the clip is not named after the game: {path}"));
             }
+            // The fallback deadline counts from the start of the capture, not from
+            // when the game was found: after an engine restart it starts over.
+            engine.restart();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while engine.state()["state"] == "ready" && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            until("the engine to restart", &|| engine.state()["state"] == "ready")?;
+            let restarted = Instant::now();
             // The PowerShell window has no swap chain, so it is never hooked; it is
             // not elevated either, so no restart as administrator may be offered,
             // and after 15 s its window is recorded instead (spec capture.game-hook).
             until("the hook check", &|| detector.hook_checked())?;
+            let waited = restarted.elapsed();
+            log!("[selftest] hook check {:.1} s after the engine restart", waited.as_secs_f64());
+            if waited < Duration::from_secs(14) {
+                return Err(format!("the window fallback came {:.1} s after the capture started again", waited.as_secs_f64()));
+            }
             let snapshot = detector.snapshot();
             let target = status("target")?;
             log!("[selftest] hook check: {snapshot}; engine target {target}; Laurel elevated: {}, this process elevated: {:?}", win::self_elevated(), win::process_elevated(std::process::id()));
@@ -1311,6 +1339,30 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
             if !follows.as_str().is_some_and(|exe| exe.eq_ignore_ascii_case("powershell.exe")) {
                 return Err(format!("the game audio does not follow the game's window: {follows}"));
             }
+            // A minimized game is still open (a game in exclusive fullscreen
+            // minimizes on Alt+Tab): the capture and the replay buffer stay.
+            let hwnd = detector.current().map_or(0, |g| g.hwnd);
+            win::minimize_no_activate(hwnd);
+            std::thread::sleep(Duration::from_secs(8));
+            let still = detector.current().is_some_and(|g| g.id.name == name);
+            let recording = status("recording")?;
+            win::restore_no_activate(hwnd);
+            log!("[selftest] minimized game: still the game {still}, recording {recording}");
+            if !still || recording != true {
+                return Err("a minimized game counted as closed".into());
+            }
+            // While the game is recorded by its window, its hook is tried again: a
+            // game capture goes over the window capture for a while, then comes off
+            // when it does not hook (the PowerShell window never is).
+            detector.retry_hook_now();
+            until("a hook try", &|| status("probing").is_ok_and(|p| p == true))?;
+            let during = status("target")?;
+            until("the hook try to end", &|| status("probing").is_ok_and(|p| p == false))?;
+            let snapshot = detector.snapshot();
+            log!("[selftest] hook try over {during}, then {snapshot}");
+            if !during.as_str().unwrap_or_default().starts_with("window:") || snapshot["capture"] != "window" {
+                return Err("the hook try changed the capture".into());
+            }
             Ok(())
         });
         let _ = child.kill();
@@ -1318,7 +1370,12 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
         result?;
         until("the game to close", &|| detector.current().is_none())?;
         until("recording to pause", &|| status("recording").is_ok_and(|r| r == false))?;
-        log!("[selftest] game closed: {}", detector.snapshot());
+        // With no game, the game audio follows nothing, so it stops trying again.
+        let follows = status("audio")?["follows"].clone();
+        log!("[selftest] game closed: {}; game audio follows {follows}", detector.snapshot());
+        if !follows.is_null() {
+            return Err(format!("the game audio still follows {follows} with no game"));
+        }
 
         // Screen recording (spec capture.screen): with no game open, the primary
         // monitor is recorded; turned off, nothing is captured again.
@@ -1547,6 +1604,13 @@ fn check_log_rotation() -> Result<(), String> {
     if files < 2 || entries != files || !end_ok {
         return Err("the logs .zip is not as expected".into());
     }
+    // info.txt names Windows 11 by its build, whatever the registry's ProductName says.
+    let windows = |name: &str| win::reg_string(win::HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", name).unwrap_or_default();
+    let here = windows_name(&windows("ProductName"), &windows("CurrentBuild"));
+    log!("[selftest] Windows in info.txt: {here} (registry: {}, build {})", windows("ProductName"), windows("CurrentBuild"));
+    if windows_name("Windows 10 Pro", "26200") != "Windows 11 Pro" || windows_name("Windows 10 Pro", "19045") != "Windows 10 Pro" {
+        return Err("the Windows name in info.txt is wrong".into());
+    }
     Ok(())
 }
 
@@ -1620,6 +1684,32 @@ fn check_library(app: &AppHandle, saved: &Value) -> Result<(), String> {
     );
     if frames.iter().filter(|f| f.exists()).count() != 12 || count(&exact) != 60 || count(&fast) != fast_expected || exact["audioTracks"] != item["audioTracks"] || again_path.contains("(trim) (trim)") {
         return Err("the new trim did not behave".into());
+    }
+    // The exact trim's video rate is capped at the original's (stability tests, A4),
+    // read from the clip's sample sizes, which never add up to more than the file.
+    let source = mp4::probe(std::path::Path::new(path))?;
+    let file_rate = std::fs::metadata(path).map_err(|e| e.to_string())?.len() * 8 * 1000 / source.duration_ms.max(1);
+    let exact_rate = mp4::probe(std::path::Path::new(exact["path"].as_str().unwrap_or_default()))?.video_bitrate;
+    log!("[selftest] video rate: original {} bit/s (whole file {file_rate}), exact trim {exact_rate}", source.video_bitrate);
+    if source.video_bitrate == 0 || source.video_bitrate > file_rate || exact_rate == 0 {
+        return Err("the video rate of the clips could not be read".into());
+    }
+    // A clip cannot go to Recently deleted while ffmpeg reads it for a trim: the
+    // delete is refused with a reason, and the clip stays (stability tests, A3).
+    let trimming = {
+        let (library, path) = (library.inner().clone(), path.to_string());
+        let last = t[t.len() - 1];
+        std::thread::spawn(move || library.trim(&path, 0.0, last, true))
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !library.is_reading(path) && !trimming.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let during = library.is_reading(path).then(|| library.delete(path));
+    let long_trim = trimming.join().map_err(|_| "the trim thread panicked".to_string())??;
+    log!("[selftest] delete during a trim: {during:?}; the clip is still there: {}; the trim gave {}", std::path::Path::new(path).exists(), long_trim["path"]);
+    if !matches!(during, Some(Err(_))) || !std::path::Path::new(path).exists() {
+        return Err("a clip being trimmed was deleted, or the trim was too quick to check".into());
     }
     // Delete (spec library.trash): the file moves to Recently deleted, comes back
     // where it was, and leaves for good, with its thumbnail.
@@ -2085,16 +2175,9 @@ fn main() {
                 library_changed(&handle);
                 watch_deleted(handle);
             });
-            // The windows are created here, after every state they call into exists
-            // (windows created from the config would load before setup runs).
-            for label in ["overlay", "main"] {
-                if let Some(config) = app.config().app.windows.iter().find(|w| w.label == label) {
-                    tauri::WebviewWindowBuilder::from_config(app.handle(), config)?.build()?;
-                }
-            }
-            if let Err(e) = app.state::<Notifier>().init_window() {
-                log!("overlay unavailable: {e}");
-            }
+            // Recording starts before the windows: building them waits for WebView2,
+            // which took up to 25 s on a slower PC (stability tests, finding A9).
+            // Without the overlay window yet, a notice only plays its sound.
             let achievements = steam::Achievements::new(app.handle().clone(), store.clone(), &work_dir);
             app.manage(achievements.clone());
             let cfg = engine_config(work_dir, storage, detector.clone(), store.clone());
@@ -2102,8 +2185,6 @@ fn main() {
             detector.start();
             achievements.start();
             watch_disk(app.handle().clone());
-            setup_tray(app.handle())?;
-            watch_tray(app.handle().clone());
             let handle = app.handle().clone();
             match Hotkeys::start(bindings(&store.get()), move |event| on_hotkey(&handle, event)) {
                 Ok(hotkeys) => {
@@ -2111,6 +2192,20 @@ fn main() {
                 }
                 Err(e) => log!("hotkeys unavailable: {e}"),
             }
+            // The windows are created here, after every state they call into exists
+            // (windows created from the config would load before setup runs).
+            let building = Instant::now();
+            for label in ["overlay", "main"] {
+                if let Some(config) = app.config().app.windows.iter().find(|w| w.label == label) {
+                    tauri::WebviewWindowBuilder::from_config(app.handle(), config)?.build()?;
+                }
+            }
+            log!("windows built in {} ms", building.elapsed().as_millis());
+            if let Err(e) = app.state::<Notifier>().init_window() {
+                log!("overlay unavailable: {e}");
+            }
+            setup_tray(app.handle())?;
+            watch_tray(app.handle().clone());
             if !minimized && !selftest_mode {
                 show_main(app.handle());
             }

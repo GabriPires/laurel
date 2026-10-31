@@ -28,7 +28,7 @@
 //!   --clips-dir DIR, --screenshots-dir DIR  (default <work-dir>\clips and \screenshots)
 //!   --script "cmd; cmd; ..."    commands: wait N | save | screenshot | stats | beep N |
 //!                               capture <monitor[:N[:method]]|window:..|game[:..]> |
-//!                               mix <game|game-mic|pc-mic> | quit
+//!                               mix <game|game-mic|pc-mic> | probe [on|off] | quit
 //!                               (without --script or --rpc, commands are read from stdin)
 //! Logs (libobs and the engine's own) always go to stderr.
 //!
@@ -574,6 +574,10 @@ fn run(args: Args) -> Result<(), String> {
                     Err(e) => log!("[laurel] capture switch failed: {e}"),
                 }
             }
+            Some("probe") => match rec.set_probe(parts.next() != Some("off")) {
+                Ok(probing) => log!("[laurel] game hook try {} at {:.1}s", if probing { "on" } else { "off" }, started.elapsed().as_secs_f64()),
+                Err(e) => log!("[laurel] game hook try failed: {e}"),
+            },
             Some("mix") => match AudioMix::parse(parts.next().unwrap_or_default()).ok_or("bad mix".to_string()).and_then(|m| rec.set_mix(m)) {
                 Ok(()) => log!("[laurel] mix switched at {:.1}s", started.elapsed().as_secs_f64()),
                 Err(e) => log!("[laurel] mix switch failed: {e}"),
@@ -609,6 +613,7 @@ fn serve_app(obs: &Obs, rec: &mut Recorder, args: &Args, dirs: &Dirs) {
                 Ok(json!({
                     "target": target,
                     "captureSize": [cw, ch],
+                    "probing": rec.probing(),
                     "activeFps": s.active_fps,
                     "laggedFrames": s.lagged_frames,
                     "skippedFrames": s.skipped_frames,
@@ -634,6 +639,11 @@ fn serve_app(obs: &Obs, rec: &mut Recorder, args: &Args, dirs: &Dirs) {
                     targets.push(json!({ "target": format!("window:{spec}"), "label": format!("Window: {label}") }));
                 }
                 Ok(Value::Array(targets))
+            }
+            "probeHook" => {
+                // A7: while a game is recorded by its window, try its hook on top.
+                let enabled = params.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                rec.set_probe(enabled).map(|probing| json!({ "probing": probing }))
             }
             "setCapture" => {
                 let spec = params.get("target").and_then(Value::as_str).unwrap_or_default();

@@ -499,7 +499,11 @@ async function deleteItems(paths) {
   library.selected.clear();
   await loadLibrary();
   if ($('view-viewer').hidden) renderLibrary();
-  if (result.failed.length) activity(t('Could not delete: {error}', { error: result.failed.join('; ') }), 'bad');
+  if (result.failed.length) {
+    const error = t('Could not delete: {error}', { error: result.failed.join('; ') });
+    activity(error, 'bad');
+    if (!n) toast(error);
+  }
   if (n) {
     activity(tp(n, 'Moved {n} item to Recently deleted', 'Moved {n} items to Recently deleted'));
     toast(tp(n, '{n} item deleted', '{n} items deleted'), moved.length ? t('Undo') : null, moved.length ? () => restoreItems(moved) : null);

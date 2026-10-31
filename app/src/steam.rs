@@ -210,8 +210,9 @@ impl Achievements {
     fn on_event(self: &Arc<Achievements>, appid: u32, game: &str, event: Value) {
         match event["event"].as_str().unwrap_or_default() {
             "ready" => {
+                let skipped = event["skipped"].as_str().map(|p| format!("; passed over {p}, which lacks the user stats functions")).unwrap_or_default();
                 log!(
-                    "steam: {game}: {} achievements, {} unlocked; library {} ({})",
+                    "steam: {game}: {} achievements, {} unlocked; library {} ({}){skipped}",
                     event["achievements"], event["unlocked"], event["library"].as_str().unwrap_or_default(), event["origin"].as_str().unwrap_or_default()
                 );
                 self.state.lock().unwrap().ready = Some(event);

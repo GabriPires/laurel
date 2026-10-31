@@ -63,15 +63,24 @@ pub fn frames(ffmpeg: &Path, input: &Path, outputs: &[(f64, std::path::PathBuf)]
 
 /// Re-encodes `start..end` seconds so the copy starts exactly there: the video with
 /// NVENC, or x264 when NVENC is not available, every audio track to AAC.
+/// `max_bitrate` (bits per second, the original's) caps the video: at the quality
+/// asked, a busy game came out at twice the recording's rate or more (stability
+/// tests, finding A4), and a copy cannot hold more detail than its original.
 ///
 /// The app snaps `start` to a frame's time and `end` to the end of the last frame
 /// to keep; half a millisecond earlier on both keeps the first and the last frame
 /// whatever the rounding (ffmpeg keeps the frames from `start` and before `end`).
-pub fn trim_exact(ffmpeg: &Path, input: &Path, output: &Path, start: f64, end: f64) -> Result<(), String> {
+pub fn trim_exact(ffmpeg: &Path, input: &Path, output: &Path, start: f64, end: f64, max_bitrate: Option<u64>) -> Result<(), String> {
     let (s, d) = (format!("{:.6}", (start - 0.0005).max(0.0)), format!("{:.6}", end - start));
+    // A one-second buffer: with two, x264 came out 10% above the original on a
+    // 4 s trim of a noisy clip; NVENC stayed at the original's rate either way.
+    let cap = max_bitrate.filter(|b| *b > 0).map(|b| b.to_string());
     let encode = |video: &[&str]| {
         let mut args: Vec<&std::ffi::OsStr> = vec!["-ss".as_ref(), s.as_ref(), "-i".as_ref(), input.as_os_str(), "-t".as_ref(), d.as_ref(), "-map".as_ref(), "0".as_ref(), "-c:v".as_ref()];
         args.extend(video.iter().map(|a| std::ffi::OsStr::new(a)));
+        if let Some(rate) = &cap {
+            args.extend(["-maxrate", rate, "-bufsize", rate].map(std::ffi::OsStr::new));
+        }
         args.extend(["-c:a".as_ref(), "aac".as_ref(), "-b:a".as_ref(), "160k".as_ref(), "-movflags".as_ref(), "+faststart".as_ref(), output.as_os_str()]);
         run(ffmpeg, &args)
     };

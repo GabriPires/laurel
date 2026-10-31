@@ -24,6 +24,24 @@ pub struct Library {
     dirs: Mutex<(PathBuf, PathBuf)>,
     thumbs_dir: PathBuf,
     ffmpeg: Option<PathBuf>,
+    /// Clips ffmpeg is reading for a trim or its timeline (lowercase paths): they
+    /// cannot be moved to Recently deleted meanwhile (stability tests, finding A3).
+    reading: Mutex<Vec<String>>,
+}
+
+/// Marks a clip as being read until dropped (see Library::reading).
+struct Reading<'a> {
+    library: &'a Library,
+    key: String,
+}
+
+impl Drop for Reading<'_> {
+    fn drop(&mut self) {
+        let mut reading = self.library.reading.lock().unwrap();
+        if let Some(i) = reading.iter().position(|k| *k == self.key) {
+            reading.remove(i);
+        }
+    }
 }
 
 /// A readable game name: the name the app found for the game, else the hooked
@@ -120,7 +138,7 @@ impl Library {
         }
         let thumbs_dir = work_dir.join("thumbnails");
         std::fs::create_dir_all(&thumbs_dir).map_err(|e| e.to_string())?;
-        Ok(Library { db: Mutex::new(db), dirs: Mutex::new((clips_dir, shots_dir)), thumbs_dir, ffmpeg })
+        Ok(Library { db: Mutex::new(db), dirs: Mutex::new((clips_dir, shots_dir)), thumbs_dir, ffmpeg, reading: Mutex::new(vec![]) })
     }
 
     /// Clips, screenshots and thumbnails folders.
@@ -195,13 +213,16 @@ impl Library {
     pub fn delete(&self, path: &str) -> Result<Value, String> {
         let path = share::windows_path(path);
         self.get(&path)?.filter(|i| i["deletedMs"].is_null()).ok_or("item not found")?;
+        if self.reading.lock().unwrap().contains(&path.to_lowercase()) {
+            return Err(t!("It is being trimmed. Try again when the trimmed copy is saved."));
+        }
         let file = Path::new(&path);
         if !file.exists() {
             self.purge(&path, false)?;
             return Ok(Value::Null);
         }
         let target = free_name(&self.ensure_trash()?, file)?;
-        std::fs::rename(file, &target).map_err(|e| format!("{}: {e}", file.display()))?;
+        storage::rename_when_free(file, &target).map_err(|e| format!("{}: {e}", file.display()))?;
         let key = target.to_string_lossy().into_owned();
         self.db
             .lock()
@@ -456,8 +477,10 @@ impl Library {
         let stem = source.file_stem().ok_or("bad clip path")?.to_string_lossy().into_owned();
         let dir = source.parent().ok_or("bad clip path")?;
         let out = trim_path(dir, &stem);
+        let _reading = self.reading(&source);
         if exact {
-            media::trim_exact(ffmpeg, &source, &out, start, end)?;
+            let bitrate = mp4::probe(&source).map(|info| info.video_bitrate).ok();
+            media::trim_exact(ffmpeg, &source, &out, start, end, bitrate)?;
         } else {
             // Stream copy seeks to the keyframe at or before the time asked, so
             // half a millisecond after `start` (a keyframe's time) keeps that
@@ -474,6 +497,18 @@ impl Library {
 }
 
 impl Library {
+    /// Whether ffmpeg is reading this clip for a trim or its timeline.
+    pub fn is_reading(&self, path: &str) -> bool {
+        self.reading.lock().unwrap().contains(&share::windows_path(path).to_lowercase())
+    }
+
+    /// Marks `source` as being read by ffmpeg until the result is dropped.
+    fn reading(&self, source: &Path) -> Reading<'_> {
+        let key = source.to_string_lossy().to_lowercase();
+        self.reading.lock().unwrap().push(key.clone());
+        Reading { library: self, key }
+    }
+
     /// Frame and keyframe times of a clip (spec edit.trim), from the file itself.
     pub fn video_frames(&self, path: &str) -> Result<mp4::VideoFrames, String> {
         mp4::video_frames(Path::new(&share::windows_path(path)))
@@ -490,6 +525,7 @@ impl Library {
         let frames: Vec<(f64, PathBuf)> = (0..count).map(|i| ((i as f64 + 0.5) * duration / count as f64, dir.join(format!("{i:02}.jpg")))).collect();
         if !frames.iter().all(|(_, p)| p.exists()) {
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let _reading = self.reading(&source);
             media::frames(ffmpeg, &source, &frames, 192)?;
         }
         Ok(frames.into_iter().map(|(_, p)| p).collect())
