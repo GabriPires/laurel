@@ -5,8 +5,11 @@
 
 pub mod ffi;
 
+use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::Path;
+use std::sync::mpsc::Sender;
+use std::sync::Mutex;
 
 pub fn cstr(s: &str) -> CString {
     CString::new(s).expect("string without NUL")
@@ -14,6 +17,76 @@ pub fn cstr(s: &str) -> CString {
 
 pub fn opt_string(p: *const c_char) -> Option<String> {
     (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+}
+
+/// Gets the name of each game capture source whose shared texture OBS could not
+/// open (the game renders on another GPU; A13 of the stability tests).
+static SHARED_TEXTURE_FAILURES: Mutex<Option<Sender<String>>> = Mutex::new(None);
+
+/// Starts (or, with None, stops) sending the names of game capture sources that
+/// log "failed to open shared handle" to `tx`.
+pub fn watch_shared_texture_failures(tx: Option<Sender<String>>) {
+    if let Ok(mut slot) = SHARED_TEXTURE_FAILURES.lock() {
+        *slot = tx;
+    }
+}
+
+/// The source in a game capture line such as
+/// "[game-capture: 'capture'] init_shtex_capture: failed to open shared handle".
+fn shared_texture_failure(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("[game-capture: '")?;
+    let (name, message) = rest.split_once("'] ")?;
+    message.starts_with("init_shtex_capture: failed to open shared handle").then_some(name)
+}
+
+/// What a WASAPI audio source logged about its device (A16 of the stability tests).
+#[derive(Debug, PartialEq)]
+pub enum AudioEvent {
+    /// The source could not start its device, or tries it again; with the Windows
+    /// error when OBS logged one (only the first failure in a row has it).
+    Failed { source: String, code: Option<String> },
+    /// The source started its device.
+    Started { source: String },
+    /// Not from the log: the app asked for another try of the microphone.
+    Retry,
+}
+
+static AUDIO_EVENTS: Mutex<Option<Sender<AudioEvent>>> = Mutex::new(None);
+
+thread_local! {
+    /// The error of the last "[WASAPISource::TryInitialize]" line on this thread;
+    /// the same thread then logs which source failed to start.
+    static INIT_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Starts (or, with None, stops) sending audio device events to `tx`.
+pub fn watch_audio_events(tx: Option<Sender<AudioEvent>>) {
+    if let Ok(mut slot) = AUDIO_EVENTS.lock() {
+        *slot = tx;
+    }
+}
+
+/// The audio device event in a libobs line (win-wasapi), if any:
+/// "[WASAPISource::TryInitialize]:[<device>] Failed to initialize audio client: 80070005",
+/// "WASAPI: Device 'default' failed to start (source: microphone)",
+/// "Device '<device>' invalidated.  Retrying (source: microphone)",
+/// "WASAPI: Device '<device>' [48000 Hz] initialized (source: microphone)".
+fn audio_event(line: &str) -> Option<AudioEvent> {
+    if let Some(rest) = line.strip_prefix("[WASAPISource::TryInitialize]:[") {
+        let code = rest.rsplit(": ").next().filter(|c| !c.is_empty() && c.chars().all(|ch| ch.is_ascii_hexdigit()));
+        INIT_ERROR.with(|e| *e.borrow_mut() = code.map(str::to_ascii_uppercase));
+        return None;
+    }
+    let source = line.strip_suffix(')')?.rsplit_once("(source: ")?.1.to_string();
+    if line.starts_with("WASAPI: Device '") && line.contains("' failed to start (source: ") {
+        Some(AudioEvent::Failed { source, code: INIT_ERROR.with(|e| e.borrow_mut().take()) })
+    } else if line.starts_with("Device '") && line.contains("' invalidated.  Retrying (source: ") {
+        Some(AudioEvent::Failed { source, code: None })
+    } else if line.starts_with("WASAPI: Device '") && line.contains("] initialized (source: ") {
+        Some(AudioEvent::Started { source })
+    } else {
+        None
+    }
 }
 
 /// Sends libobs log messages to stderr (the default handler prints to stdout, which
@@ -34,6 +107,16 @@ unsafe extern "C" fn on_log(level: i32, msg: *const c_char, args: *mut c_void, _
         _ => "debug",
     };
     log!("{prefix}: {line}");
+    if let Some(event) = audio_event(&line) {
+        if let Some(tx) = AUDIO_EVENTS.lock().ok().as_ref().and_then(|slot| slot.as_ref()) {
+            let _ = tx.send(event);
+        }
+    }
+    if let Some(name) = shared_texture_failure(&line) {
+        if let Some(tx) = SHARED_TEXTURE_FAILURES.lock().ok().as_ref().and_then(|slot| slot.as_ref()) {
+            let _ = tx.send(name.to_string());
+        }
+    }
 }
 
 /// Owns the libobs core; dropping it shuts libobs down.
@@ -46,6 +129,8 @@ pub struct VideoConfig {
     pub output_width: u32,
     pub output_height: u32,
     pub fps: u32,
+    /// DXGI adapter index (see gpu.rs).
+    pub adapter: u32,
 }
 
 #[derive(Debug)]
@@ -97,7 +182,7 @@ impl Obs {
             output_width: cfg.output_width,
             output_height: cfg.output_height,
             output_format: ffi::VIDEO_FORMAT_NV12,
-            adapter: 0,
+            adapter: cfg.adapter,
             gpu_conversion: true,
             colorspace: ffi::VIDEO_CS_709,
             range: ffi::VIDEO_RANGE_PARTIAL,
@@ -436,6 +521,16 @@ impl SharedSource {
 
     pub fn update(&self, settings: &Data) {
         unsafe { ffi::obs_source_update(self.0, settings.ptr()) }
+    }
+
+    /// Routes the source to a global output channel (0 = video, 1+ = audio).
+    pub fn set_output_channel(&self, channel: u32) {
+        unsafe { ffi::obs_set_output_source(channel, self.0) }
+    }
+
+    /// Another reference to the same source.
+    pub fn share(&self) -> SharedSource {
+        SharedSource(unsafe { ffi::obs_source_get_ref(self.0) })
     }
 }
 

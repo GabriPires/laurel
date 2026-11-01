@@ -48,6 +48,7 @@ struct Inner {
     pending: Mutex<HashMap<u64, Sender<Reply>>>,
     next_id: AtomicU64,
     state: Mutex<Value>,
+    microphone: Mutex<Value>,
     quitting: AtomicBool,
     /// Set by `restart`: the next exit is asked for, not a failure.
     restarting: AtomicBool,
@@ -63,6 +64,7 @@ impl Engine {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             state: Mutex::new(json!({ "state": "starting" })),
+            microphone: Mutex::new(json!({ "state": "starting" })),
             quitting: AtomicBool::new(false),
             restarting: AtomicBool::new(false),
         }));
@@ -75,6 +77,18 @@ impl Engine {
     /// the engine's `ready` notification as `info`.
     pub fn state(&self) -> Value {
         self.0.state.lock().unwrap().clone()
+    }
+
+    /// The microphone's state from the engine's "microphone" notifications (A16 of the
+    /// stability tests): `{ "state": "starting" | "ok" | "failed" | "denied" | "off",
+    /// "code": <Windows error> }`. Each engine start begins at "starting".
+    pub fn microphone(&self) -> Value {
+        self.0.microphone.lock().unwrap().clone()
+    }
+
+    fn set_microphone(&self, value: Value) {
+        *self.0.microphone.lock().unwrap() = value.clone();
+        let _ = self.0.app.emit("microphone", value);
     }
 
     /// Sends a request and waits for its response.
@@ -176,6 +190,7 @@ impl Engine {
     fn run_once(&self) -> Result<String, String> {
         let cfg = &self.0.cfg;
         let options = (cfg.options)();
+        self.set_microphone(json!({ "state": "starting" }));
         let mut child = Command::new(&cfg.exe)
             .arg(&cfg.work_dir)
             .arg("--rpc")
@@ -263,6 +278,11 @@ impl Engine {
                     }
                     self.set_state(state);
                 }
+            }
+            // A16: the microphone started, failed, or Windows denies it.
+            Some("microphone") => {
+                log!("engine microphone: {params}");
+                self.set_microphone(params);
             }
             Some("fatal") => {
                 let text = params.get("message").and_then(Value::as_str).unwrap_or_default().to_string();

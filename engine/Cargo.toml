@@ -1,6 +1,6 @@
 [package]
 name = "laurel-engine"
-version = "0.1.0-rc.7"
+version = "0.1.0-rc.8"
 description = "Laurel headless recording engine (PoC-E1): capture, replay buffer, screenshots and multi-track audio on top of libobs."
 edition.workspace = true
 license.workspace = true
@@ -9,3 +9,4 @@ publish = false
 [dependencies]
 png = "0.17"
 serde_json = "1"
+windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common"] }

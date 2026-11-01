@@ -224,6 +224,29 @@ $('admin-restart').onclick = async () => {
 };
 $('restart').onclick = () => invoke('engine_restart');
 
+// A16: Windows' privacy settings can deny the microphone to desktop apps; the
+// clips then go without the player's voice. Warned about when track 1 has it.
+let micState = 'starting';
+async function showMicrophone() {
+  const m = await invoke('microphone_state');
+  if (micState === 'denied' && m.state === 'ok') activity(t('Microphone allowed: clips have your voice again'));
+  micState = m.state;
+  $('mic-banner').hidden = !(m.state === 'denied' && m.mix !== 'game');
+}
+listen('microphone', showMicrophone);
+showMicrophone();
+$('mic-privacy').onclick = () => invoke('open_microphone_privacy').catch((e) => activity(String(e), 'bad'));
+$('mic-retry').onclick = async () => {
+  $('mic-retry').disabled = true;
+  try {
+    await invoke('engine_request', { method: 'retryMicrophone' });
+    activity(t('Trying the microphone again'));
+  } catch (e) {
+    activity(String(e), 'bad');
+  }
+  setTimeout(() => { $('mic-retry').disabled = false; }, 2000);
+};
+
 const ENGINE_NEWS = {
   stopped: (message) => t('Engine stopped: {message}', { message }),
   failed: (message) => t('Engine failed: {message}', { message }),

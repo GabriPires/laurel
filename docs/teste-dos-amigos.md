@@ -4,6 +4,15 @@ O Laurel guarda os últimos segundos do jogo que você está jogando e salva um 
 
 Esta é uma versão de teste. Ela pode ter erros, e é exatamente isso que queremos achar com a sua ajuda.
 
+## O que mudou na 0.1.0-rc.8
+
+Esta versão corrige o que o último pacote de logs mostrou. Obrigado a quem mandou!
+
+- **Notebooks com duas placas de vídeo.** Em notebooks com a placa de vídeo do processador e uma placa dedicada (NVIDIA ou AMD), o Laurel gravava na placa mais fraca e não conseguia entrar nos jogos: gravava tudo pela janela, e nos jogos pesados o vídeo saía travado. Agora o Laurel grava na placa dedicada, onde os jogos rodam, e, se um jogo rodar na outra placa, usa um modo de compatibilidade para entrar nele.
+- **Microfone bloqueado pelo Windows.** Quando o Windows não deixa os aplicativos da área de trabalho usarem o microfone, os clipes saíam sem a sua voz, sem nenhum aviso. Agora a janela do Laurel mostra o aviso **O Windows está bloqueando o microfone**, com um botão que abre a configuração certa do Windows e outro para tentar de novo.
+- **Laurel como administrador.** Com o Laurel aberto como administrador (por exemplo, para o Genshin Impact), um jogo em que ele não conseguia entrar ficava sem imagem. Agora o Laurel passa a gravar a janela do jogo, como nos outros casos.
+- **Genshin Impact.** O launcher do Genshin Impact (HoYoPlay) era tratado como o jogo. Agora o Laurel espera o jogo de verdade.
+
 ## O que mudou na 0.1.0-rc.7
 
 Esta versão corrige o que os logs dos testes de estabilidade mostraram. Obrigado a quem mandou! Continue jogando normalmente e, depois de algumas sessões, mande os logs de novo.
@@ -79,7 +88,7 @@ Não precisa fazer tudo. O que você conseguir já ajuda muito.
 2. **Jogo encontrado:** abriu um jogo e o Laurel mostrou **Gravando** com o nome certo?
 3. **Clipe:** o F8 salvou o clipe? Tocou o som de clipe salvo? O clipe tem imagem e som, e pelo menos 30 segundos?
 4. **Som:** com o padrão (jogo e microfone), o Discord e a música ficaram fora do clipe? Teste também as outras opções de **Som do clipe**. Se aparecer o aviso **Gravando {jogo} pela janela**, confira se o clipe tem o som do jogo e se, depois de um tempo, a gravação voltou ao normal (no Windows 10, a borda amarela some).
-5. **Placa de vídeo:** em **Configurações > Gravação**, o item **Gravando agora** mostra o codificador em uso. Diga qual apareceu e qual é a sua placa (NVIDIA, AMD ou Intel). Testar em placas AMD e Intel é muito importante.
+5. **Placa de vídeo:** em **Configurações > Gravação**, o item **Gravando agora** mostra o codificador em uso. Diga qual apareceu, qual é a sua placa (NVIDIA, AMD ou Intel) e se o seu PC é um notebook com duas placas de vídeo. Testar em placas AMD e Intel é muito importante.
 6. **Desempenho:** sentiu queda de FPS ou travadas, principalmente quando o jogo abriu ou quando salvou um clipe? Se quiser, ligue **Configurações > Notificações > Mostrar avisos sobre os jogos** e diga se sentiu alguma diferença ao salvar com o aviso na tela. Diga também se o seu monitor usa G-Sync ou FreeSync.
 7. **Português:** o Laurel abriu em português? Algum texto ficou estranho, cortado ou em inglês? Mande uma captura de tela.
 8. **Seleção e Excluídos:** excluir vários clipes de uma vez funcionou? O **Desfazer** trouxe de volta? **Restaurar** devolveu o clipe para a biblioteca?

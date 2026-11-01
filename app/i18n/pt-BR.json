@@ -547,5 +547,11 @@
   "{percent}% of players": "{percent}% dos jogadores",
   "{used} of {limit} GB": "{used} de {limit} GB",
   "{used} used": "{used} usados",
-  "{used} used of {limit} GB": "{used} usados de {limit} GB"
+  "{used} used of {limit} GB": "{used} usados de {limit} GB",
+  "Windows is blocking the microphone": "O Windows está bloqueando o microfone",
+  "Your clips are recorded without your voice. Let desktop apps use the microphone in Windows privacy settings, then try again.": "Seus clipes estão sendo gravados sem a sua voz. Permita que os aplicativos da área de trabalho usem o microfone nas configurações de privacidade do Windows e tente de novo.",
+  "Open privacy settings": "Abrir configurações de privacidade",
+  "Try again": "Tentar de novo",
+  "Microphone allowed: clips have your voice again": "Microfone liberado: os clipes voltam a ter a sua voz",
+  "Trying the microphone again": "Tentando o microfone de novo"
 }

@@ -7,12 +7,17 @@
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::obs::{clear_output_channel, cstr, ffi, opt_string, Data, Encoder, Obs, Output, Scene, SharedSource, Source};
+use serde_json::{json, Value};
+
+use crate::obs::{
+    clear_output_channel, cstr, ffi, opt_string, watch_audio_events, watch_shared_texture_failures, AudioEvent, Data, Encoder, Obs, Output, Scene, SharedSource,
+    Source,
+};
 
 const VIDEO_CHANNEL: u32 = 0;
 const GAME_AUDIO_CHANNEL: u32 = 1;
@@ -25,6 +30,13 @@ const MIC_CHANNEL: u32 = 3;
 const MIX_TRACK: u32 = 1 << 0;
 const GAME_TRACK: u32 = 1 << 1;
 const MIC_TRACK: u32 = 1 << 2;
+
+/// E_ACCESSDENIED: Windows' privacy settings keep the microphone from desktop apps.
+const ACCESS_DENIED: &str = "80070005";
+/// A denied microphone leaves its channel, which ends OBS's tries every 3 s, and is
+/// tried again after this long, the wait doubling up to MIC_RETRY_MAX.
+const MIC_RETRY_FIRST: Duration = Duration::from_secs(60);
+const MIC_RETRY_MAX: Duration = Duration::from_secs(300);
 
 /// Seconds between keyframes, for every video encoder.
 pub const KEYINT_SECS: i64 = 1;
@@ -47,6 +59,126 @@ struct GameWatch {
     binder: Mutex<Option<Sender<GameInfo>>>,
     /// Executable (or test window spec) the game audio follows.
     audio_bound: Mutex<Option<String>>,
+}
+
+/// Game capture sources by name ("capture", "game-try"), for the thread that moves
+/// one to shared-memory capture when OBS cannot open its shared texture: the game
+/// renders on another GPU than the engine (A13 of the stability tests). The hook
+/// then copies each frame through system memory (OBS's multi-adapter
+/// compatibility); Direct3D 12 has no such path in OBS, and the app falls back to
+/// the game's window as before.
+#[derive(Default)]
+struct TextureWatch {
+    /// Name, source, and whether it was already moved to shared memory.
+    sources: Mutex<Vec<(String, SharedSource, bool)>>,
+}
+
+impl TextureWatch {
+    fn register(&self, name: &str, source: &Source) {
+        let mut sources = self.sources.lock().unwrap();
+        sources.retain(|(n, _, _)| n != name);
+        sources.push((name.to_string(), SharedSource::of(source), false));
+    }
+
+    fn unregister(&self, name: &str) {
+        self.sources.lock().unwrap().retain(|(n, _, _)| n != name);
+    }
+
+    fn clear(&self) {
+        self.sources.lock().unwrap().clear();
+    }
+}
+
+/// Follows the microphone's device (A16 of the stability tests): reports its state to
+/// the app ("starting", "ok", "failed" or "denied", with the Windows error) and,
+/// while Windows denies it, keeps it off its channel between tries. Runs on its own
+/// thread: OBS logs from the source's thread, which the channel change waits for.
+fn spawn_mic_watch(mic: SharedSource, events: Receiver<AudioEvent>, state: Arc<Mutex<Value>>) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        // The last Windows error: OBS logs it only on the first failure in a row.
+        let mut code: Option<String> = None;
+        let mut wait = MIC_RETRY_FIRST;
+        let mut retry_at: Option<Instant> = None;
+        let report = |now: &str, code: &Option<String>| {
+            let value = json!({ "state": now, "code": code });
+            let mut current = state.lock().unwrap();
+            if *current != value {
+                log!("[laurel] microphone {now}{}", code.as_ref().map_or(String::new(), |c| format!(" ({c})")));
+                *current = value.clone();
+                crate::rpc::notify("microphone", value);
+            }
+        };
+        let try_again = |why: &str| {
+            log!("[laurel] microphone: trying again ({why})");
+            mic.set_output_channel(MIC_CHANNEL);
+        };
+        loop {
+            let event = match retry_at {
+                Some(at) => events.recv_timeout(at.saturating_duration_since(Instant::now())),
+                None => events.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            };
+            match event {
+                Ok(AudioEvent::Failed { source, code: error }) if source == "microphone" => {
+                    if error.is_some() {
+                        code = error;
+                    }
+                    if code.as_deref() != Some(ACCESS_DENIED) {
+                        report("failed", &code);
+                        continue;
+                    }
+                    // A try that was already under way may still log once: the
+                    // microphone is off its channel already.
+                    if retry_at.is_none() {
+                        clear_output_channel(MIC_CHANNEL);
+                        log!("[laurel] microphone off its channel: Windows denies it; next try in {} s", wait.as_secs());
+                        retry_at = Some(Instant::now() + wait);
+                        wait = (wait * 2).min(MIC_RETRY_MAX);
+                    }
+                    report("denied", &code);
+                }
+                Ok(AudioEvent::Started { source }) if source == "microphone" => {
+                    code = None;
+                    wait = MIC_RETRY_FIRST;
+                    retry_at = None;
+                    report("ok", &code);
+                }
+                Ok(AudioEvent::Retry) => {
+                    wait = MIC_RETRY_FIRST;
+                    retry_at = None;
+                    try_again("asked");
+                }
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    retry_at = None;
+                    try_again("timer");
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    })
+}
+
+/// Moves a game capture whose shared texture OBS cannot open to shared-memory
+/// capture, once per source. Runs on its own thread: OBS logs the failure from
+/// the graphics thread, inside the source's tick.
+fn spawn_texture_watch(watch: Arc<TextureWatch>) -> JoinHandle<()> {
+    let (tx, rx) = channel::<String>();
+    watch_shared_texture_failures(Some(tx));
+    std::thread::spawn(move || {
+        for name in rx {
+            let source = {
+                let mut sources = watch.sources.lock().unwrap();
+                sources.iter_mut().find(|(n, _, moved)| *n == name && !*moved).map(|(_, source, moved)| {
+                    *moved = true;
+                    source.share()
+                })
+            };
+            if let Some(source) = source {
+                log!("[laurel] game capture '{name}': OBS cannot open the game's shared texture (the game runs on another GPU); trying shared-memory capture");
+                source.update(&Data::new().bool("sli_compatibility", true));
+            }
+        }
+    })
 }
 
 /// What track 1, the one players play, mixes (spec audio.separate-tracks, D12
@@ -193,6 +325,14 @@ pub struct Recorder {
     game: Arc<GameWatch>,
     watching_game: bool,
     binder_thread: Option<JoinHandle<()>>,
+    /// Game captures that may move to shared memory (A13), and the thread doing it.
+    textures: Arc<TextureWatch>,
+    texture_thread: Option<JoinHandle<()>>,
+    /// The microphone's state for the app (A16), the way to ask its thread for
+    /// another try, and that thread.
+    mic_state: Arc<Mutex<Value>>,
+    mic_tx: Option<Sender<AudioEvent>>,
+    mic_thread: Option<JoinHandle<()>>,
     saved_tx: *mut Sender<()>,
     saved_rx: Receiver<()>,
     output_size: (u32, u32),
@@ -214,8 +354,13 @@ impl Recorder {
         // Watch the game capture before anything else: with the hook already in the
         // game, "hooked" can fire before the rest of the pipeline exists.
         let game = Arc::new(GameWatch::default());
+        let textures = Arc::new(TextureWatch::default());
+        let texture_thread = Some(spawn_texture_watch(textures.clone()));
         let capture = create_capture(obs, &cfg.capture, cfg.cursor)?;
         let watching_game = capture.as_ref().is_some_and(|c| connect_game_signals(c, &cfg.capture, &game));
+        if let (Capture::Game(_), Some(source)) = (&cfg.capture, &capture) {
+            textures.register("capture", source);
+        }
         let mut scene = Scene::new("laurel-canvas", cfg.canvas)?;
         scene.set(capture.as_ref());
         scene.set_output_channel(VIDEO_CHANNEL);
@@ -238,6 +383,11 @@ impl Recorder {
                 game,
                 watching_game,
                 binder_thread: None,
+                textures,
+                texture_thread,
+                mic_state: Arc::new(Mutex::new(json!({ "state": "off" }))),
+                mic_tx: None,
+                mic_thread: None,
                 saved_tx,
                 saved_rx,
                 output_size: cfg.output_size,
@@ -267,8 +417,15 @@ impl Recorder {
             track_masks.push(GAME_TRACK);
         }
         let mut mic = None;
+        let mic_state = Arc::new(Mutex::new(json!({ "state": if cfg.mic { "starting" } else { "off" } })));
+        let (mut mic_tx, mut mic_thread) = (None, None);
         if cfg.mic {
+            // Watch the log first: the device starts on its own thread right away.
+            let (tx, rx) = channel();
+            watch_audio_events(Some(tx.clone()));
             let source = Source::new("wasapi_input_capture", "microphone", &Data::new().str("device_id", "default"))?;
+            mic_thread = Some(spawn_mic_watch(SharedSource::of(&source), rx, mic_state.clone()));
+            mic_tx = Some(tx);
             source.set_output_channel(MIC_CHANNEL);
             mic = Some(source);
             track_masks.push(MIC_TRACK);
@@ -311,6 +468,11 @@ impl Recorder {
             game,
             watching_game,
             binder_thread,
+            textures,
+            texture_thread,
+            mic_state,
+            mic_tx,
+            mic_thread,
             saved_tx,
             saved_rx,
             output_size: cfg.output_size,
@@ -419,6 +581,18 @@ impl Recorder {
         self.game.game.lock().unwrap().clone()
     }
 
+    /// The microphone's state: `{ "state": "off" | "starting" | "ok" | "failed" |
+    /// "denied", "code": <Windows error> }` (A16).
+    pub fn microphone(&self) -> Value {
+        self.mic_state.lock().unwrap().clone()
+    }
+
+    /// Tries the microphone again now (the player allowed it in Windows' settings).
+    pub fn retry_microphone(&self) -> Result<(), String> {
+        let tx = self.mic_tx.as_ref().ok_or("no microphone")?;
+        tx.send(AudioEvent::Retry).map_err(|_| "the microphone watch stopped".to_string())
+    }
+
     /// The process (or test window) the game audio follows, if any.
     pub fn game_audio(&self) -> Option<String> {
         self.game.audio_bound.lock().unwrap().clone()
@@ -434,8 +608,12 @@ impl Recorder {
         let next = create_capture(obs, capture, self.cursor)?;
         self.drop_probe();
         self.unwatch_game();
+        self.textures.clear();
         if let Some(source) = &next {
             self.watching_game = connect_game_signals(source, capture, &self.game);
+            if matches!(capture, Capture::Game(_)) {
+                self.textures.register("capture", source);
+            }
         }
         self.scene.set(next.as_ref());
         self.capture = next; // drops our reference to the previous source
@@ -476,6 +654,7 @@ impl Recorder {
         let spec = spec.clone();
         let source = game_capture("game-try", Some(&spec), self.cursor)?;
         connect_game_signals(&source, &Capture::Game(Some(spec.clone())), &self.game);
+        self.textures.register("game-try", &source);
         self.scene.set_top(Some(&source));
         log!("[laurel] trying the game hook over the window capture");
         self.probe = Some((spec, source));
@@ -507,6 +686,7 @@ impl Recorder {
     /// Stops trying the game capture over the window capture.
     fn drop_probe(&mut self) {
         let Some((_, probe)) = self.probe.take() else { return };
+        self.textures.unregister("game-try");
         probe.disconnect("hooked", on_game_hooked, self.game_ptr());
         probe.disconnect("unhooked", on_game_unhooked, self.game_ptr());
         self.scene.set_top(None);
@@ -631,6 +811,18 @@ impl Drop for Recorder {
         // Closing the channel ends the binder, which releases its source reference.
         *self.game.binder.lock().unwrap() = None;
         if let Some(thread) = self.binder_thread.take() {
+            let _ = thread.join();
+        }
+        // Closing both senders ends the microphone thread and its source reference.
+        watch_audio_events(None);
+        self.mic_tx = None;
+        if let Some(thread) = self.mic_thread.take() {
+            let _ = thread.join();
+        }
+        // Closing the log watch ends the texture thread; the sources it held go too.
+        self.textures.clear();
+        watch_shared_texture_failures(None);
+        if let Some(thread) = self.texture_thread.take() {
             let _ = thread.join();
         }
         if let Some(output) = &self.output {

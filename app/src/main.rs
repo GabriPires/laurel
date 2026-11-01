@@ -467,6 +467,21 @@ async fn engine_request(engine: tauri::State<'_, Engine>, method: String, params
         .map_err(|e| e.to_string())?
 }
 
+/// The microphone's state (A16 of the stability tests) with the mix the player
+/// chose: the window warns about a denied microphone only when track 1 has it.
+#[tauri::command]
+fn microphone_state(app: AppHandle) -> Value {
+    let mut state = app.state::<Engine>().microphone();
+    state["mix"] = json!(app.state::<Arc<Store>>().get().audio_mix);
+    state
+}
+
+/// Opens Windows' microphone privacy page, where desktop apps get the microphone.
+#[tauri::command]
+fn open_microphone_privacy() -> Result<(), String> {
+    share::open_url("ms-settings:privacy-microphone")
+}
+
 #[tauri::command]
 fn engine_state(engine: tauri::State<'_, Engine>) -> Value {
     engine.state()
@@ -548,6 +563,10 @@ fn set_settings(app: AppHandle, settings: Value) -> Result<Value, String> {
         if let Err(e) = app.state::<Engine>().request("setAudioMix", json!({ "mix": new.audio_mix }), SHOT_TIMEOUT) {
             log!("setAudioMix failed: {e}");
         }
+    }
+    if mix_changed {
+        // A16: the window's microphone warning depends on whether track 1 has it.
+        let _ = app.emit("microphone", Value::Null);
     }
     if video_changed {
         // Spec quality.encoding: the engine takes the video settings when it starts.
@@ -1015,13 +1034,14 @@ fn export_logs(app: &AppHandle, dir: &std::path::Path) -> Result<PathBuf, String
     let windows = |name: &str| win::reg_string(win::HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", name).unwrap_or_default();
     let build = windows("CurrentBuild");
     let info = format!(
-        "Laurel {}\nWindows: {} {} (build {})\nSaved: {date} {time}\nAdministrator: {}\n\nEngine:\n{}\n\nGame:\n{}\n\nSteam achievements:\n{}\n\nSettings:\n{}\n",
+        "Laurel {}\nWindows: {} {} (build {})\nSaved: {date} {time}\nAdministrator: {}\n\nEngine:\n{}\n\nMicrophone:\n{}\n\nGame:\n{}\n\nSteam achievements:\n{}\n\nSettings:\n{}\n",
         app.package_info().version,
         windows_name(&windows("ProductName"), &build),
         windows("DisplayVersion"),
         build,
         win::self_elevated(),
         serde_json::to_string_pretty(&app.state::<Engine>().state()).unwrap_or_default(),
+        serde_json::to_string_pretty(&app.state::<Engine>().microphone()).unwrap_or_default(),
         serde_json::to_string_pretty(&app.state::<Arc<Detector>>().snapshot()).unwrap_or_default(),
         serde_json::to_string_pretty(&app.state::<Arc<steam::Achievements>>().status()).unwrap_or_default(),
         serde_json::to_string_pretty(&app.state::<Arc<Store>>().get().to_json()).unwrap_or_default(),
@@ -1241,10 +1261,13 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
         if let Some(game) = catalog.installed().first() {
             let inside = game.dir.join(r"Game\Binaries\Win64\Game-Win64-Shipping.exe").to_string_lossy().into_owned();
             let helper = game.dir.join("UnityCrashHandler64.exe").to_string_lossy().into_owned();
+            // A launcher in the game's folder, as HoYoPlay's next to Genshin Impact
+            // (A17 of the stability tests), is not the game.
+            let launcher = game.dir.join("HYP.exe").to_string_lossy().into_owned();
             let ignoring = Settings { ignored_games: vec![IgnoredGame { key: game.id.key.clone(), name: game.id.name.clone() }], ..settings.clone() };
-            let verdicts = (catalog.classify(&inside, &settings), catalog.classify(&helper, &settings), catalog.classify(&inside, &ignoring));
+            let verdicts = (catalog.classify(&inside, &settings), catalog.classify(&helper, &settings), catalog.classify(&launcher, &settings), catalog.classify(&inside, &ignoring));
             log!("[selftest] classify in {}: {:?}", game.id.name, verdicts);
-            if verdicts != (Verdict::Game(game.id.clone()), Verdict::NotGame, Verdict::Ignored(game.id.clone())) {
+            if verdicts != (Verdict::Game(game.id.clone()), Verdict::NotGame, Verdict::NotGame, Verdict::Ignored(game.id.clone())) {
                 return Err("library classification failed".into());
             }
         } else {
@@ -1747,6 +1770,27 @@ fn check_video(app: &AppHandle, engine: &Engine, wait_ready: &dyn Fn(&str) -> Re
     if !ids.contains(&"obs_x264") || !ids.iter().any(|id| info["encoder"] == *id) {
         return Err(format!("unexpected encoders: {ids:?}, in use {}", info["encoder"]));
     }
+    // A13: the engine says which GPU it renders on and why (high performance on a
+    // PC with two GPUs), so log packages show it.
+    let adapter = &info["adapter"];
+    log!("[selftest] video adapter: {adapter}");
+    if !adapter["index"].is_u64() || !adapter["name"].is_string() || !["only GPU", "high performance", "default", "asked"].iter().any(|r| adapter["reason"] == *r) {
+        return Err(format!("the engine did not report its video adapter: {adapter}"));
+    }
+    // A16: the engine reports the microphone once its device starts or fails, and
+    // takes a request for another try.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while engine.microphone()["state"] == "starting" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mic = engine.microphone();
+    log!("[selftest] microphone: {mic}");
+    if !["ok", "failed", "denied", "off"].iter().any(|s| mic["state"] == *s) {
+        return Err(format!("the engine did not report the microphone: {mic}"));
+    }
+    if mic["state"] != "off" {
+        log!("[selftest] microphone retry: {}", engine.request("retryMicrophone", Value::Null, SHOT_TIMEOUT)?);
+    }
     let store = app.state::<Arc<Store>>();
     let original = store.get();
     let original_mix = original.audio_mix.clone();
@@ -1820,9 +1864,16 @@ fn check_audio(app: &AppHandle, engine: &Engine) -> Result<(), String> {
 /// restoring it resumes; start with Windows can be set and is restored.
 fn check_storage(app: &AppHandle, engine: &Engine) -> Result<(), String> {
     let storage = app.state::<Arc<Storage>>();
-    match Storage::check_writable(std::path::Path::new(r"C:\Windows\System32\laurel-selftest")) {
-        Err(e) => log!("[selftest] unwritable folder refused: {e}"),
-        Ok(()) => return Err("a folder in System32 was accepted".into()),
+    // An elevated Laurel may write anywhere, System32 included (the self-test also
+    // runs elevated, for the hook check of A14), so only one that is not elevated
+    // checks the refusal.
+    if win::self_elevated() {
+        log!("[selftest] Laurel elevated: unwritable folder check skipped");
+    } else {
+        match Storage::check_writable(std::path::Path::new(r"C:\Windows\System32\laurel-selftest")) {
+            Err(e) => log!("[selftest] unwritable folder refused: {e}"),
+            Ok(()) => return Err("a folder in System32 was accepted".into()),
+        }
     }
 
     // Size limit in a throwaway library with three tiny screenshots.
@@ -2074,6 +2125,8 @@ fn main() {
             engine_request,
             engine_state,
             engine_restart,
+            microphone_state,
+            open_microphone_privacy,
             get_settings,
             set_settings,
             preview_notice,

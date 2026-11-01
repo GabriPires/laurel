@@ -449,6 +449,11 @@ impl Detector {
     /// Both deadlines count from the start of the capture, not from when the game
     /// was found: on a slow PC, starting Laurel and the engine used up the time
     /// before the hook was even tried.
+    ///
+    /// An elevated Laurel asks the engine too (A14 of the stability tests): its
+    /// hook can still fail, for example with the game on another GPU (A13), and
+    /// then the game's window is recorded as for any other game. Only a Laurel
+    /// that is not elevated offers the restart as administrator.
     fn check_hook(&self) {
         let (game, capturing) = {
             let s = self.state.lock().unwrap();
@@ -458,16 +463,11 @@ impl Detector {
                 _ => return,
             }
         };
-        let hooked = if self.elevated {
-            Ok(true)
-        } else {
-            self.app.state::<Engine>().request("status", Value::Null, REQUEST_TIMEOUT).map(|status| !status["game"].is_null())
-        };
-        let Ok(hooked) = hooked else { return };
+        let Ok(hooked) = self.app.state::<Engine>().request("status", Value::Null, REQUEST_TIMEOUT).map(|status| !status["game"].is_null()) else { return };
         let elevated = if hooked { Some(false) } else { win::process_elevated(game.pid) };
-        let needs_admin = !hooked && elevated != Some(false);
-        // A game that is not elevated gets until FALLBACK_GRACE before its window is
-        // recorded instead.
+        let needs_admin = !hooked && !self.elevated && elevated != Some(false);
+        // A game this Laurel can hook (not elevated, or Laurel elevated too) gets
+        // until FALLBACK_GRACE before its window is recorded instead.
         let fallback = !hooked && !needs_admin && capturing >= FALLBACK_GRACE;
         if !hooked && !needs_admin && !fallback {
             return;
@@ -489,7 +489,7 @@ impl Detector {
         if hooked {
             return;
         }
-        log!("capture: {} not hooked after {} s of capture; process elevated: {elevated:?}", game.id.name, capturing.as_secs());
+        log!("capture: {} not hooked after {} s of capture; process elevated: {elevated:?}; Laurel elevated: {}", game.id.name, capturing.as_secs(), self.elevated);
         let notifier = self.app.state::<Notifier>();
         if needs_admin {
             let _ = self.app.emit("game-state", self.snapshot());

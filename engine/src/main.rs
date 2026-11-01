@@ -9,6 +9,8 @@
 //!   --base WxH                  canvas size (default 1920x1080)
 //!   --out WxH                   encoded size (default = base)
 //!   --fps N                     (default 60)
+//!   --adapter N                 GPU to render on, by DXGI adapter index (default: the
+//!                               high-performance GPU when there are two, else 0)
 //!   --encoder auto|nvenc|amf|qsv|x264|ID  video encoder (default auto: the first that starts)
 //!   --codec h264|hevc|av1       for auto (default h264); H.264 is the fallback
 //!   --rate cbr|vbr              rate control (default cbr)
@@ -28,7 +30,7 @@
 //!   --clips-dir DIR, --screenshots-dir DIR  (default <work-dir>\clips and \screenshots)
 //!   --script "cmd; cmd; ..."    commands: wait N | save | screenshot | stats | beep N |
 //!                               capture <monitor[:N[:method]]|window:..|game[:..]> |
-//!                               mix <game|game-mic|pc-mic> | probe [on|off] | quit
+//!                               mix <game|game-mic|pc-mic> | probe [on|off] | mic [retry] | quit
 //!                               (without --script or --rpc, commands are read from stdin)
 //! Logs (libobs and the engine's own) always go to stderr.
 //!
@@ -46,6 +48,7 @@ macro_rules! log {
     }};
 }
 
+mod gpu;
 mod obs;
 mod recorder;
 mod rpc;
@@ -72,6 +75,7 @@ struct Args {
     base: (u32, u32),
     out: Option<(u32, u32)>,
     fps: u32,
+    adapter: Option<u32>,
     encoder: String,
     codec: String,
     rate: String,
@@ -240,6 +244,7 @@ fn parse_args() -> Result<Args, String> {
         base: (1920, 1080),
         out: None,
         fps: 60,
+        adapter: None,
         encoder: "auto".into(),
         codec: "h264".into(),
         rate: "cbr".into(),
@@ -270,6 +275,7 @@ fn parse_args() -> Result<Args, String> {
             "--base" => a.base = parse_size(&value()?)?,
             "--out" => a.out = Some(parse_size(&value()?)?),
             "--fps" => a.fps = value()?.parse().map_err(|_| "bad --fps")?,
+            "--adapter" => a.adapter = Some(value()?.parse().map_err(|_| "bad --adapter")?),
             "--encoder" => a.encoder = value()?,
             "--codec" => a.codec = one_of(value()?, &["h264", "hevc", "av1"], "--codec")?,
             "--rate" => a.rate = one_of(value()?, &["cbr", "vbr"], "--rate")?,
@@ -442,7 +448,10 @@ fn run(args: Args) -> Result<(), String> {
     // Encoders need even dimensions (spec quality.encoding).
     let out = args.out.unwrap_or(args.base);
     let out = (out.0.max(2) & !1, out.1.max(2) & !1);
-    obs.reset_video(VideoConfig { base_width: args.base.0, base_height: args.base.1, output_width: out.0, output_height: out.1, fps: args.fps })?;
+    // A13: on a PC with two GPUs, render where the games run (see gpu.rs).
+    let gpu = gpu::choose(args.adapter);
+    log!("[laurel] video adapter {}: {} ({}; {} GPUs)", gpu.index, gpu.adapter.as_ref().map_or("unknown", |a| a.name.as_str()), gpu.reason, gpu.gpus);
+    obs.reset_video(VideoConfig { base_width: args.base.0, base_height: args.base.1, output_width: out.0, output_height: out.1, fps: args.fps, adapter: gpu.index })?;
     obs.reset_audio(48000)?;
     for m in MODULES {
         if let Err(e) = obs.load_module(&args.obs_root, m) {
@@ -520,6 +529,7 @@ fn run(args: Args) -> Result<(), String> {
                 "codec": args.codec,
                 "encoderFallbacks": fallbacks_json(&rec),
                 "encoders": video_encoder_list(&encoders),
+                "adapter": gpu.json(),
                 "target": args.capture_spec,
                 "output": [out.0, out.1],
                 "base": [args.base.0, args.base.1],
@@ -583,6 +593,15 @@ fn run(args: Args) -> Result<(), String> {
                 Err(e) => log!("[laurel] mix switch failed: {e}"),
             },
             Some("stats") => log!("[laurel] stats after {:.1}s: {}", started.elapsed().as_secs_f64(), recorder::format_stats(&obs, &rec)),
+            Some("mic") => {
+                // A16: "mic retry" asks for another try; "mic" only logs the state.
+                if parts.next() == Some("retry") {
+                    if let Err(e) = rec.retry_microphone() {
+                        log!("[laurel] microphone retry failed: {e}");
+                    }
+                }
+                log!("[laurel] microphone state at {:.1}s: {}", started.elapsed().as_secs_f64(), rec.microphone());
+            }
             Some("quit") => break,
             Some(other) => log!("[laurel] unknown command {other}"),
         }
@@ -624,6 +643,7 @@ fn serve_app(obs: &Obs, rec: &mut Recorder, args: &Args, dirs: &Dirs) {
                     "cursor": rec.cursor(),
                     "game": game_json(rec.game()),
                     "audio": { "mode": if args.desktop_audio { "game" } else { "off" }, "mix": rec.audio_mix().name(), "follows": rec.game_audio() },
+                    "microphone": rec.microphone(),
                 }))
             }
             "listTargets" => {
@@ -639,6 +659,10 @@ fn serve_app(obs: &Obs, rec: &mut Recorder, args: &Args, dirs: &Dirs) {
                     targets.push(json!({ "target": format!("window:{spec}"), "label": format!("Window: {label}") }));
                 }
                 Ok(Value::Array(targets))
+            }
+            "retryMicrophone" => {
+                // A16: the player allowed the microphone in Windows' settings.
+                rec.retry_microphone().map(|_| rec.microphone())
             }
             "probeHook" => {
                 // A7: while a game is recorded by its window, try its hook on top.
