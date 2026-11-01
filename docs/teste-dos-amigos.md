@@ -4,6 +4,16 @@ O Laurel guarda os últimos segundos do jogo que você está jogando e salva um 
 
 Esta é uma versão de teste. Ela pode ter erros, e é exatamente isso que queremos achar com a sua ajuda.
 
+## O que mudou na 0.1.0-rc.9
+
+Esta versão traz as últimas correções dos testes de estabilidade e uma correção para quem usa fone Bluetooth.
+
+- **Fone Bluetooth.** Com o Laurel aberto, um fone Bluetooth com microfone podia ficar no modo de chamada, com o som pior ou até mudo, porque o Laurel deixava o microfone aberto o tempo todo, mesmo sem jogo. Agora o Laurel só abre o microfone enquanto grava um jogo, ou a tela quando a gravação de tela está ligada.
+- **Escolher o microfone.** Em **Configurações > Gravação**, a opção nova **Gravar meu microfone** liga e desliga o microfone nos clipes, e **Microfone** deixa escolher qual usar, em vez do **Padrão do Windows**. Com um fone Bluetooth, o modo de chamada ainda acontece enquanto o Laurel grava com o microfone do fone: para evitar, escolha outro microfone ou desligue a opção.
+- **Avisos importantes aparecem sempre.** Com **Mostrar avisos sobre os jogos** desligado, que é o padrão, o aviso de que um jogo roda como administrador era só um som. Agora os avisos que querem dizer que o Laurel não está gravando o jogo aparecem sobre o jogo mesmo assim: o jogo que roda como administrador, a gravação pausada com o disco quase cheio e **O Laurel parou de gravar**.
+- **Desligar o PC com o Laurel aberto.** Ao desligar ou reiniciar o Windows, o Laurel tentava religar o motor de gravação que o Windows estava fechando. Agora ele espera o Windows terminar.
+- **Logs mais úteis.** Se o motor de gravação parar de repente, o log agora diz o motivo e onde aconteceu, o que ajuda a achar a causa. Também sumiram as linhas de erro que apareciam a cada troca da saída de som.
+
 ## O que mudou na 0.1.0-rc.8
 
 Esta versão corrige o que o último pacote de logs mostrou. Obrigado a quem mandou!
@@ -87,7 +97,7 @@ Não precisa fazer tudo. O que você conseguir já ajuda muito.
 1. **Instalação ou atualização:** instalou ou atualizou sem erro? Pediu administrador? Seu PC tinha OBS instalado?
 2. **Jogo encontrado:** abriu um jogo e o Laurel mostrou **Gravando** com o nome certo?
 3. **Clipe:** o F8 salvou o clipe? Tocou o som de clipe salvo? O clipe tem imagem e som, e pelo menos 30 segundos?
-4. **Som:** com o padrão (jogo e microfone), o Discord e a música ficaram fora do clipe? Teste também as outras opções de **Som do clipe**. Se aparecer o aviso **Gravando {jogo} pela janela**, confira se o clipe tem o som do jogo e se, depois de um tempo, a gravação voltou ao normal (no Windows 10, a borda amarela some).
+4. **Som:** com o padrão (jogo e microfone), o Discord e a música ficaram fora do clipe? Teste também as outras opções de **Som do clipe**, e **Gravar meu microfone** desligado. Se usa fone Bluetooth com microfone, diga se o som do fone ficou normal com o Laurel aberto, sem jogo, e durante o jogo. Se aparecer o aviso **Gravando {jogo} pela janela**, confira se o clipe tem o som do jogo e se, depois de um tempo, a gravação voltou ao normal (no Windows 10, a borda amarela some).
 5. **Placa de vídeo:** em **Configurações > Gravação**, o item **Gravando agora** mostra o codificador em uso. Diga qual apareceu, qual é a sua placa (NVIDIA, AMD ou Intel) e se o seu PC é um notebook com duas placas de vídeo. Testar em placas AMD e Intel é muito importante.
 6. **Desempenho:** sentiu queda de FPS ou travadas, principalmente quando o jogo abriu ou quando salvou um clipe? Se quiser, ligue **Configurações > Notificações > Mostrar avisos sobre os jogos** e diga se sentiu alguma diferença ao salvar com o aviso na tela. Diga também se o seu monitor usa G-Sync ou FreeSync.
 7. **Português:** o Laurel abriu em português? Algum texto ficou estranho, cortado ou em inglês? Mande uma captura de tela.

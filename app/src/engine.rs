@@ -1,7 +1,8 @@
 //! Supervises the laurel-engine process: starts it, restarts it when it dies and
 //! exchanges JSON-RPC messages with it over its stdin/stdout (engine/src/rpc.rs).
 //! The engine's stderr (its log) goes to `<work-dir>/logs/engine.log`, each line with
-//! the local time.
+//! the local time, and so does the way each engine ended (A19: engine.log keeps more
+//! history than the app sessions kept in the logs package).
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -26,6 +27,33 @@ const HEALTHY_RUN: Duration = Duration::from_secs(60);
 /// Exit status when Windows cannot load a DLL the engine needs: the Microsoft Visual
 /// C++ runtime, which the OBS runtime requires, or a file of a damaged OBS runtime.
 const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
+
+/// "exit code 0xC0000005 (STATUS_ACCESS_VIOLATION)": codes past 0xFFFF in hex, as
+/// Windows writes them, with the name of the known ones (A19).
+fn describe_exit(status: &std::process::ExitStatus) -> String {
+    let Some(code) = status.code().map(|c| c as u32) else {
+        return status.to_string();
+    };
+    let name = match code {
+        101 => Some("a Rust panic"),
+        0xC000_0005 => Some("STATUS_ACCESS_VIOLATION"),
+        0xC000_001D => Some("STATUS_ILLEGAL_INSTRUCTION"),
+        0xC000_00FD => Some("STATUS_STACK_OVERFLOW"),
+        0xC000_0135 => Some("STATUS_DLL_NOT_FOUND"),
+        0xC000_013A => Some("STATUS_CONTROL_C_EXIT"),
+        0xC000_0374 => Some("STATUS_HEAP_CORRUPTION"),
+        0xC000_0409 => Some("STATUS_STACK_BUFFER_OVERRUN, a fast fail"),
+        0x4001_0004 => Some("DBG_TERMINATE_PROCESS"),
+        0x8000_0003 => Some("STATUS_BREAKPOINT"),
+        0xE06D_7363 => Some("a C++ exception"),
+        _ => None,
+    };
+    let code = if code > 0xFFFF { format!("0x{code:08X}") } else { code.to_string() };
+    match name {
+        Some(name) => format!("exit code {code} ({name})"),
+        None => format!("exit code {code}"),
+    }
+}
 
 pub struct EngineConfig {
     pub exe: PathBuf,
@@ -175,6 +203,23 @@ impl Engine {
                 log!("engine restarted to apply new settings");
                 continue;
             }
+            // A5: while Windows ends the session it also ends the engine (a console
+            // program), and would end a new one at once. The supervisor waits, and
+            // starts the engine again only if the session goes on; that end is not
+            // counted as a failure.
+            if crate::win::session_ending() {
+                log!("engine not restarted: Windows is ending the session");
+                self.set_state(json!({ "state": "stopped", "message": "Windows is ending the session" }));
+                while crate::win::session_ending() && !self.0.quitting.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                if self.0.quitting.load(Ordering::SeqCst) {
+                    break;
+                }
+                log!("the session goes on: the engine starts again");
+                restarted = true;
+                continue;
+            }
             quick_failures = if started.elapsed() > HEALTHY_RUN { 1 } else { quick_failures + 1 };
             if quick_failures >= MAX_QUICK_FAILURES {
                 self.set_state(json!({ "state": "failed", "message": message }));
@@ -221,11 +266,22 @@ impl Engine {
             }
         });
         let log_path = cfg.work_dir.join("logs").join("engine.log");
+        let (exit_tx, exit_rx) = channel::<String>();
         std::thread::spawn(move || {
             let mut file = crate::log::Rotating::open(&log_path, 0, crate::log::MAX_BYTES);
             file.line(&format!("[{}] ==== engine start", crate::win::clock()));
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                file.line(&format!("[{}] {line}", crate::win::clock()));
+            // Bytes, not `lines()`: a line that is not UTF-8 would end the reading,
+            // and with it the log of this engine.
+            let mut stderr = BufReader::new(stderr);
+            let mut buf = Vec::new();
+            while stderr.read_until(b'\n', &mut buf).is_ok_and(|n| n > 0) {
+                let line = String::from_utf8_lossy(&buf);
+                file.line(&format!("[{}] {}", crate::win::clock(), line.trim_end_matches(['\r', '\n'])));
+                buf.clear();
+            }
+            // A19: how this engine ended, after its last line.
+            if let Ok(exit) = exit_rx.recv_timeout(Duration::from_secs(5)) {
+                file.line(&format!("[{}] ==== engine exited: {exit}", crate::win::clock()));
             }
         });
 
@@ -244,7 +300,9 @@ impl Engine {
             let _ = tx.send(Err("the engine stopped".into()));
         }
         let status = exited?;
-        log!("engine exited: {status}");
+        let exit = describe_exit(&status);
+        log!("engine exited: {exit}");
+        let _ = exit_tx.send(exit);
         let fatal = fatal.lock().unwrap().take().or_else(|| {
             (status.code().map(|c| c as u32) == Some(STATUS_DLL_NOT_FOUND))
                 .then(|| "a DLL is missing: install the Microsoft Visual C++ Redistributable (x64) or reinstall Laurel".to_string())

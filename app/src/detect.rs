@@ -493,7 +493,8 @@ impl Detector {
         let notifier = self.app.state::<Notifier>();
         if needs_admin {
             let _ = self.app.emit("game-state", self.snapshot());
-            notifier.notify(Kind::Error, &t!("Can't record {game}", game = game.id.name), &t!("It runs as administrator. Open Laurel and restart it as administrator."));
+            // A15: shown over the game even with notices over games off.
+            notifier.notify_critical(&t!("Can't record {game}", game = game.id.name), &t!("It runs as administrator. Open Laurel and restart it as administrator."));
         } else {
             self.apply();
             let _ = self.app.emit("game-state", self.snapshot());

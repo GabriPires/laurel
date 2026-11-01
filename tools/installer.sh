@@ -20,6 +20,11 @@
 #   default out: /mnt/c/Users/$WINUSER/laurel-dev (C:\Users\$WINUSER\laurel-dev)
 #   --config     more Tauri settings merged over the others (tests: another version
 #                or update channel)
+#
+# Also writes target/laurel-pdb/Laurel-<version>-pdb.zip: the PDBs of the programs in
+# this installer and their SHA-256 (A19: a crash report in engine.log reads to the
+# function only with the PDB of the same build). It stays private: the release
+# uploads it to the private repository, never to the public one.
 set -euo pipefail
 
 # The Windows user, unless WINUSER says otherwise.
@@ -91,3 +96,22 @@ setup=$(ls -t target/$TARGET/release/bundle/nsis/Laurel_*_x64-setup.exe | head -
 mkdir -p "$out"
 cp "$setup" "$out/"
 echo "[installer] $out/$(basename "$setup") ($(stat -c %s "$setup") bytes, SHA-256 $(sha256sum "$setup" | cut -d' ' -f1))"
+
+version=$(basename "$setup" | sed -E 's/^Laurel_(.*)_x64-setup\.exe$/\1/')
+mkdir -p target/laurel-pdb
+pdbzip=target/laurel-pdb/Laurel-$version-pdb.zip
+python3 -I - "target/$TARGET/release" "$pdbzip" <<'PY'
+import hashlib, os, sys, zipfile
+release, archive = sys.argv[1], sys.argv[2]
+programs = ["laurel-app", "laurel-engine", "laurel-steam"]
+with zipfile.ZipFile(archive + ".tmp", "w", zipfile.ZIP_DEFLATED) as z:
+    sums = ""
+    for program in programs:
+        with open(os.path.join(release, program + ".exe"), "rb") as f:
+            sums += f"{hashlib.sha256(f.read()).hexdigest()}  {program}.exe\n"
+        pdb = program.replace("-", "_") + ".pdb"
+        z.write(os.path.join(release, pdb), pdb)
+    z.writestr("SHA256SUMS", sums)
+os.replace(archive + ".tmp", archive)
+PY
+echo "[installer] $pdbzip ($(stat -c %s "$pdbzip") bytes): the PDBs of this build, private"

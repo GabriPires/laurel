@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::obs::{
-    clear_output_channel, cstr, ffi, opt_string, watch_audio_events, watch_shared_texture_failures, AudioEvent, Data, Encoder, Obs, Output, Scene, SharedSource,
-    Source,
+    clear_output_channel, cstr, ffi, list_source_property, opt_string, watch_audio_events, watch_shared_texture_failures, AudioEvent, Data, Encoder, Obs, Output,
+    Scene, SharedSource, Source,
 };
 
 const VIDEO_CHANNEL: u32 = 0;
@@ -33,8 +33,8 @@ const MIC_TRACK: u32 = 1 << 2;
 
 /// E_ACCESSDENIED: Windows' privacy settings keep the microphone from desktop apps.
 const ACCESS_DENIED: &str = "80070005";
-/// A denied microphone leaves its channel, which ends OBS's tries every 3 s, and is
-/// tried again after this long, the wait doubling up to MIC_RETRY_MAX.
+/// A denied microphone is closed, which ends OBS's tries every 3 s, and is tried
+/// again after this long, the wait doubling up to MIC_RETRY_MAX.
 const MIC_RETRY_FIRST: Duration = Duration::from_secs(60);
 const MIC_RETRY_MAX: Duration = Duration::from_secs(300);
 
@@ -89,72 +89,231 @@ impl TextureWatch {
     }
 }
 
-/// Follows the microphone's device (A16 of the stability tests): reports its state to
-/// the app ("starting", "ok", "failed" or "denied", with the Windows error) and,
-/// while Windows denies it, keeps it off its channel between tries. Runs on its own
-/// thread: OBS logs from the source's thread, which the channel change waits for.
-fn spawn_mic_watch(mic: SharedSource, events: Receiver<AudioEvent>, state: Arc<Mutex<Value>>) -> JoinHandle<()> {
-    std::thread::spawn(move || {
-        // The last Windows error: OBS logs it only on the first failure in a row.
-        let mut code: Option<String> = None;
-        let mut wait = MIC_RETRY_FIRST;
-        let mut retry_at: Option<Instant> = None;
-        let report = |now: &str, code: &Option<String>| {
-            let value = json!({ "state": now, "code": code });
-            let mut current = state.lock().unwrap();
-            if *current != value {
-                log!("[laurel] microphone {now}{}", code.as_ref().map_or(String::new(), |c| format!(" ({c})")));
-                *current = value.clone();
-                crate::rpc::notify("microphone", value);
+/// What the microphone's thread waits for besides OBS's lines and the orders.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MicTimer {
+    /// Windows denies the microphone (A16): try again then.
+    Denied,
+    /// The chosen device is not connected: look for it again then.
+    Missing,
+}
+
+/// How often a microphone that is not connected is looked for while it should be open.
+const MIC_LOOK_AGAIN: Duration = Duration::from_secs(10);
+
+/// Whether a microphone device is connected: the chosen one, or any for "default".
+/// OBS lists its own "default" item first.
+fn mic_connected(device: &str) -> bool {
+    let devices = list_source_property("wasapi_input_capture", "device_id");
+    if device == "default" {
+        devices.iter().any(|(_, id)| id != "default")
+    } else {
+        devices.iter().any(|(_, id)| id == device)
+    }
+}
+
+/// The microphone (spec audio.mic) as its own thread sees it. OBS opens a WASAPI
+/// device when its source is created and lets it go only when the source is
+/// destroyed; taking the source off its channel only stops OBS's tries. So this
+/// thread alone creates and destroys the microphone's source, which exists only
+/// while the microphone should be open (A20 of the stability tests): the player's
+/// switch is on, the recorder records a game or the screen, Windows does not deny it
+/// (A16) and its device is connected. An open Bluetooth headset microphone puts the
+/// headset in call mode.
+struct Mic {
+    enabled: bool,
+    device: String,
+    recording: bool,
+    mixers: u32,
+    source: Option<Source>,
+    /// The last Windows error: OBS logs it only on the first failure in a row.
+    code: Option<String>,
+    /// The wait before the next try while Windows denies it.
+    wait: Duration,
+    timer: Option<(Instant, MicTimer)>,
+    state: Arc<Mutex<Value>>,
+}
+
+impl Mic {
+    /// Tells the app the microphone's state ("off", "idle", "starting", "ok",
+    /// "failed", "denied" or "missing"), once per change.
+    fn report(&self, now: &str) {
+        let value = json!({ "state": now, "code": self.code, "enabled": self.enabled, "device": self.device });
+        let mut current = self.state.lock().unwrap();
+        if *current != value {
+            log!("[laurel] microphone {now}{}", self.code.as_ref().map_or(String::new(), |c| format!(" ({c})")));
+            *current = value.clone();
+            crate::rpc::notify("microphone", value);
+        }
+    }
+
+    fn wanted(&self) -> bool {
+        self.enabled && self.recording
+    }
+
+    /// The state of a microphone closed on purpose.
+    fn report_closed(&self) {
+        self.report(if self.enabled { "idle" } else { "off" });
+    }
+
+    /// Opens the microphone if it should be open and is not: a new source on the
+    /// chosen device, unless Windows denies it (until the next try) or the device is
+    /// not connected (looked for again every MIC_LOOK_AGAIN).
+    fn open(&mut self) {
+        if self.source.is_some() || !self.wanted() || self.timer.is_some_and(|(_, t)| t == MicTimer::Denied) {
+            return;
+        }
+        if !mic_connected(&self.device) {
+            self.timer = Some((Instant::now() + MIC_LOOK_AGAIN, MicTimer::Missing));
+            self.report("missing");
+            return;
+        }
+        self.timer = None;
+        match Source::new("wasapi_input_capture", "microphone", &Data::new().str("device_id", &self.device)) {
+            Ok(source) => {
+                source.set_audio_mixers(self.mixers);
+                source.set_output_channel(MIC_CHANNEL);
+                self.source = Some(source);
+                log!("[laurel] microphone open ({})", self.device);
+                self.report("starting");
             }
+            Err(e) => {
+                log!("[laurel] microphone: {e}");
+                self.report("failed");
+            }
+        }
+    }
+
+    /// Closes the microphone: its source goes, and with it OBS's hold on the device.
+    fn close(&mut self, why: &str) {
+        if let Some(source) = self.source.take() {
+            clear_output_channel(MIC_CHANNEL);
+            drop(source);
+            log!("[laurel] microphone closed: {why}");
+        }
+    }
+
+    fn handle(&mut self, event: AudioEvent) {
+        match event {
+            AudioEvent::Recording(on) => {
+                if on == self.recording {
+                    return;
+                }
+                self.recording = on;
+                // Each new recording tries a denied microphone once more.
+                self.timer = None;
+                if on {
+                    self.open();
+                } else {
+                    self.close("not recording");
+                    self.report_closed();
+                }
+            }
+            AudioEvent::Choice { enabled, device } => {
+                let moved = device != self.device;
+                self.enabled = enabled;
+                self.device = device;
+                if moved || !enabled {
+                    self.close(if enabled { "another device" } else { "switched off" });
+                    self.timer = None;
+                    self.code = None;
+                    self.wait = MIC_RETRY_FIRST;
+                }
+                log!("[laurel] microphone {} ({})", if enabled { "on" } else { "off" }, self.device);
+                if self.wanted() {
+                    self.open();
+                } else {
+                    self.report_closed();
+                }
+            }
+            AudioEvent::Mixers(mask) => {
+                self.mixers = mask;
+                if let Some(source) = &self.source {
+                    source.set_audio_mixers(mask);
+                }
+            }
+            AudioEvent::Retry => {
+                self.wait = MIC_RETRY_FIRST;
+                self.timer = None;
+                log!("[laurel] microphone: trying again (asked)");
+                self.close("trying again");
+                if self.wanted() {
+                    self.open();
+                } else {
+                    self.report_closed();
+                }
+            }
+            AudioEvent::Failed { source, code } if source == "microphone" => {
+                if self.source.is_none() {
+                    return; // a line from a source already closed
+                }
+                if code.is_some() {
+                    self.code = code;
+                }
+                if self.code.as_deref() == Some(ACCESS_DENIED) {
+                    self.close("Windows denies it");
+                    log!("[laurel] microphone: Windows denies it; next try in {} s", self.wait.as_secs());
+                    self.timer = Some((Instant::now() + self.wait, MicTimer::Denied));
+                    self.wait = (self.wait * 2).min(MIC_RETRY_MAX);
+                    self.report("denied");
+                } else if !mic_connected(&self.device) {
+                    // OBS would try a device that is gone every 3 s, a log line each.
+                    self.close("device not connected");
+                    self.timer = Some((Instant::now() + MIC_LOOK_AGAIN, MicTimer::Missing));
+                    self.report("missing");
+                } else {
+                    self.report("failed");
+                }
+            }
+            AudioEvent::Started { source } if source == "microphone" => {
+                if self.source.is_none() {
+                    return;
+                }
+                self.code = None;
+                self.wait = MIC_RETRY_FIRST;
+                self.timer = None;
+                self.report("ok");
+            }
+            _ => {}
+        }
+    }
+
+    fn timeout(&mut self) {
+        if let Some((_, MicTimer::Denied)) = self.timer.take() {
+            log!("[laurel] microphone: trying again (timer)");
+        }
+        self.open();
+    }
+}
+
+/// Starts the microphone's thread (see Mic), closed until the recorder says it
+/// records. It ends when the recorder drops its sender and the log watch stops.
+fn spawn_microphone(enabled: bool, device: String, events: Receiver<AudioEvent>, state: Arc<Mutex<Value>>) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut mic = Mic {
+            enabled,
+            device,
+            recording: false,
+            mixers: MIC_TRACK | MIX_TRACK,
+            source: None,
+            code: None,
+            wait: MIC_RETRY_FIRST,
+            timer: None,
+            state,
         };
-        let try_again = |why: &str| {
-            log!("[laurel] microphone: trying again ({why})");
-            mic.set_output_channel(MIC_CHANNEL);
-        };
+        mic.report_closed();
         loop {
-            let event = match retry_at {
-                Some(at) => events.recv_timeout(at.saturating_duration_since(Instant::now())),
+            let event = match mic.timer {
+                Some((at, _)) => events.recv_timeout(at.saturating_duration_since(Instant::now())),
                 None => events.recv().map_err(|_| RecvTimeoutError::Disconnected),
             };
             match event {
-                Ok(AudioEvent::Failed { source, code: error }) if source == "microphone" => {
-                    if error.is_some() {
-                        code = error;
-                    }
-                    if code.as_deref() != Some(ACCESS_DENIED) {
-                        report("failed", &code);
-                        continue;
-                    }
-                    // A try that was already under way may still log once: the
-                    // microphone is off its channel already.
-                    if retry_at.is_none() {
-                        clear_output_channel(MIC_CHANNEL);
-                        log!("[laurel] microphone off its channel: Windows denies it; next try in {} s", wait.as_secs());
-                        retry_at = Some(Instant::now() + wait);
-                        wait = (wait * 2).min(MIC_RETRY_MAX);
-                    }
-                    report("denied", &code);
-                }
-                Ok(AudioEvent::Started { source }) if source == "microphone" => {
-                    code = None;
-                    wait = MIC_RETRY_FIRST;
-                    retry_at = None;
-                    report("ok", &code);
-                }
-                Ok(AudioEvent::Retry) => {
-                    wait = MIC_RETRY_FIRST;
-                    retry_at = None;
-                    try_again("asked");
-                }
-                Ok(_) => {}
-                Err(RecvTimeoutError::Timeout) => {
-                    retry_at = None;
-                    try_again("timer");
-                }
+                Ok(event) => mic.handle(event),
+                Err(RecvTimeoutError::Timeout) => mic.timeout(),
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
+        mic.close("engine stopping");
     })
 }
 
@@ -289,7 +448,12 @@ pub struct RecorderConfig {
     pub mix: AudioMix,
     /// Tests: bind the game audio to this window spec from the start.
     pub game_audio: Option<String>,
+    /// Whether there is a microphone track at all (tests run without one).
     pub mic: bool,
+    /// The player's microphone switch and device, "default" for Windows' default
+    /// communications device (spec audio.mic).
+    pub mic_enabled: bool,
+    pub mic_device: String,
     pub clips_dir: PathBuf,
     pub output_size: (u32, u32),
     /// The canvas the capture is fitted into.
@@ -308,7 +472,6 @@ pub struct Recorder {
     video: Option<Encoder>,
     _encoders: Vec<Encoder>,
     game_audio: Option<Source>,
-    mic: Option<Source>,
     /// Exists only while the mix is `AudioMix::PcMic`.
     pc_audio: Option<Source>,
     mix: AudioMix,
@@ -328,11 +491,16 @@ pub struct Recorder {
     /// Game captures that may move to shared memory (A13), and the thread doing it.
     textures: Arc<TextureWatch>,
     texture_thread: Option<JoinHandle<()>>,
-    /// The microphone's state for the app (A16), the way to ask its thread for
-    /// another try, and that thread.
+    /// The microphone's state for the app (A16), the way to give its thread orders
+    /// (see Mic), and that thread.
     mic_state: Arc<Mutex<Value>>,
     mic_tx: Option<Sender<AudioEvent>>,
     mic_thread: Option<JoinHandle<()>>,
+    /// The player's microphone switch and device, and whether the microphone's
+    /// thread was last told that the recorder records (A20).
+    mic_enabled: bool,
+    mic_device: String,
+    mic_recording: bool,
     saved_tx: *mut Sender<()>,
     saved_rx: Receiver<()>,
     output_size: (u32, u32),
@@ -372,7 +540,6 @@ impl Recorder {
                 video: None,
                 _encoders: vec![],
                 game_audio: None,
-                mic: None,
                 pc_audio: None,
                 mix: cfg.mix,
                 desktop_audio: false,
@@ -388,6 +555,9 @@ impl Recorder {
                 mic_state: Arc::new(Mutex::new(json!({ "state": "off" }))),
                 mic_tx: None,
                 mic_thread: None,
+                mic_enabled: false,
+                mic_device: cfg.mic_device.clone(),
+                mic_recording: false,
                 saved_tx,
                 saved_rx,
                 output_size: cfg.output_size,
@@ -416,18 +586,15 @@ impl Recorder {
             game_audio = Some(source);
             track_masks.push(GAME_TRACK);
         }
-        let mut mic = None;
         let mic_state = Arc::new(Mutex::new(json!({ "state": if cfg.mic { "starting" } else { "off" } })));
         let (mut mic_tx, mut mic_thread) = (None, None);
         if cfg.mic {
-            // Watch the log first: the device starts on its own thread right away.
+            // The microphone opens only while the recorder records (A20); its thread
+            // follows OBS's lines about it from then on.
             let (tx, rx) = channel();
             watch_audio_events(Some(tx.clone()));
-            let source = Source::new("wasapi_input_capture", "microphone", &Data::new().str("device_id", "default"))?;
-            mic_thread = Some(spawn_mic_watch(SharedSource::of(&source), rx, mic_state.clone()));
+            mic_thread = Some(spawn_microphone(cfg.mic_enabled, cfg.mic_device.clone(), rx, mic_state.clone()));
             mic_tx = Some(tx);
-            source.set_output_channel(MIC_CHANNEL);
-            mic = Some(source);
             track_masks.push(MIC_TRACK);
         }
 
@@ -457,7 +624,6 @@ impl Recorder {
             video: None,
             _encoders: encoders,
             game_audio,
-            mic,
             pc_audio: None,
             mix: cfg.mix,
             desktop_audio: cfg.desktop_audio,
@@ -473,6 +639,9 @@ impl Recorder {
             mic_state,
             mic_tx,
             mic_thread,
+            mic_enabled: cfg.mic_enabled,
+            mic_device: cfg.mic_device.clone(),
+            mic_recording: false,
             saved_tx,
             saved_rx,
             output_size: cfg.output_size,
@@ -486,6 +655,7 @@ impl Recorder {
         if !cfg.start_paused {
             rec.start_output()?;
         }
+        rec.follow_recording();
         Ok(rec)
     }
 
@@ -567,13 +737,34 @@ impl Recorder {
 
     /// Starts or stops the replay buffer; the capture keeps running.
     pub fn set_recording(&mut self, enabled: bool) -> Result<(), String> {
-        match (enabled, self.output()?.active()) {
-            (true, false) => self.start_output()?,
-            (false, true) => self.output()?.stop(),
-            _ => {}
-        }
+        let result = match (enabled, self.output()?.active()) {
+            (true, false) => self.start_output(),
+            (false, true) => {
+                self.output()?.stop();
+                Ok(())
+            }
+            _ => Ok(()),
+        };
+        self.follow_recording();
+        result?;
         log!("[laurel] recording {}", if enabled { "resumed" } else { "paused" });
         Ok(())
+    }
+
+    /// Tells the microphone's thread whether the recorder records a game or the
+    /// screen: the microphone is open only then (A20 of the stability tests).
+    fn follow_recording(&mut self) {
+        let now = self.active() && !matches!(self.target, Capture::None);
+        if now != self.mic_recording {
+            self.mic_recording = now;
+            self.send_mic(AudioEvent::Recording(now));
+        }
+    }
+
+    fn send_mic(&self, event: AudioEvent) {
+        if let Some(tx) = &self.mic_tx {
+            let _ = tx.send(event);
+        }
     }
 
     /// The game being captured, if the game capture source is hooked.
@@ -581,8 +772,9 @@ impl Recorder {
         self.game.game.lock().unwrap().clone()
     }
 
-    /// The microphone's state: `{ "state": "off" | "starting" | "ok" | "failed" |
-    /// "denied", "code": <Windows error> }` (A16).
+    /// The microphone's state: `{ "state": "off" | "idle" | "starting" | "ok" |
+    /// "failed" | "denied" | "missing", "code": <Windows error>, "enabled", "device" }`
+    /// (A16, A20; "idle": closed while nothing is recorded).
     pub fn microphone(&self) -> Value {
         self.mic_state.lock().unwrap().clone()
     }
@@ -590,7 +782,24 @@ impl Recorder {
     /// Tries the microphone again now (the player allowed it in Windows' settings).
     pub fn retry_microphone(&self) -> Result<(), String> {
         let tx = self.mic_tx.as_ref().ok_or("no microphone")?;
-        tx.send(AudioEvent::Retry).map_err(|_| "the microphone watch stopped".to_string())
+        tx.send(AudioEvent::Retry).map_err(|_| "the microphone thread stopped".to_string())
+    }
+
+    /// The player's microphone switch and device (spec audio.mic): applies to the
+    /// running recording, without a restart.
+    pub fn set_microphone(&mut self, enabled: Option<bool>, device: Option<String>) -> Result<(), String> {
+        let tx = self.mic_tx.as_ref().ok_or("no microphone (--no-mic)")?;
+        let device = device.map(|d| d.trim().to_string()).filter(|d| !d.is_empty());
+        let (enabled, device) = (enabled.unwrap_or(self.mic_enabled), device.unwrap_or_else(|| self.mic_device.clone()));
+        tx.send(AudioEvent::Choice { enabled, device: device.clone() }).map_err(|_| "the microphone thread stopped".to_string())?;
+        self.mic_enabled = enabled;
+        self.mic_device = device;
+        Ok(())
+    }
+
+    /// The player's microphone switch and device.
+    pub fn microphone_choice(&self) -> Value {
+        json!({ "enabled": self.mic_enabled, "device": self.mic_device })
     }
 
     /// The process (or test window) the game audio follows, if any.
@@ -632,6 +841,7 @@ impl Recorder {
                 }
             }
         }
+        self.follow_recording();
         Ok(())
     }
 
@@ -731,9 +941,7 @@ impl Recorder {
         if let Some(game) = &self.game_audio {
             game.set_audio_mixers(GAME_TRACK | if mix == AudioMix::PcMic { 0 } else { MIX_TRACK });
         }
-        if let Some(mic) = &self.mic {
-            mic.set_audio_mixers(MIC_TRACK | if mix == AudioMix::Game { 0 } else { MIX_TRACK });
-        }
+        self.send_mic(AudioEvent::Mixers(MIC_TRACK | if mix == AudioMix::Game { 0 } else { MIX_TRACK }));
         self.mix = mix;
         log!("[laurel] audio mix {} (track 1)", mix.name());
         Ok(())

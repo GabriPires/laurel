@@ -137,6 +137,7 @@ extern "system" {
     fn GetMessageW(msg: *mut Msg, hwnd: isize, min: u32, max: u32) -> i32;
     fn DispatchMessageW(msg: *const Msg) -> isize;
     fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
+    fn SendMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
     fn RegisterRawInputDevices(devices: *const RawInputDevice, count: u32, size: u32) -> i32;
     fn GetRawInputData(input: isize, command: u32, data: *mut c_void, size: *mut u32, header_size: u32) -> u32;
     fn GetRawInputDeviceInfoW(device: isize, command: u32, data: *mut c_void, size: *mut u32) -> u32;
@@ -446,7 +447,7 @@ pub fn make_overlay(hwnd: isize, capturable: bool) -> Result<(), String> {
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (ex & !WS_EX_APPWINDOW) | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST);
         if !capturable && SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) == 0 {
-            return Err("SetWindowDisplayAffinity failed".into());
+            return Err(format!("SetWindowDisplayAffinity failed (error {})", GetLastError()));
         }
     }
     Ok(())
@@ -927,4 +928,146 @@ pub fn process_path(pid: u32) -> Option<String> {
 /// Plays a WAV image asynchronously; the image must outlive the playback.
 pub fn play_wav(wav: &'static [u8]) {
     unsafe { PlaySoundW(wav.as_ptr().cast(), 0, SND_MEMORY | SND_ASYNC | SND_NODEFAULT) };
+}
+
+const WM_QUERYENDSESSION: u32 = 0x0011;
+const WM_ENDSESSION: u32 = 0x0016;
+const WS_POPUP: u32 = 0x8000_0000;
+const SM_SHUTTINGDOWN: i32 = 0x2000;
+const ENDSESSION_CLOSEAPP: isize = 0x0000_0001;
+const ENDSESSION_CRITICAL: isize = 0x4000_0000;
+const ENDSESSION_LOGOFF: isize = 0x8000_0000;
+/// After WM_ENDSESSION, Windows ends the app; one still running this long after
+/// it was not ended (the session went on).
+const SESSION_END_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What Windows says about the end of the session (A5).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SessionEvent {
+    /// WM_QUERYENDSESSION: Windows asks to end the session (sign-out, restart or
+    /// shutdown, or the Restart Manager closing apps), with its flags.
+    Asked(&'static str),
+    /// WM_ENDSESSION with TRUE: the session ends.
+    Ending,
+    /// WM_ENDSESSION with FALSE: an app or the user stopped the end.
+    Canceled,
+}
+
+/// 0: the session goes on; 1: asked; 2: ending (since SESSION_ENDING_AT).
+static SESSION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static SESSION_ENDING_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+static SESSION_HANDLER: std::sync::OnceLock<fn(SessionEvent)> = std::sync::OnceLock::new();
+static SESSION_WINDOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+fn session_flags(lparam: isize) -> &'static str {
+    if lparam & ENDSESSION_CLOSEAPP != 0 {
+        "an installer or Windows closing apps"
+    } else if lparam & ENDSESSION_LOGOFF != 0 {
+        "sign-out"
+    } else if lparam & ENDSESSION_CRITICAL != 0 {
+        "forced"
+    } else {
+        "restart or shutdown"
+    }
+}
+
+extern "system" fn session_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize {
+    use std::sync::atomic::Ordering;
+    let event = match msg {
+        WM_QUERYENDSESSION => {
+            SESSION.store(1, Ordering::SeqCst);
+            Some(SessionEvent::Asked(session_flags(lparam)))
+        }
+        WM_ENDSESSION if wparam != 0 => {
+            *SESSION_ENDING_AT.lock().unwrap() = Some(std::time::Instant::now());
+            SESSION.store(2, Ordering::SeqCst);
+            Some(SessionEvent::Ending)
+        }
+        WM_ENDSESSION => {
+            SESSION.store(0, Ordering::SeqCst);
+            Some(SessionEvent::Canceled)
+        }
+        _ => None,
+    };
+    match event {
+        Some(event) => {
+            if let Some(handler) = SESSION_HANDLER.get() {
+                handler(event);
+            }
+            // Laurel never holds the end of the session.
+            (msg == WM_QUERYENDSESSION) as isize
+        }
+        None => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// A5: watches the end of the Windows session from a hidden top-level window of its
+/// own thread (Windows sends WM_QUERYENDSESSION and WM_ENDSESSION to top-level
+/// windows, not to message-only ones).
+pub fn watch_session(handler: fn(SessionEvent)) -> Result<(), String> {
+    SESSION_HANDLER.set(handler).map_err(|_| "the session is already watched".to_string())?;
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    std::thread::spawn(move || {
+        let class = wide("LaurelSession");
+        let created = unsafe {
+            let instance = GetModuleHandleW(std::ptr::null());
+            let wc = WndClassExW {
+                size: std::mem::size_of::<WndClassExW>() as u32,
+                style: 0,
+                wnd_proc: session_proc,
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: std::ptr::null(),
+                class_name: class.as_ptr(),
+                icon_sm: 0,
+            };
+            if RegisterClassExW(&wc) == 0 {
+                Err("could not register the session window class".to_string())
+            } else {
+                let hwnd = CreateWindowExW(WS_EX_TOOLWINDOW as u32, class.as_ptr(), class.as_ptr(), WS_POPUP, 0, 0, 0, 0, 0, 0, instance, std::ptr::null_mut());
+                SESSION_WINDOW.store(hwnd, std::sync::atomic::Ordering::SeqCst);
+                if hwnd == 0 { Err("could not create the session window".to_string()) } else { Ok(()) }
+            }
+        };
+        let ok = created.is_ok();
+        let _ = tx.send(created);
+        if ok {
+            run_message_loop();
+        }
+    });
+    rx.recv().map_err(|e| e.to_string())?
+}
+
+/// True while Windows ends the session: from WM_QUERYENDSESSION until a
+/// WM_ENDSESSION that cancels it (or SESSION_END_GRACE after one that does not, if
+/// the app still runs), or while the system reports the session shutting down.
+pub fn session_ending() -> bool {
+    use std::sync::atomic::Ordering;
+    let ending = match SESSION.load(Ordering::SeqCst) {
+        0 => false,
+        1 => true,
+        _ => SESSION_ENDING_AT.lock().unwrap().is_none_or(|at| at.elapsed() < SESSION_END_GRACE),
+    };
+    ending || unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) } != 0
+}
+
+/// Self-test: sends the session window what Windows sends at a restart
+/// (WM_QUERYENDSESSION), or the WM_ENDSESSION of an end that was stopped.
+pub fn simulate_session_end(ask: bool) -> Result<(), String> {
+    let hwnd = SESSION_WINDOW.load(std::sync::atomic::Ordering::SeqCst);
+    if hwnd == 0 {
+        return Err("no session window".into());
+    }
+    unsafe {
+        if ask {
+            SendMessageW(hwnd, WM_QUERYENDSESSION, 0, 0);
+        } else {
+            SendMessageW(hwnd, WM_ENDSESSION, 0, 0);
+        }
+    }
+    Ok(())
 }

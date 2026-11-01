@@ -5,11 +5,12 @@
 
 pub mod ffi;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::Path;
-use std::sync::mpsc::Sender;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Sender, SyncSender};
+use std::sync::{Mutex, OnceLock};
 
 pub fn cstr(s: &str) -> CString {
     CString::new(s).expect("string without NUL")
@@ -49,6 +50,13 @@ pub enum AudioEvent {
     Started { source: String },
     /// Not from the log: the app asked for another try of the microphone.
     Retry,
+    /// Not from the log: whether the recorder records a game or the screen now; the
+    /// microphone is open only then (A20 of the stability tests).
+    Recording(bool),
+    /// Not from the log: the player's microphone switch and device (spec audio.mic).
+    Choice { enabled: bool, device: String },
+    /// Not from the log: the audio tracks the microphone goes to (the mix).
+    Mixers(u32),
 }
 
 static AUDIO_EVENTS: Mutex<Option<Sender<AudioEvent>>> = Mutex::new(None);
@@ -119,6 +127,53 @@ unsafe extern "C" fn on_log(level: i32, msg: *const c_char, args: *mut c_void, _
     }
 }
 
+/// A18: libobs hands its "UI" tasks to the host. The only one Laurel's plugins queue
+/// is win-wasapi's reset of the audio monitoring when the default output device
+/// changes, once per device role; Laurel monitors no audio, so the task does
+/// nothing, but without a handler libobs logs an error for each one. The engine runs
+/// them in order on a thread of its own, as OBS's frontend does on its UI thread.
+struct UiTask {
+    task: unsafe extern "C" fn(param: *mut c_void),
+    param: usize,
+    done: Option<SyncSender<()>>,
+}
+
+static UI_TASKS: OnceLock<Sender<UiTask>> = OnceLock::new();
+static UI_TASKS_RUN: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static ON_UI_TASK_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// libobs UI tasks run since the engine started (one is libobs marking the thread).
+pub fn ui_tasks_run() -> u64 {
+    UI_TASKS_RUN.load(Ordering::Relaxed)
+}
+
+unsafe extern "C" fn on_ui_task(task: ffi::obs_task_t, param: *mut c_void, wait: bool) {
+    let Some(task) = task else {
+        return;
+    };
+    // A task that queues another one with `wait` from the task thread runs it at once.
+    if ON_UI_TASK_THREAD.with(Cell::get) {
+        unsafe { task(param) };
+        UI_TASKS_RUN.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let (done, finished) = if wait {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let queued = UI_TASKS.get().is_some_and(|tx| tx.send(UiTask { task, param: param as usize, done }).is_ok());
+    if !queued {
+        log!("[laurel] libobs UI task not run: no task thread");
+    } else if let Some(finished) = finished {
+        let _ = finished.recv();
+    }
+}
+
 /// Owns the libobs core; dropping it shuts libobs down.
 pub struct Obs;
 
@@ -155,6 +210,7 @@ impl Obs {
         let locale = cstr(locale);
         let config = cstr(&module_config_dir.display().to_string());
         if unsafe { ffi::obs_startup(locale.as_ptr(), config.as_ptr(), std::ptr::null_mut()) } {
+            Obs::run_ui_tasks();
             Ok(Obs)
         } else {
             Err("obs_startup failed".into())
@@ -246,21 +302,7 @@ impl Obs {
     /// monitors of `monitor_capture` or devices of `wasapi_input_capture`.
     /// Integer lists report their values as decimal strings.
     pub fn source_list_property(&self, source_id: &str, property: &str) -> Vec<(String, String)> {
-        let id = cstr(source_id);
-        let name = cstr(property);
-        let mut items = Vec::new();
-        unsafe {
-            let props = ffi::obs_get_source_properties(id.as_ptr());
-            if props.is_null() {
-                return items;
-            }
-            let prop = ffi::obs_properties_get(props, name.as_ptr());
-            if !prop.is_null() {
-                items = list_items(prop);
-            }
-            ffi::obs_properties_destroy(props);
-        }
-        items
+        list_source_property(source_id, property)
     }
 
     /// The list properties of an encoder type (rate control, presets, profiles…)
@@ -330,6 +372,30 @@ unsafe fn list_items(prop: *mut ffi::obs_property_t) -> Vec<(String, String)> {
             (opt_string(ffi::obs_property_list_item_name(prop, i)).unwrap_or_default(), value)
         })
         .collect()
+}
+
+impl Obs {
+    /// Starts the UI task thread (A18) and hands it to libobs; after obs_startup.
+    fn run_ui_tasks() {
+        let (tx, rx) = std::sync::mpsc::channel::<UiTask>();
+        if UI_TASKS.set(tx).is_err() {
+            return;
+        }
+        let started = std::thread::Builder::new().name("laurel: libobs UI tasks".into()).spawn(move || {
+            ON_UI_TASK_THREAD.with(|on| on.set(true));
+            for job in rx {
+                unsafe { (job.task)(job.param as *mut c_void) };
+                UI_TASKS_RUN.fetch_add(1, Ordering::Relaxed);
+                if let Some(done) = job.done {
+                    let _ = done.send(());
+                }
+            }
+        });
+        match started {
+            Ok(_) => unsafe { ffi::obs_set_ui_task_handler(on_ui_task) },
+            Err(e) => log!("[laurel] no thread for libobs UI tasks: {e}"),
+        }
+    }
 }
 
 impl Drop for Obs {
@@ -523,11 +589,6 @@ impl SharedSource {
         unsafe { ffi::obs_source_update(self.0, settings.ptr()) }
     }
 
-    /// Routes the source to a global output channel (0 = video, 1+ = audio).
-    pub fn set_output_channel(&self, channel: u32) {
-        unsafe { ffi::obs_set_output_source(channel, self.0) }
-    }
-
     /// Another reference to the same source.
     pub fn share(&self) -> SharedSource {
         SharedSource(unsafe { ffi::obs_source_get_ref(self.0) })
@@ -538,6 +599,26 @@ impl Drop for SharedSource {
     fn drop(&mut self) {
         unsafe { ffi::obs_source_release(self.0) }
     }
+}
+
+/// The (label, value) items of a list property of a source type (see
+/// Obs::source_list_property); usable from any thread once libobs is up.
+pub fn list_source_property(source_id: &str, property: &str) -> Vec<(String, String)> {
+    let id = cstr(source_id);
+    let name = cstr(property);
+    let mut items = Vec::new();
+    unsafe {
+        let props = ffi::obs_get_source_properties(id.as_ptr());
+        if props.is_null() {
+            return items;
+        }
+        let prop = ffi::obs_properties_get(props, name.as_ptr());
+        if !prop.is_null() {
+            items = list_items(prop);
+        }
+        ffi::obs_properties_destroy(props);
+    }
+    items
 }
 
 pub fn clear_output_channel(channel: u32) {

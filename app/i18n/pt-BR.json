@@ -21,7 +21,6 @@
   "A free game clip recorder: no ads, every feature included.": "Um gravador de clipes de jogos gratuito: sem anúncios e com todos os recursos.",
   "A little after it starts, Laurel asks GitHub whether a new version exists. That is the only thing it looks up on the internet; nothing about you or your clips is sent.": "Logo depois de abrir, o Laurel pergunta ao GitHub se existe uma versão nova. É a única consulta que ele faz na internet, e nada sobre você ou seus clipes é enviado.",
   "A new version of Laurel is ready": "Uma nova versão do Laurel está pronta",
-  "A short notice in the corner of the game.": "Um aviso curto no canto do jogo.",
   "Achievement": "Conquista",
   "Achievement clip saved": "Clipe de conquista salvo",
   "Achievement: {name}": "Conquista: {name}",
@@ -553,5 +552,16 @@
   "Open privacy settings": "Abrir configurações de privacidade",
   "Try again": "Tentar de novo",
   "Microphone allowed: clips have your voice again": "Microfone liberado: os clipes voltam a ter a sua voz",
-  "Trying the microphone again": "Tentando o microfone de novo"
+  "Trying the microphone again": "Tentando o microfone de novo",
+  "Laurel stopped recording": "O Laurel parou de gravar",
+  "The recording engine failed. Open Laurel to restart it.": "O motor de gravação falhou. Abra o Laurel para reiniciá-lo.",
+  "On this PC, Windows does not let Laurel keep notices out of recordings, so only important notices show, such as a game Laurel cannot record.": "Neste PC, o Windows não deixa o Laurel tirar os avisos das gravações, então só aparecem os avisos importantes, como o de um jogo que o Laurel não consegue gravar.",
+  "A short notice in the corner of the game. Important notices, such as a game Laurel cannot record, show even when this is off.": "Um aviso curto no canto do jogo. Os avisos importantes, como o de um jogo que o Laurel não consegue gravar, aparecem mesmo com esta opção desligada.",
+  "Record my microphone": "Gravar meu microfone",
+  "Laurel opens the microphone only while it records a game, or the screen when screen recording is on.": "O Laurel só abre o microfone enquanto grava um jogo, ou a tela quando a gravação de tela está ligada.",
+  "Microphone": "Microfone",
+  "Windows default": "Padrão do Windows",
+  "Microphone not connected": "Microfone desconectado",
+  "The chosen microphone is not connected: clips go without your voice until it is.": "O microfone escolhido não está conectado: os clipes saem sem a sua voz até ele voltar.",
+  "A Bluetooth headset's microphone puts the headset in call mode, with lower sound, while Laurel records.": "O microfone de um fone Bluetooth põe o fone no modo de chamada, com som pior, enquanto o Laurel grava."
 }

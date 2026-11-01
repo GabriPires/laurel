@@ -9,6 +9,8 @@
 //! LAUREL_CAPTURE (a fixed target instead of game detection), LAUREL_OVERLAY_CAPTURABLE=1 (overlay visible to capture),
 //! LAUREL_FFMPEG (ffmpeg.exe), LAUREL_START_VIEW (library | clips | screenshots | settings[:<page>]).
 #![windows_subsystem = "windows"]
+// The settings JSON (settings.rs) has more fields than json! expands by default.
+#![recursion_limit = "256"]
 
 mod detect;
 mod engine;
@@ -216,7 +218,12 @@ fn engine_config(work_dir: PathBuf, storage: Arc<Storage>, detector: Arc<Detecto
             s.clip_secs.to_string(),
             "--mix".into(),
             s.audio_mix.clone(),
+            "--mic-device".into(),
+            s.mic_device.clone(),
         ]);
+        if !s.mic_enabled {
+            options.push("--mic-off".into());
+        }
         if s.video_height > 0 && s.video_height < h {
             options.extend(["--out".into(), format!("{}x{}", w * s.video_height / h, s.video_height)]);
         }
@@ -371,7 +378,7 @@ fn watch_disk(app: AppHandle) {
             let notifier = app.state::<Notifier>();
             if pause {
                 log!("disk almost full ({free_gb:.1} GB free): recording paused");
-                notifier.notify(Kind::Error, &t!("Recording paused"), &t!("Disk almost full ({free} GB free). Free up space to keep recording.", free = i18n::number(free_gb, 1)));
+                notifier.notify_critical(&t!("Recording paused"), &t!("Disk almost full ({free} GB free). Free up space to keep recording.", free = i18n::number(free_gb, 1)));
             } else {
                 log!("disk space back ({free_gb:.1} GB free): recording resumed");
                 notifier.notify(Kind::Info, &t!("Recording resumed"), &t!("{free} GB free on the capture drive", free = i18n::number(free_gb, 1)));
@@ -416,6 +423,11 @@ fn watch_engine_state(app: &AppHandle) {
             }
         } else if *previous == "ready" && now != "ready" && state["closing"] != true && state["restart"] != true {
             notifier.notify(Kind::Error, &t!("Recording stopped"), &state["message"].as_str().map_or_else(|| t!("The engine stopped"), String::from));
+        }
+        // A15: the supervisor gave up on the engine; nothing records until the player
+        // restarts it, so this shows over the game even with notices off.
+        if now == "failed" && *previous != "failed" {
+            notifier.notify_critical(&t!("Laurel stopped recording"), &t!("The recording engine failed. Open Laurel to restart it."));
         }
         *previous = now;
     });
@@ -472,8 +484,17 @@ async fn engine_request(engine: tauri::State<'_, Engine>, method: String, params
 #[tauri::command]
 fn microphone_state(app: AppHandle) -> Value {
     let mut state = app.state::<Engine>().microphone();
-    state["mix"] = json!(app.state::<Arc<Store>>().get().audio_mix);
+    let settings = app.state::<Arc<Store>>().get();
+    state["mix"] = json!(settings.audio_mix);
+    state["chosen"] = json!({ "enabled": settings.mic_enabled, "device": settings.mic_device });
     state
+}
+
+/// Whether this PC keeps the overlay out of screen capture; without it only
+/// critical notices show (A10 and A15 of the stability tests).
+#[tauri::command]
+fn overlay_status(notifier: tauri::State<'_, Notifier>) -> Value {
+    json!({ "excluded": notifier.excluded() })
 }
 
 /// Opens Windows' microphone privacy page, where desktop apps get the microphone.
@@ -535,6 +556,7 @@ fn set_settings(app: AppHandle, settings: Value) -> Result<Value, String> {
     let language_changed = new.language != current.language;
     let fewer_days = new.deleted_days < current.deleted_days;
     let mix_changed = new.audio_mix != current.audio_mix;
+    let mic_changed = (new.mic_enabled, &new.mic_device) != (current.mic_enabled, &current.mic_device);
     let screen = detect::screen_of(&new);
     store.set(new.clone()).map_err(|e| e.to_string())?;
     log!("settings: {}", new.to_json());
@@ -564,7 +586,14 @@ fn set_settings(app: AppHandle, settings: Value) -> Result<Value, String> {
             log!("setAudioMix failed: {e}");
         }
     }
-    if mix_changed {
+    if mic_changed && !video_changed {
+        // Spec audio.mic: the switch and the device apply without a restart; a
+        // restarted engine gets --mic-device and --mic-off.
+        if let Err(e) = app.state::<Engine>().request("setMicrophone", json!({ "enabled": new.mic_enabled, "device": new.mic_device }), SHOT_TIMEOUT) {
+            log!("setMicrophone failed: {e}");
+        }
+    }
+    if mix_changed || mic_changed {
         // A16: the window's microphone warning depends on whether track 1 has it.
         let _ = app.emit("microphone", Value::Null);
     }
@@ -1159,6 +1188,16 @@ fn watch_tray(app: AppHandle) {
     });
 }
 
+/// A5: what Windows says about the end of the session goes to app.log; the engine
+/// supervisor reads `win::session_ending`.
+fn on_session(event: win::SessionEvent) {
+    match event {
+        win::SessionEvent::Asked(why) => log!("Windows asks to end the session ({why})"),
+        win::SessionEvent::Ending => log!("Windows is ending the session"),
+        win::SessionEvent::Canceled => log!("Windows did not end the session"),
+    }
+}
+
 /// Scripted end-to-end check for development: clip, screenshot, engine crash and
 /// restart, clip again. Writes "selftest: PASS" or "selftest: FAIL ..." to app.log.
 fn selftest(app: AppHandle) {
@@ -1205,12 +1244,16 @@ fn selftest(app: AppHandle) {
         log!("[selftest] screenshot ok: {}", engine.request("screenshot", Value::Null, SHOT_TIMEOUT)?);
         check_video(&app, &engine, &wait_ready)?;
         check_audio(&app, &engine)?;
+        check_microphone(&app, &engine)?;
         log!("[selftest] targets: {}", engine.request("listTargets", Value::Null, SHOT_TIMEOUT)?);
         log!("[selftest] status: {}", engine.request("status", Value::Null, SHOT_TIMEOUT)?);
+        let log_start = engine_log_len();
         log!("[selftest] killing the engine");
         engine.kill();
         std::thread::sleep(Duration::from_millis(500));
         wait_ready("after the restart")?;
+        check_crash_report(&engine, &wait_ready, log_start)?;
+        check_session_end(&engine, &wait_ready)?;
         std::thread::sleep(Duration::from_secs(4));
         clip()?;
         check_games(&app, &engine)?;
@@ -1225,6 +1268,99 @@ fn selftest(app: AppHandle) {
         Err(e) => log!("selftest: FAIL {e}"),
     }
     quit(&app);
+}
+
+/// Size of engine.log now, to read what is written after.
+fn engine_log_len() -> u64 {
+    log::dir().and_then(|d| std::fs::metadata(d.join("engine.log")).ok()).map_or(0, |m| m.len())
+}
+
+/// What engine.log got since it was `start` bytes long, with the part in
+/// engine.old.log if it rotated meanwhile.
+fn engine_log_since(start: u64) -> String {
+    let Some(dir) = log::dir() else {
+        return String::new();
+    };
+    let current = std::fs::read(dir.join("engine.log")).unwrap_or_default();
+    let bytes = match current.get(start as usize..) {
+        Some(tail) => tail.to_vec(),
+        None => {
+            let old = std::fs::read(dir.join("engine.old.log")).unwrap_or_default();
+            [old.get(start as usize..).unwrap_or_default(), &current].concat()
+        }
+    };
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Self-test of A19: engine.log tells how each engine ended (the one the self-test
+/// just killed, exit code 1), and an engine that crashes leaves there the exception,
+/// where it happened and its stack before the supervisor restarts it. The crash is
+/// a deliberate access violation (the "crash" request), which ends without a Windows
+/// Error Reporting report.
+fn check_crash_report(engine: &Engine, wait_ready: &dyn Fn(&str) -> Result<(), String>, log_start: u64) -> Result<(), String> {
+    if engine.request("crash", Value::Null, SHOT_TIMEOUT).is_ok() {
+        return Err("the engine answered the crash request".into());
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while engine.state()["state"] == "ready" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    wait_ready("after the crash")?;
+    let text = engine_log_since(log_start);
+    let lines: Vec<&str> = text.lines().filter(|l| l.contains("==== engine exited") || l.contains("[laurel] crash:")).collect();
+    let frames = lines.iter().filter(|l| l.contains("crash: called from")).count();
+    let first = lines.iter().find(|l| l.contains("unhandled exception")).copied().unwrap_or_default();
+    let exits: Vec<&str> = lines.iter().filter_map(|l| l.split_once("==== engine exited: ").map(|(_, e)| e)).collect();
+    log!("[selftest] crash report: {first:?}, {frames} return addresses; engines ended: {exits:?}");
+    for needed in [
+        "==== engine exited: exit code 1",
+        "crash: unhandled exception 0xC0000005 (EXCEPTION_ACCESS_VIOLATION)",
+        " at laurel-engine.exe+0x",
+        ", writing 0x0000000000000008",
+        "crash: called from laurel-engine.exe+0x",
+        "crash: thread name: main",
+        "crash: end of report",
+        "==== engine exited: exit code 0xC0000005 (STATUS_ACCESS_VIOLATION)",
+    ] {
+        if !lines.iter().any(|l| l.contains(needed)) {
+            return Err(format!("engine.log has no \"{needed}\""));
+        }
+    }
+    Ok(())
+}
+
+/// Self-test of A5: while Windows ends the session (the WM_QUERYENDSESSION it sends
+/// at a restart, sent here to the app's session window), an engine that ends is not
+/// started again; once the end is stopped (WM_ENDSESSION with FALSE), it is.
+fn check_session_end(engine: &Engine, wait_ready: &dyn Fn(&str) -> Result<(), String>) -> Result<(), String> {
+    let before = win::session_ending();
+    win::simulate_session_end(true)?;
+    let asked = win::session_ending();
+    engine.kill();
+    let waiting = |secs: u64| {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            let state = engine.state();
+            if state["state"] == "stopped" && state["message"] == "Windows is ending the session" {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let stopped = waiting(5);
+    std::thread::sleep(Duration::from_secs(3));
+    let still = waiting(0);
+    win::simulate_session_end(false)?;
+    let after = win::session_ending();
+    wait_ready("after the end of the session was stopped")?;
+    log!("[selftest] session end: ending before {before}, asked {asked}; engine waiting {stopped}, still after 3 s {still}; end stopped {}, engine ready", !after);
+    if before || !asked || !stopped || !still || after {
+        return Err("the engine did not wait for the end of the session".into());
+    }
+    Ok(())
 }
 
 /// Self-test of the interface language: the Portuguese strings load, a count picks
@@ -1777,24 +1913,11 @@ fn check_video(app: &AppHandle, engine: &Engine, wait_ready: &dyn Fn(&str) -> Re
     if !adapter["index"].is_u64() || !adapter["name"].is_string() || !["only GPU", "high performance", "default", "asked"].iter().any(|r| adapter["reason"] == *r) {
         return Err(format!("the engine did not report its video adapter: {adapter}"));
     }
-    // A16: the engine reports the microphone once its device starts or fails, and
-    // takes a request for another try.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while engine.microphone()["state"] == "starting" && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let mic = engine.microphone();
-    log!("[selftest] microphone: {mic}");
-    if !["ok", "failed", "denied", "off"].iter().any(|s| mic["state"] == *s) {
-        return Err(format!("the engine did not report the microphone: {mic}"));
-    }
-    if mic["state"] != "off" {
-        log!("[selftest] microphone retry: {}", engine.request("retryMicrophone", Value::Null, SHOT_TIMEOUT)?);
-    }
     let store = app.state::<Arc<Store>>();
     let original = store.get();
     let original_mix = original.audio_mix.clone();
-    let test = Settings { video_encoder: "x264".into(), video_preset: "performance".into(), video_height: 720, video_fps: 30, clip_secs: 15, audio_mix: "pc-mic".into(), ..original.clone() };
+    let original_mic = (original.mic_enabled, original.mic_device.clone());
+    let test = Settings { video_encoder: "x264".into(), video_preset: "performance".into(), video_height: 720, video_fps: 30, clip_secs: 15, audio_mix: "pc-mic".into(), mic_enabled: false, mic_device: "laurel-selftest-mic".into(), ..original.clone() };
     // A restart is asynchronous: the old engine may still read as ready for a moment,
     // so wait for it to go before waiting for the new one.
     let restart = |what: &str| -> Result<(), String> {
@@ -1812,11 +1935,18 @@ fn check_video(app: &AppHandle, engine: &Engine, wait_ready: &dyn Fn(&str) -> Re
     let changed = result?;
     let restored = engine.state()["info"].clone();
     log!(
-        "[selftest] video settings: encoder {}, output {}, fps {}, buffer {} s, clip sound {}; restored: {}, clip sound {}",
-        changed["encoder"], changed["output"], changed["fps"], changed["bufferSecs"], changed["audioMix"], restored["encoder"], restored["audioMix"]
+        "[selftest] video settings: encoder {}, output {}, fps {}, buffer {} s, clip sound {}, microphone {}; restored: {}, clip sound {}, microphone {}",
+        changed["encoder"], changed["output"], changed["fps"], changed["bufferSecs"], changed["audioMix"], changed["microphone"], restored["encoder"], restored["audioMix"], restored["microphone"]
     );
     if changed["encoder"] != "obs_x264" || changed["output"][1] != 720 || changed["fps"] != 30 || changed["bufferSecs"] != 15 || changed["audioMix"] != "pc-mic" {
         return Err("the video settings did not reach the engine".into());
+    }
+    // Spec audio.mic: a restarted engine takes the microphone switch and device.
+    if changed["microphone"] != json!({ "enabled": false, "device": "laurel-selftest-mic" }) {
+        return Err(format!("the microphone choice did not reach the engine: {}", changed["microphone"]));
+    }
+    if restored["microphone"] != json!({ "enabled": original_mic.0, "device": original_mic.1 }) {
+        return Err(format!("the microphone choice was not restored: {}", restored["microphone"]));
     }
     if restored["audioMix"] != original_mix.as_str() {
         return Err(format!("the clip sound was not restored: {}", restored["audioMix"]));
@@ -1856,6 +1986,68 @@ fn check_audio(app: &AppHandle, engine: &Engine) -> Result<(), String> {
     let restored = set(&original);
     log!("[selftest] clip sound restored: {restored:?}");
     outcome.and(restored.map(|_| ()))
+}
+
+/// Self-test of the microphone (spec audio.mic; A16 and A20 of the stability tests):
+/// closed ("idle") while nothing is recorded, as in the self-test, open while a
+/// capture records (the screen here) and closed again without it; the switch and
+/// the device apply without a restart; a device that is not connected is reported
+/// instead of tried every 3 s; a request for another try is taken. Then the
+/// player's capture and microphone come back.
+fn check_microphone(app: &AppHandle, engine: &Engine) -> Result<(), String> {
+    let chosen = app.state::<Arc<Store>>().get();
+    let target = engine.request("status", Value::Null, SHOT_TIMEOUT)?["target"].as_str().unwrap_or("none").to_string();
+    let wait_for = |states: &[&str], secs: u64| -> Result<String, String> {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            let now = engine.microphone()["state"].as_str().unwrap_or_default().to_string();
+            if states.contains(&now.as_str()) {
+                return Ok(now);
+            }
+            if Instant::now() > deadline {
+                return Err(format!("the microphone is {now}, expected {states:?}: {}", engine.microphone()));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let set = |enabled: bool, device: &str| engine.request("setMicrophone", json!({ "enabled": enabled, "device": device }), SHOT_TIMEOUT);
+    const OPEN: &[&str] = &["ok", "failed", "denied", "missing"];
+    let outcome = (|| -> Result<(), String> {
+        set(true, "default")?;
+        let idle = wait_for(&["idle"], 5)?;
+        let mics = engine.request("listMicrophones", Value::Null, SHOT_TIMEOUT)?;
+        engine.request("setCapture", json!({ "target": "monitor:0" }), SHOT_TIMEOUT)?;
+        let open = wait_for(OPEN, 10)?;
+        let retried = if open == "missing" {
+            open.clone()
+        } else {
+            engine.request("retryMicrophone", Value::Null, SHOT_TIMEOUT)?;
+            std::thread::sleep(Duration::from_millis(300));
+            wait_for(&["ok", "failed", "denied"], 10)?
+        };
+        set(false, "default")?;
+        let off = wait_for(&["off"], 5)?;
+        set(true, "laurel-selftest-no-such-microphone")?;
+        let missing = wait_for(&["missing"], 5)?;
+        set(true, "default")?;
+        // The state read before the engine takes the change is the old one.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while engine.microphone()["device"] != "default" && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let back = wait_for(OPEN, 10)?;
+        engine.request("setCapture", json!({ "target": target }), SHOT_TIMEOUT)?;
+        let closed = wait_for(&["idle"], 5)?;
+        log!(
+            "[selftest] microphone: {} listed; no recording {idle}; recording the screen {open}, after another try {retried}; switched off {off}; a device not connected {missing}; back on {back}; capture {target} again {closed}",
+            mics.as_array().map_or(0, Vec::len)
+        );
+        Ok(())
+    })();
+    let capture = engine.request("setCapture", json!({ "target": target }), SHOT_TIMEOUT);
+    let restored = set(chosen.mic_enabled, &chosen.mic_device);
+    log!("[selftest] microphone restored: {restored:?}");
+    outcome.and(capture.map(|_| ())).and(restored.map(|_| ()))
 }
 
 /// Self-test of storage: an unwritable folder is refused; the size limit removes
@@ -2079,6 +2271,39 @@ fn check_overlay(engine: &Engine, notifier: &Notifier) -> Result<(), String> {
     if !was_visible || !(1300..=1900).contains(&ms) {
         return Err("the clip notice did not last about 1.5 s".into());
     }
+
+    // A15: with notices over games off, an ordinary notice stays hidden and a
+    // critical one (Laurel is not recording the game) shows. A10: on a PC whose
+    // overlay Windows cannot keep out of capture, only critical notices show.
+    let wait_hidden = || {
+        let start = Instant::now();
+        while win::is_visible(hwnd) && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let shows = |critical: bool, what: &str| {
+        if critical {
+            notifier.notify_critical("Laurel self-test", what);
+        } else {
+            notifier.notify(Kind::Info, "Laurel self-test", what);
+        }
+        std::thread::sleep(Duration::from_millis(400));
+        let visible = win::is_visible(hwnd);
+        wait_hidden();
+        visible
+    };
+    let settings = notifier.settings();
+    let excluded = notifier.excluded();
+    let _ = notifier.set_settings(Settings { overlay: false, ..settings.clone() });
+    let off = (shows(false, "An ordinary notice, notices off"), shows(true, "A critical notice, notices off"));
+    let _ = notifier.set_settings(settings);
+    notifier.set_excluded(false);
+    let unexcluded = (shows(false, "An ordinary notice, overlay in captures"), shows(true, "A critical notice, overlay in captures"));
+    notifier.set_excluded(excluded);
+    log!("[selftest] notices off: ordinary shown={}, critical shown={}; overlay in captures: ordinary shown={}, critical shown={}", off.0, off.1, unexcluded.0, unexcluded.1);
+    if off != (false, true) || unexcluded != (false, true) {
+        return Err("critical notices did not show alone (see the line above)".into());
+    }
     Ok(())
 }
 
@@ -2127,6 +2352,7 @@ fn main() {
             engine_restart,
             microphone_state,
             open_microphone_privacy,
+            overlay_status,
             get_settings,
             set_settings,
             preview_notice,
@@ -2176,6 +2402,9 @@ fn main() {
             log::init(&work_dir.join("logs"))?;
             log!("Laurel {} starting; work dir {}; administrator: {}", app.package_info().version, work_dir.display(), win::self_elevated());
             listen_for_show(app.handle());
+            if let Err(e) = win::watch_session(on_session) {
+                log!("session end not watched: {e}");
+            }
             let store = Arc::new(Store::open(&work_dir.join("settings.json")));
             app.manage(store.clone());
             i18n::set(&store.get().language);

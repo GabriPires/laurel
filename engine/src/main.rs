@@ -21,7 +21,10 @@
 //!                               PC audio and microphone; track 2 is the game, track 3 the mic
 //!   --game-audio SPEC           tests: game audio from this window spec from the start
 //!   --no-desktop-audio          no game or PC audio
-//!   --no-mic, --no-cursor
+//!   --mic-device ID             microphone device, from --list (default: Windows' default
+//!                               communications device)
+//!   --mic-off                   the microphone stays closed until setMicrophone turns it on
+//!   --no-mic, --no-cursor       --no-mic: no microphone track at all (tests)
 //!   --no-output                 capture only: no audio, encoders or replay buffer
 //!   --paused                    build the replay buffer but do not start it (the app
 //!                               starts it with setRecording when it finds a game)
@@ -30,9 +33,11 @@
 //!   --clips-dir DIR, --screenshots-dir DIR  (default <work-dir>\clips and \screenshots)
 //!   --script "cmd; cmd; ..."    commands: wait N | save | screenshot | stats | beep N |
 //!                               capture <monitor[:N[:method]]|window:..|game[:..]> |
-//!                               mix <game|game-mic|pc-mic> | probe [on|off] | mic [retry] | quit
+//!                               mix <game|game-mic|pc-mic> | probe [on|off] |
+//!                               mic [retry|on|off|device <id>] | mics | crash | quit
 //!                               (without --script or --rpc, commands are read from stdin)
-//! Logs (libobs and the engine's own) always go to stderr.
+//! Logs (libobs and the engine's own) always go to stderr, and so does the report of
+//! an unhandled exception (crash.rs; `crash` and the `crash` request cause one, for tests).
 //!
 //! libobs and its plugins come from Laurel's own OBS runtime, staged by
 //! tools/obs-runtime.py: the engine runs from `<runtime>\bin\64bit`, next to obs.dll.
@@ -48,6 +53,7 @@ macro_rules! log {
     }};
 }
 
+mod crash;
 mod gpu;
 mod obs;
 mod recorder;
@@ -86,6 +92,8 @@ struct Args {
     mix: AudioMix,
     game_audio: Option<String>,
     mic: bool,
+    mic_enabled: bool,
+    mic_device: String,
     cursor: bool,
     record: bool,
     paused: bool,
@@ -255,6 +263,8 @@ fn parse_args() -> Result<Args, String> {
         mix: AudioMix::GameMic,
         game_audio: None,
         mic: true,
+        mic_enabled: true,
+        mic_device: "default".into(),
         cursor: true,
         record: true,
         paused: false,
@@ -289,6 +299,8 @@ fn parse_args() -> Result<Args, String> {
             }
             "--game-audio" => a.game_audio = Some(value()?),
             "--no-mic" => a.mic = false,
+            "--mic-off" => a.mic_enabled = false,
+            "--mic-device" => a.mic_device = Some(value()?.trim().to_string()).filter(|d| !d.is_empty()).unwrap_or_else(|| "default".into()),
             "--no-cursor" => a.cursor = false,
             "--no-output" => a.record = false,
             "--paused" => a.paused = true,
@@ -304,6 +316,8 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() {
+    // A19: an unhandled exception leaves its code, place and stack in engine.log.
+    crash::install();
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
@@ -505,6 +519,8 @@ fn run(args: Args) -> Result<(), String> {
         mix: args.mix,
         game_audio: args.game_audio.clone(),
         mic: args.mic,
+        mic_enabled: args.mic_enabled,
+        mic_device: args.mic_device.clone(),
         clips_dir: clips_dir.clone(),
         output_size: out,
         canvas: args.base,
@@ -514,8 +530,8 @@ fn run(args: Args) -> Result<(), String> {
     let started = Instant::now();
     let mut rec = Recorder::start(&obs, &cfg, video_choices)?;
     log!(
-        "[laurel] recording: capture={:?} base={}x{} out={}x{} fps={} encoder={} rate={} preset={} bitrate={}kbps buffer={}s game_audio={} mic={} mix={} record={} paused={}",
-        cfg.capture, args.base.0, args.base.1, out.0, out.1, args.fps, rec.encoder(), args.rate, args.preset, args.bitrate, args.buffer, args.desktop_audio, args.mic, rec.audio_mix().name(), args.record, args.paused
+        "[laurel] recording: capture={:?} base={}x{} out={}x{} fps={} encoder={} rate={} preset={} bitrate={}kbps buffer={}s game_audio={} mic={} mic_enabled={} mic_device={} mix={} record={} paused={}",
+        cfg.capture, args.base.0, args.base.1, out.0, out.1, args.fps, rec.encoder(), args.rate, args.preset, args.bitrate, args.buffer, args.desktop_audio, args.mic, args.mic_enabled, args.mic_device, rec.audio_mix().name(), args.record, args.paused
     );
 
     if args.rpc {
@@ -536,6 +552,7 @@ fn run(args: Args) -> Result<(), String> {
                 "fps": args.fps,
                 "bufferSecs": args.buffer,
                 "audioMix": rec.audio_mix().name(),
+                "microphone": rec.microphone_choice(),
                 "recording": rec.active(),
                 "clipsDir": dirs.clips,
                 "screenshotsDir": dirs.screenshots,
@@ -543,7 +560,7 @@ fn run(args: Args) -> Result<(), String> {
         );
         serve_app(&obs, &mut rec, &args, &dirs);
         drop(rec);
-        log!("[laurel] shutdown");
+        log!("[laurel] shutdown ({} libobs UI tasks run)", obs::ui_tasks_run());
         return Ok(());
     }
 
@@ -594,21 +611,37 @@ fn run(args: Args) -> Result<(), String> {
             },
             Some("stats") => log!("[laurel] stats after {:.1}s: {}", started.elapsed().as_secs_f64(), recorder::format_stats(&obs, &rec)),
             Some("mic") => {
-                // A16: "mic retry" asks for another try; "mic" only logs the state.
-                if parts.next() == Some("retry") {
-                    if let Err(e) = rec.retry_microphone() {
-                        log!("[laurel] microphone retry failed: {e}");
-                    }
+                // A16: "mic retry" asks for another try; A20: "mic on", "mic off" and
+                // "mic device <id>" are the player's choices; "mic" only logs the state.
+                let result = match parts.next() {
+                    Some("retry") => rec.retry_microphone(),
+                    Some("on") => rec.set_microphone(Some(true), None),
+                    Some("off") => rec.set_microphone(Some(false), None),
+                    Some("device") => rec.set_microphone(None, Some(parts.collect::<Vec<_>>().join(" "))),
+                    _ => Ok(()),
+                };
+                if let Err(e) = result {
+                    log!("[laurel] microphone command failed: {e}");
                 }
+                std::thread::sleep(Duration::from_millis(200));
                 log!("[laurel] microphone state at {:.1}s: {}", started.elapsed().as_secs_f64(), rec.microphone());
             }
+            Some("mics") => log!("[laurel] microphones: {}", microphone_list()),
+            Some("crash") => crash::deliberate(),
             Some("quit") => break,
             Some(other) => log!("[laurel] unknown command {other}"),
         }
     }
     drop(rec);
-    log!("[laurel] shutdown");
+    log!("[laurel] shutdown ({} libobs UI tasks run)", obs::ui_tasks_run());
     Ok(())
+}
+
+/// The microphones the player can choose (spec audio.mic), without OBS's own
+/// "default" item: the app offers Windows' default itself.
+fn microphone_list() -> Value {
+    let devices = obs::list_source_property("wasapi_input_capture", "device_id");
+    Value::Array(devices.into_iter().filter(|(_, id)| id != "default").map(|(name, id)| json!({ "id": id, "name": name })).collect())
 }
 
 fn game_json(game: Option<GameInfo>) -> Value {
@@ -644,6 +677,7 @@ fn serve_app(obs: &Obs, rec: &mut Recorder, args: &Args, dirs: &Dirs) {
                     "game": game_json(rec.game()),
                     "audio": { "mode": if args.desktop_audio { "game" } else { "off" }, "mix": rec.audio_mix().name(), "follows": rec.game_audio() },
                     "microphone": rec.microphone(),
+                    "microphoneChoice": rec.microphone_choice(),
                 }))
             }
             "listTargets" => {
@@ -663,6 +697,15 @@ fn serve_app(obs: &Obs, rec: &mut Recorder, args: &Args, dirs: &Dirs) {
             "retryMicrophone" => {
                 // A16: the player allowed the microphone in Windows' settings.
                 rec.retry_microphone().map(|_| rec.microphone())
+            }
+            "listMicrophones" => Ok(microphone_list()),
+            // A19: the self-test checks the crash report in engine.log.
+            "crash" => crash::deliberate(),
+            "setMicrophone" => {
+                // Spec audio.mic: the switch and the device apply without a restart.
+                let enabled = params.get("enabled").and_then(Value::as_bool);
+                let device = params.get("device").and_then(Value::as_str).map(str::to_string);
+                rec.set_microphone(enabled, device).map(|_| rec.microphone_choice())
             }
             "probeHook" => {
                 // A7: while a game is recorded by its window, try its hook on top.

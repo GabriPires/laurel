@@ -410,6 +410,14 @@
                   <option value="pc-mic">All PC sound and microphone</option>
                 </select>
               </div>
+              <div class="row-item">
+                <div class="row-text"><label for="opt-mic" class="row-name">Record my microphone</label><span class="row-desc">Laurel opens the microphone only while it records a game, or the screen when screen recording is on.</span></div>
+                <input type="checkbox" id="opt-mic" class="switch" role="switch">
+              </div>
+              <div class="row-item">
+                <div class="row-text"><label for="opt-mic-device" class="row-name">Microphone</label><span id="mic-device-desc" class="row-desc"></span></div>
+                <select id="opt-mic-device" class="row-select"></select>
+              </div>
             </div>
             <p class="group-desc">Clips also keep the game and your microphone on separate tracks, for video editors. Changes apply to the next clips.</p>
             <h2 class="group-label">Screen recording</h2>
@@ -585,7 +593,7 @@
             </div>
             <div class="rows">
               <div class="row-item">
-                <div class="row-text"><label for="opt-overlay" class="row-name">Show notices over games</label><span id="overlay-desc" class="row-desc">A short notice in the corner of the game.</span></div>
+                <div class="row-text"><label for="opt-overlay" class="row-name">Show notices over games</label><span id="overlay-desc" class="row-desc">A short notice in the corner of the game. Important notices, such as a game Laurel cannot record, show even when this is off.</span></div>
                 <input type="checkbox" id="opt-overlay" class="switch" role="switch">
               </div>
               <div class="row-item">

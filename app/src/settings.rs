@@ -5,7 +5,8 @@
 //! (record.toggle), the mouse cursor (capture.cursor), screen recording
 //! (capture.screen, off by default per D13), the video and the clip length
 //! (quality.encoding, record.replay-buffer), and what the clips' main audio track
-//! mixes (audio.separate-tracks), whether Laurel checks for updates (stage 6
+//! mixes (audio.separate-tracks), the microphone switch and device (audio.mic),
+//! whether Laurel checks for updates (stage 6
 //! plan), the interface language, how long deleted items wait in Recently
 //! deleted (library.trash), and the automatic clips of Steam achievements
 //! (autoclip.steam-achievements). Missing or invalid fields fall back to the
@@ -80,6 +81,10 @@ pub struct Settings {
     /// Track 1: game, game-mic or pc-mic (D12 revised); tracks 2 and 3 stay the game
     /// and the microphone.
     pub audio_mix: String,
+    /// The microphone switch and device (spec audio.mic): "default" is Windows'
+    /// default communications device, else an id from the engine's listMicrophones.
+    pub mic_enabled: bool,
+    pub mic_device: String,
     /// Ask the update channel for a new version a little after each start.
     pub check_updates: bool,
     /// system, en or pt-BR (see i18n.rs).
@@ -137,6 +142,8 @@ impl Default for Settings {
             video_fps: 60,
             clip_secs: 30,
             audio_mix: "game-mic".into(),
+            mic_enabled: true,
+            mic_device: "default".into(),
             check_updates: true,
             language: "system".into(),
             auto_clip: true,
@@ -193,6 +200,8 @@ impl Settings {
             video_fps: number("videoFps", d.video_fps, 360).max(10),
             clip_secs: number("clipSecs", d.clip_secs, 600).max(5),
             audio_mix: choice("audioMix", &["game", "game-mic", "pc-mic"], &d.audio_mix),
+            mic_enabled: flag("micEnabled", d.mic_enabled),
+            mic_device: Some(text("micDevice", &d.mic_device)).filter(|s| !s.is_empty()).unwrap_or(d.mic_device),
             check_updates: flag("checkUpdates", d.check_updates),
             language: choice("language", crate::i18n::LANGUAGES, &d.language),
             auto_clip: flag("autoClip", d.auto_clip),
@@ -243,6 +252,8 @@ impl Settings {
             "videoFps": self.video_fps,
             "clipSecs": self.clip_secs,
             "audioMix": self.audio_mix,
+            "micEnabled": self.mic_enabled,
+            "micDevice": self.mic_device,
             "checkUpdates": self.check_updates,
             "language": self.language,
             "autoClip": self.auto_clip,

@@ -5,7 +5,7 @@
 //! while notices are on screen, at the top right of the foreground window (the
 //! game), and hidden again when idle so it does not sit over the game for nothing.
 
-use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -77,6 +77,11 @@ struct Inner {
     /// The alert sounds and the volume they were rendered at.
     sounds: Mutex<(u8, Sounds)>,
     hwnd: AtomicIsize,
+    /// Whether Windows keeps the overlay out of screen capture. On some Windows 10
+    /// PCs it does not (A10 of the stability tests); the overlay then shows only
+    /// critical notices, which come while Laurel is not recording the game, so no
+    /// clip can hold them.
+    excluded: AtomicBool,
     next_id: AtomicU64,
     /// The overlay hides once the last notice on screen has expired.
     visible_until: Mutex<Instant>,
@@ -90,6 +95,7 @@ impl Notifier {
             store,
             sounds: Mutex::new((volume, Sounds::new(volume))),
             hwnd: AtomicIsize::new(0),
+            excluded: AtomicBool::new(true),
             next_id: AtomicU64::new(1),
             visible_until: Mutex::new(Instant::now()),
         }))
@@ -102,10 +108,25 @@ impl Notifier {
         window.set_ignore_cursor_events(true).map_err(|e| e.to_string())?;
         let hwnd = window.hwnd().map_err(|e| e.to_string())?.0 as isize;
         let capturable = std::env::var("LAUREL_OVERLAY_CAPTURABLE").is_ok_and(|v| v == "1");
-        win::make_overlay(hwnd, capturable)?;
+        match win::make_overlay(hwnd, capturable) {
+            Ok(()) => log!("overlay ready (excluded from capture: {})", !capturable),
+            Err(e) => {
+                self.0.excluded.store(false, Ordering::SeqCst);
+                log!("overlay ready for critical notices only: {e}");
+            }
+        }
         self.0.hwnd.store(hwnd, Ordering::SeqCst);
-        log!("overlay ready (excluded from capture: {})", !capturable);
         Ok(())
+    }
+
+    /// Whether the overlay is kept out of screen capture (false: critical notices only).
+    pub fn excluded(&self) -> bool {
+        self.0.excluded.load(Ordering::SeqCst)
+    }
+
+    /// Self-test: acts as a PC whose overlay Windows cannot keep out of capture.
+    pub fn set_excluded(&self, excluded: bool) {
+        self.0.excluded.store(excluded, Ordering::SeqCst);
     }
 
     pub fn hwnd(&self) -> isize {
@@ -123,6 +144,19 @@ impl Notifier {
     /// Plays the kind's sound and shows the notice over the foreground window,
     /// each according to the settings.
     pub fn notify(&self, kind: Kind, title: &str, detail: &str) {
+        self.show(kind, title, detail, false);
+    }
+
+    /// An error notice that Laurel is not recording the game (it runs as
+    /// administrator, the disk is almost full, the engine failed): shown over the
+    /// game even with notices over games turned off, which would leave only a
+    /// sound (A15 of the stability tests). The game leaves independent flip while
+    /// it shows, but nothing is being recorded then.
+    pub fn notify_critical(&self, title: &str, detail: &str) {
+        self.show(Kind::Error, title, detail, true);
+    }
+
+    fn show(&self, kind: Kind, title: &str, detail: &str, critical: bool) {
         let settings = self.settings();
         let sound = settings.sounds && settings.volume > 0 && (kind != Kind::AutoClip || settings.auto_clip_sound);
         if let (true, Some(alert)) = (sound, kind.alert()) {
@@ -133,8 +167,11 @@ impl Notifier {
             sounds.1.play(alert);
         }
         let hwnd = self.hwnd();
-        if !settings.overlay || hwnd == 0 {
+        if hwnd == 0 || !(critical || settings.overlay && self.excluded()) {
             return;
+        }
+        if critical {
+            log!("critical notice shown: {title}");
         }
         let id = self.0.next_id.fetch_add(1, Ordering::SeqCst);
         let _ = self.0.app.emit_to("overlay", "notice", json!({ "id": id, "kind": kind.name(), "title": title, "detail": detail, "holdMs": kind.hold().as_millis() as u64 }));

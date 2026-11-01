@@ -112,12 +112,60 @@ function showMix(mix) {
   $('audio-mix-desc').classList.toggle('warn', mix === 'pc-mic');
 }
 
+// The microphone (spec audio.mic): Windows' default communications device or one
+// the engine lists; a chosen one that is not connected stays in the list. The
+// engine opens it only while it records (A20 of the stability tests).
+async function fillMicrophones(selected) {
+  const select = $('opt-mic-device');
+  let mics = [];
+  try {
+    mics = await invoke('engine_request', { method: 'listMicrophones' });
+  } catch {
+    // The engine may be restarting; keep Windows' default and the chosen one.
+  }
+  const option = (value, text) => {
+    const o = document.createElement('option');
+    o.value = value;
+    o.textContent = text;
+    return o;
+  };
+  const options = [option('default', t('Windows default')), ...mics.map((m) => option(m.id, m.name))];
+  if (selected !== 'default' && !mics.some((m) => m.id === selected)) options.push(option(selected, t('Microphone not connected')));
+  select.replaceChildren(...options);
+  select.value = selected;
+}
+
+// What the microphone row says: the Bluetooth note, or a chosen microphone that is
+// not connected while Laurel records.
+async function showMicDevice() {
+  const m = await invoke('microphone_state');
+  const missing = m.state === 'missing' && m.chosen?.enabled;
+  $('mic-device-desc').textContent = missing
+    ? t('The chosen microphone is not connected: clips go without your voice until it is.')
+    : t('A Bluetooth headset\'s microphone puts the headset in call mode, with lower sound, while Laurel records.');
+  $('mic-device-desc').classList.toggle('warn', missing);
+}
+listen('microphone', showMicDevice);
+
 // Notices over games (overlay.in-game): off by default, since the game leaves
 // independent flip while one is on screen; when on, the row says so in yellow.
+// Critical notices, while Laurel is not recording the game, show either way (A15).
+// On a PC where Windows cannot keep the overlay out of recordings, only those show
+// (A10).
+let overlayExcluded = true;
+invoke('overlay_status').then((s) => {
+  overlayExcluded = s.excluded;
+  showOverlay($('opt-overlay').checked);
+});
 function showOverlay(on) {
+  if (!overlayExcluded) {
+    $('overlay-desc').textContent = t('On this PC, Windows does not let Laurel keep notices out of recordings, so only important notices show, such as a game Laurel cannot record.');
+    $('overlay-desc').classList.add('warn');
+    return;
+  }
   $('overlay-desc').textContent = on
     ? t('Some games may run a little unevenly while a notice is on screen. If you notice it, turn this off.')
-    : t('A short notice in the corner of the game.');
+    : t('A short notice in the corner of the game. Important notices, such as a game Laurel cannot record, show even when this is off.');
   $('overlay-desc').classList.toggle('warn', on);
 }
 
@@ -157,6 +205,10 @@ function fill(s) {
   $('opt-limit-gb').disabled = !s.limitEnabled;
   fillVideo(s);
   $('opt-audio-mix').value = s.audioMix;
+  $('opt-mic').checked = s.micEnabled;
+  dim($('opt-mic-device').closest('.row-item'), !s.micEnabled);
+  fillMicrophones(s.micDevice);
+  showMicDevice();
   $('opt-updates').checked = s.checkUpdates;
   $('opt-language').querySelector('option[value="system"]').textContent = t('Windows language ({language})', { language: LANGUAGE_NAMES[s.systemLanguage] ?? s.systemLanguage });
   $('opt-language').value = s.language;
@@ -226,6 +278,8 @@ async function saveSettings() {
     videoFps: Number($('opt-video-fps').value),
     clipSecs: Number($('opt-clip-secs').value),
     audioMix: $('opt-audio-mix').value,
+    micEnabled: $('opt-mic').checked,
+    micDevice: $('opt-mic-device').value || 'default',
     checkUpdates: $('opt-updates').checked,
     language: $('opt-language').value,
   };
@@ -249,7 +303,7 @@ async function saveSettings() {
 }
 
 for (const id of ['opt-autoclip', 'opt-autoclip-sound', 'opt-steam', 'opt-steam-ultra', 'opt-steam-rare', 'opt-steam-any', 'opt-overlay', 'opt-sounds', 'opt-volume', 'opt-naming', 'opt-limit', 'opt-limit-gb', 'opt-recycle', 'opt-min-free', 'opt-deleted-days', 'opt-cursor', 'opt-screen', 'opt-screen-monitor', 'opt-screen-switch',
-  'opt-video-encoder', 'opt-video-codec', 'opt-video-preset', 'opt-video-rate', 'opt-video-bitrate', 'opt-video-height', 'opt-video-fps', 'opt-clip-secs', 'opt-audio-mix', 'opt-updates', 'opt-language']) {
+  'opt-video-encoder', 'opt-video-codec', 'opt-video-preset', 'opt-video-rate', 'opt-video-bitrate', 'opt-video-height', 'opt-video-fps', 'opt-clip-secs', 'opt-audio-mix', 'opt-mic', 'opt-mic-device', 'opt-updates', 'opt-language']) {
   $(id).addEventListener('change', saveSettings);
 }
 $('opt-volume').oninput = () => { $('opt-volume-value').textContent = $('opt-volume').value; };
@@ -437,7 +491,12 @@ window.openSettings = (page) => {
 };
 showPage('recording');
 listen('storage-state', (e) => settings && showStorage(e.payload));
-listen('engine-state', (e) => { if (settings && e.payload.state === 'ready') fillVideo(settings, e.payload.info); });
+listen('engine-state', (e) => {
+  if (settings && e.payload.state === 'ready') {
+    fillVideo(settings, e.payload.info);
+    fillMicrophones($('opt-mic-device').value || settings.micDevice);
+  }
+});
 listen('library-changed', () => { if (!$('view-settings').hidden) loadSettings(); });
 
 loadSettings();

@@ -111,6 +111,8 @@ pub type signal_callback_t = unsafe extern "C" fn(data: *mut c_void, cd: *mut ca
 pub type raw_video_callback_t = unsafe extern "C" fn(param: *mut c_void, frame: *mut video_data);
 /// `va_list` is a plain pointer on x86_64 Windows, so it is passed through opaquely.
 pub type log_handler_t = unsafe extern "C" fn(level: i32, msg: *const c_char, args: *mut c_void, param: *mut c_void);
+pub type obs_task_t = Option<unsafe extern "C" fn(param: *mut c_void)>;
+pub type obs_task_handler_t = unsafe extern "C" fn(task: obs_task_t, param: *mut c_void, wait: bool);
 
 // log levels (util/base.h)
 pub const LOG_ERROR: i32 = 100;
@@ -216,6 +218,7 @@ extern "C" {
     pub fn calldata_get_string(data: *const calldata_t, name: *const c_char, str: *mut *const c_char) -> bool;
     pub fn bfree(ptr: *mut c_void);
     pub fn base_set_log_handler(handler: log_handler_t, param: *mut c_void);
+    pub fn obs_set_ui_task_handler(handler: obs_task_handler_t);
     pub fn dstr_vprintf(dst: *mut dstr, format: *const c_char, args: *mut c_void);
 
     // raw frames (screenshots)
