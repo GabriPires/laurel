@@ -4,6 +4,14 @@ O Laurel guarda os últimos segundos do jogo que você está jogando e salva um 
 
 Esta é uma versão de teste. Ela pode ter erros, e é exatamente isso que queremos achar com a sua ajuda.
 
+## O que mudou na 0.1.0-rc.10
+
+Esta versão corrige o que o último pacote de logs mostrou. Obrigado a quem mandou!
+
+- **Fortnite e outros jogos com anti-cheat.** No Fortnite, o Laurel podia gravar a sessão inteira com a tela do anti-cheat (Easy Anti-Cheat) em vez do jogo: os clipes saíam com o som do jogo, mas só com aquela tela. O Laurel achava que a janela do anti-cheat, que abre antes do jogo, era o próprio jogo. Agora ele ignora essas janelas do Easy Anti-Cheat e do BattlEye e espera o jogo de verdade.
+- **A gravação acompanha o jogo.** Se a janela do jogo muda de programa antes de o Laurel conseguir entrar nele, como no caso acima, a gravação agora vai junto para a janela nova, em vez de ficar presa na primeira.
+- **Logs mais completos.** Ao fechar o Laurel ou ao atualizar, o log agora diz como o motor de gravação terminou, o que ajuda a separar um fechamento normal de uma falha.
+
 ## O que mudou na 0.1.0-rc.9
 
 Esta versão traz as últimas correções dos testes de estabilidade e uma correção para quem usa fone Bluetooth.
@@ -95,7 +103,7 @@ Quem já tem a versão anterior recebe a atualização pelo próprio Laurel: apa
 Não precisa fazer tudo. O que você conseguir já ajuda muito.
 
 1. **Instalação ou atualização:** instalou ou atualizou sem erro? Pediu administrador? Seu PC tinha OBS instalado?
-2. **Jogo encontrado:** abriu um jogo e o Laurel mostrou **Gravando** com o nome certo?
+2. **Jogo encontrado:** abriu um jogo e o Laurel mostrou **Gravando** com o nome certo? Em jogos com anti-cheat, como o Fortnite, o clipe mostra o jogo, e não a tela do anti-cheat?
 3. **Clipe:** o F8 salvou o clipe? Tocou o som de clipe salvo? O clipe tem imagem e som, e pelo menos 30 segundos?
 4. **Som:** com o padrão (jogo e microfone), o Discord e a música ficaram fora do clipe? Teste também as outras opções de **Som do clipe**, e **Gravar meu microfone** desligado. Se usa fone Bluetooth com microfone, diga se o som do fone ficou normal com o Laurel aberto, sem jogo, e durante o jogo. Se aparecer o aviso **Gravando {jogo} pela janela**, confira se o clipe tem o som do jogo e se, depois de um tempo, a gravação voltou ao normal (no Windows 10, a borda amarela some).
 5. **Placa de vídeo:** em **Configurações > Gravação**, o item **Gravando agora** mostra o codificador em uso. Diga qual apareceu, qual é a sua placa (NVIDIA, AMD ou Intel) e se o seu PC é um notebook com duas placas de vídeo. Testar em placas AMD e Intel é muito importante.

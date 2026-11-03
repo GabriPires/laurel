@@ -1254,6 +1254,7 @@ fn selftest(app: AppHandle) {
         wait_ready("after the restart")?;
         check_crash_report(&engine, &wait_ready, log_start)?;
         check_session_end(&engine, &wait_ready)?;
+        check_engine_quit(&engine, &wait_ready)?;
         std::thread::sleep(Duration::from_secs(4));
         clip()?;
         check_games(&app, &engine)?;
@@ -1297,6 +1298,27 @@ fn engine_log_since(start: u64) -> String {
 /// where it happened and its stack before the supervisor restarts it. The crash is
 /// a deliberate access violation (the "crash" request), which ends without a Windows
 /// Error Reporting report.
+/// Self-test of A21: an engine asked to quit (Laurel closing, or an update about to
+/// run its installer) has told engine.log how it ended, after its own
+/// "[laurel] shutdown", by the time Engine::shutdown returns; and after an update
+/// whose installer did not start, the engine runs again.
+fn check_engine_quit(engine: &Engine, wait_ready: &dyn Fn(&str) -> Result<(), String>) -> Result<(), String> {
+    let start = engine_log_len();
+    let asked = Instant::now();
+    engine.shutdown();
+    let took = asked.elapsed();
+    let text = engine_log_since(start);
+    let shutdown = text.lines().position(|l| l.contains("[laurel] shutdown"));
+    let exited = text.lines().position(|l| l.ends_with("==== engine exited: exit code 0"));
+    engine.resume();
+    wait_ready("after the engine quit and resumed")?;
+    log!("[selftest] engine quit in {} ms: shutdown line {shutdown:?}, exit line {exited:?}; resumed", took.as_millis());
+    match (shutdown, exited) {
+        (Some(s), Some(e)) if s < e => Ok(()),
+        _ => Err("engine.log does not tell how the engine ended when Engine::shutdown returns".into()),
+    }
+}
+
 fn check_crash_report(engine: &Engine, wait_ready: &dyn Fn(&str) -> Result<(), String>, log_start: u64) -> Result<(), String> {
     if engine.request("crash", Value::Null, SHOT_TIMEOUT).is_ok() {
         return Err("the engine answered the crash request".into());
@@ -1396,15 +1418,29 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
         log!("[selftest] installed games: {} {}", catalog.installed().len(), catalog.counts());
         if let Some(game) = catalog.installed().first() {
             let inside = game.dir.join(r"Game\Binaries\Win64\Game-Win64-Shipping.exe").to_string_lossy().into_owned();
-            let helper = game.dir.join("UnityCrashHandler64.exe").to_string_lossy().into_owned();
-            // A launcher in the game's folder, as HoYoPlay's next to Genshin Impact
-            // (A17 of the stability tests), is not the game.
-            let launcher = game.dir.join("HYP.exe").to_string_lossy().into_owned();
             let ignoring = Settings { ignored_games: vec![IgnoredGame { key: game.id.key.clone(), name: game.id.name.clone() }], ..settings.clone() };
-            let verdicts = (catalog.classify(&inside, &settings), catalog.classify(&helper, &settings), catalog.classify(&launcher, &settings), catalog.classify(&inside, &ignoring));
+            let verdicts = (catalog.classify(&inside, &settings), catalog.classify(&inside, &ignoring));
             log!("[selftest] classify in {}: {:?}", game.id.name, verdicts);
-            if verdicts != (Verdict::Game(game.id.clone()), Verdict::NotGame, Verdict::NotGame, Verdict::Ignored(game.id.clone())) {
+            if verdicts != (Verdict::Game(game.id.clone()), Verdict::Ignored(game.id.clone())) {
                 return Err("library classification failed".into());
+            }
+            // Helpers in the game's folder are not the game: a crash handler, a
+            // launcher such as HoYoPlay's next to Genshin Impact (A17 of the
+            // stability tests), and the anti-cheat bootstrappers that start the game
+            // and show a splash window (A22: Fortnite's Easy Anti-Cheat one was
+            // recorded instead of the game).
+            let helpers = [
+                "UnityCrashHandler64.exe",
+                "HYP.exe",
+                r"Game\Binaries\Win64\Game-Win64-Shipping_EAC_EOS.exe",
+                r"Game\Binaries\Win64\Game-Win64-Shipping_EAC.exe",
+                r"Game\Binaries\Win64\Game-Win64-Shipping_BE.exe",
+                "start_protected_game.exe",
+            ];
+            let counted: Vec<&str> = helpers.into_iter().filter(|h| catalog.classify(&game.dir.join(h).to_string_lossy(), &settings) != Verdict::NotGame).collect();
+            log!("[selftest] helpers in {} not counted as the game: {} of {}", game.id.name, helpers.len() - counted.len(), helpers.len());
+            if !counted.is_empty() {
+                return Err(format!("helpers counted as the game: {counted:?}"));
             }
         } else {
             log!("[selftest] no installed games; library classification not exercised");
@@ -1430,12 +1466,13 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
     detector.set_mode(Mode::Detect);
     // A window off every monitor that does not take the focus, so the test does not
     // disturb whoever uses the PC.
-    let script = "Add-Type -AssemblyName System.Windows.Forms, System.Drawing; \
+    let form = |title: &str| "Add-Type -AssemblyName System.Windows.Forms, System.Drawing; \
         Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition 'public class QuietForm : System.Windows.Forms.Form { protected override bool ShowWithoutActivation { get { return true; } } }'; \
-        $f = New-Object QuietForm; $f.Text = 'Laurel self-test game'; $f.StartPosition = 'Manual'; \
+        $f = New-Object QuietForm; $f.Text = 'TITLE'; $f.StartPosition = 'Manual'; \
         $f.Location = New-Object System.Drawing.Point(-6000, -6000); $f.Size = New-Object System.Drawing.Size(960, 600); \
         $t = New-Object System.Windows.Forms.Timer; $t.Interval = 120000; $t.Add_Tick({ $f.Close() }); $t.Start(); \
-        [System.Windows.Forms.Application]::Run($f)";
+        [System.Windows.Forms.Application]::Run($f)"
+        .replace("TITLE", title);
     let outcome = (|| -> Result<(), String> {
         let status = |key: &str| engine.request("status", Value::Null, SHOT_TIMEOUT).map(|s| s[key].clone());
         let until = |what: &str, done: &dyn Fn() -> bool| -> Result<(), String> {
@@ -1450,7 +1487,8 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
         };
         // Stopping the replay buffer completes asynchronously.
         until("recording to stop without a game", &|| status("recording").is_ok_and(|r| r == false))?;
-        let mut child = std::process::Command::new(&shell).args(["-NoProfile", "-Command", script]).creation_flags(0x0800_0000).spawn().map_err(|e| e.to_string())?;
+        let spawn = |title: &str| std::process::Command::new(&shell).args(["-NoProfile", "-Command", &form(title)]).creation_flags(0x0800_0000).spawn().map_err(|e| e.to_string());
+        let mut child = spawn(name)?;
         let found = until("the game", &|| detector.current().is_some_and(|g| g.id.name == name));
         let result = found.and_then(|_| {
             until("recording", &|| status("recording").is_ok_and(|r| r == true))?;
@@ -1522,6 +1560,31 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
             if !during.as_str().unwrap_or_default().starts_with("window:") || snapshot["capture"] != "window" {
                 return Err("the hook try changed the capture".into());
             }
+            // A23: when the game's window moves to another of its processes (as
+            // Fortnite's from its anti-cheat bootstrapper to the game), the capture
+            // follows it. The first window is minimized, so a second PowerShell
+            // window becomes the game's; then the first comes back and the second
+            // closes, and the capture goes back to the first.
+            let first = format!("window:{name}:");
+            let other = "Laurel self-test game window 2";
+            let second = format!("window:{other}:");
+            win::minimize_no_activate(hwnd);
+            let mut child2 = spawn(other)?;
+            let pid2 = child2.id();
+            let moved = until("the capture to follow the second window", &|| {
+                detector.current().is_some_and(|g| g.pid == pid2) && status("target").is_ok_and(|t| t.as_str().unwrap_or_default().starts_with(&second))
+            });
+            let after = (detector.snapshot(), status("probing"));
+            win::restore_no_activate(hwnd);
+            let _ = child2.kill();
+            let _ = child2.wait();
+            moved?;
+            log!("[selftest] game moved to pid {pid2}: {}; probing {:?}", after.0, after.1);
+            if after.0["capture"] != "window" || after.1 != Ok(Value::Bool(false)) {
+                return Err("the capture did not stay on the moved window".into());
+            }
+            until("the capture to go back to the first window", &|| status("target").is_ok_and(|t| t.as_str().unwrap_or_default().starts_with(&first)))?;
+            log!("[selftest] game back to its first window: {}", detector.snapshot());
             Ok(())
         });
         let _ = child.kill();

@@ -129,6 +129,13 @@ struct State {
     disk_paused: bool,
     /// What the engine was last told: (capture target, recording).
     applied: Option<(String, bool)>,
+    /// The process of the game window the applied target names (see follow).
+    applied_pid: Option<u32>,
+    /// Another process of the current game whose window took over, and the scans
+    /// it has been the current one (see follow).
+    moved: Option<(u32, u32)>,
+    /// A process the capture did not follow because the game was already hooked.
+    kept: Option<u32>,
     /// When the engine started capturing the applied target (see check_hook).
     capture_started: Option<Instant>,
     /// The game whose hook was already checked (see check_hook).
@@ -168,7 +175,7 @@ impl Detector {
             app,
             store,
             catalog: RwLock::new(catalog),
-            state: Mutex::new(State { mode, enabled, current: None, missing: 0, focus: None, disk_paused: false, applied: None, capture_started: None, hook_checked: None, needs_admin: None, fallback: None, retry: None, screen }),
+            state: Mutex::new(State { mode, enabled, current: None, missing: 0, focus: None, disk_paused: false, applied: None, applied_pid: None, moved: None, kept: None, capture_started: None, hook_checked: None, needs_admin: None, fallback: None, retry: None, screen }),
             apply_lock: Mutex::new(()),
             wake: (Mutex::new(false), Condvar::new()),
             elevated: win::self_elevated(),
@@ -363,7 +370,7 @@ impl Detector {
         }
         let found = self.game_windows();
         let foreground = win::foreground_window();
-        let (started, ended) = {
+        let (started, ended, moved) = {
             let mut s = self.state.lock().unwrap();
             let mut ended = None;
             if let Some(current) = s.current.clone() {
@@ -409,18 +416,52 @@ impl Detector {
                     started = Some(next);
                 }
             }
+            // A23: the game's window moved to another of its processes, as Fortnite's
+            // from its anti-cheat bootstrapper's splash screen to the game itself,
+            // and the target the engine has names the old one. A blip of focus does
+            // not count: the new window must stay the game's for FOCUS_SCANS scans.
+            let mut moved = None;
+            let follow = match (&s.current, &s.applied) {
+                (Some(c), Some((target, _)))
+                    if started.is_none()
+                        && ended.is_none()
+                        && (target.starts_with("game:") || target.starts_with("window:"))
+                        && s.applied_pid.is_some_and(|pid| pid != c.pid)
+                        && s.kept != Some(c.pid)
+                        && wanted(&s).0 != *target =>
+                {
+                    Some(c.clone())
+                }
+                _ => None,
+            };
+            match follow {
+                Some(game) => {
+                    let scans = match s.moved {
+                        Some((pid, n)) if pid == game.pid => n + 1,
+                        _ => 1,
+                    };
+                    s.moved = Some((game.pid, scans));
+                    if scans >= FOCUS_SCANS {
+                        s.moved = None;
+                        moved = Some(game);
+                    }
+                }
+                None => s.moved = None,
+            }
             if ended.is_some() || started.is_some() {
                 s.hook_checked = None;
                 s.needs_admin = None;
                 s.fallback = None;
                 s.retry = None;
+                s.moved = None;
+                s.kept = None;
             }
             if let Some(game) = started.as_ref().filter(|_| self.test_fallback) {
                 s.hook_checked = Some(game.id.key.clone());
                 s.fallback = Some(game.id.key.clone());
                 s.retry = Some(Retry::after_fallback());
             }
-            (started, ended)
+            (started, ended, moved)
         };
         if let Some(game) = &ended {
             log!("game closed or left: {} ({})", game.id.name, game.path);
@@ -436,8 +477,46 @@ impl Detector {
                 self.app.state::<Notifier>().notify(Kind::Info, &t!("Recording|notice"), &t!("{game} · Laurel keeps the last {secs} s", game = game.id.name, secs = secs));
             }
         }
+        if let Some(game) = moved {
+            self.follow(game);
+        }
         self.check_hook();
         self.retry_hook();
+    }
+
+    /// A game whose window moved to another of its processes before its hook
+    /// started (A23 of the stability tests: Fortnite shows its anti-cheat
+    /// bootstrapper's splash screen first, then its own window) is captured in the
+    /// new window: the game capture starts over there, with its grace, or, for a
+    /// game recorded by its window, the window capture and the tries of the hook
+    /// move to it. A hooked game keeps its capture, so a second window of the game
+    /// does not drop the hook.
+    fn follow(&self, game: Active) {
+        let Ok(status) = self.app.state::<Engine>().request("status", Value::Null, REQUEST_TIMEOUT) else { return };
+        let hooked = !status["game"].is_null();
+        {
+            let mut s = self.state.lock().unwrap();
+            if s.current.as_ref().map(|c| c.pid) != Some(game.pid) {
+                return;
+            }
+            if hooked {
+                s.kept = Some(game.pid);
+            } else {
+                // The hook of the new process is checked again; the notice that the
+                // game runs as administrator still comes once (see check_hook).
+                s.hook_checked = None;
+                if s.fallback.is_some() {
+                    s.retry = Some(Retry::after_fallback());
+                }
+            }
+        }
+        if hooked {
+            log!("capture: {} moved to {} (pid {}) after its hook started; capture kept", game.id.name, game.exe(), game.pid);
+            return;
+        }
+        log!("capture: {} moved to {} (pid {}) before its hook started; the capture follows it", game.id.name, game.exe(), game.pid);
+        self.apply();
+        let _ = self.app.emit("game-state", self.snapshot());
     }
 
     /// A game that runs as administrator cannot be recorded by a Laurel that does
@@ -472,15 +551,17 @@ impl Detector {
         if !hooked && !needs_admin && !fallback {
             return;
         }
+        let notified;
         {
             let mut s = self.state.lock().unwrap();
             if s.current.as_ref().map(|g| &g.id.key) != Some(&game.id.key) {
                 return;
             }
             s.hook_checked = Some(game.id.key.clone());
-            if needs_admin {
-                s.needs_admin = Some(game.id.key.clone());
-            }
+            // Checked again after the game moved to another process (see follow):
+            // that process decides, and the notice is not shown a second time.
+            notified = s.needs_admin.is_some();
+            s.needs_admin = needs_admin.then(|| game.id.key.clone());
             if fallback {
                 s.fallback = Some(game.id.key.clone());
                 s.retry = Some(Retry::after_fallback());
@@ -493,6 +574,9 @@ impl Detector {
         let notifier = self.app.state::<Notifier>();
         if needs_admin {
             let _ = self.app.emit("game-state", self.snapshot());
+            if notified {
+                return;
+            }
             // A15: shown over the game even with notices over games off.
             notifier.notify_critical(&t!("Can't record {game}", game = game.id.name), &t!("It runs as administrator. Open Laurel and restart it as administrator."));
         } else {
@@ -568,10 +652,10 @@ impl Detector {
     /// Brings the engine to the wanted capture target and recording state.
     fn apply(&self) {
         let _serial = self.apply_lock.lock().unwrap();
-        let (target, recording, applied) = {
+        let (target, recording, applied, pid) = {
             let s = self.state.lock().unwrap();
             let (t, r) = wanted(&s);
-            (t, r, s.applied.clone())
+            (t, r, s.applied.clone(), s.current.as_ref().map(|g| g.pid))
         };
         if applied.as_ref() == Some(&(target.clone(), recording)) {
             return;
@@ -601,6 +685,7 @@ impl Detector {
                 s.capture_started = Some(Instant::now());
             }
             s.applied = Some((target, recording));
+            s.applied_pid = pid;
         }
         if screen_started {
             let secs = engine.state()["info"]["bufferSecs"].as_u64().unwrap_or_default();

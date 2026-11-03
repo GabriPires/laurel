@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
+use crate::engine::Engine;
 use crate::i18n::t;
 use crate::log::log;
 
@@ -52,6 +53,11 @@ pub async fn check(app: &AppHandle) -> Result<Value, String> {
 
 /// Downloads the update found by the last check, checks its signature and runs its
 /// installer, which closes Laurel. Progress goes to the windows as "update-progress".
+///
+/// Before the installer runs, the engine is asked to quit (A21 of the stability
+/// tests): the installer force-stops whatever still runs from Laurel's folder, which
+/// left no word in engine.log about how the engine ended. If the installer does not
+/// start, the engine runs again.
 pub async fn install(app: &AppHandle) -> Result<(), String> {
     let update = app.state::<Pending>().0.lock().unwrap().take().ok_or("no update to install: check again")?;
     log!("updates: installing {}", update.version);
@@ -61,8 +67,18 @@ pub async fn install(app: &AppHandle) -> Result<(), String> {
         received += chunk as u64;
         let _ = emitter.emit("update-progress", json!({ "received": received, "total": total }));
     };
-    update.download_and_install(on_chunk, || log!("updates: downloaded, checking the signature")).await.map_err(|e| {
+    let bytes = update.download(on_chunk, || log!("updates: downloaded, checking the signature")).await.map_err(|e| {
         log!("updates: install failed: {e}");
+        e.to_string()
+    })?;
+    let engine = app.state::<Engine>().inner().clone();
+    let stopping = engine.clone();
+    tauri::async_runtime::spawn_blocking(move || stopping.shutdown()).await.map_err(|e| e.to_string())?;
+    log!("updates: engine stopped; running the installer");
+    // On success the installer starts and this process exits here.
+    update.install(&bytes).map_err(|e| {
+        log!("updates: install failed: {e}");
+        engine.resume();
         e.to_string()
     })
 }

@@ -22,6 +22,7 @@
     "riotclientservices.exe",
     "riotclientux.exe",
     "riotclientuxrender.exe",
+    "start_protected_game.exe",
     "steam.exe",
     "steamwebhelper.exe",
     "ubisoftconnect.exe",
@@ -29,6 +30,9 @@
     "vconsole2.exe"
   ],
   "blockedPatterns": [
+    "_be.exe",
+    "_eac.exe",
+    "_eac_eos.exe",
     "anticheat",
     "battleye",
     "beservice",

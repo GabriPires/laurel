@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -27,6 +27,8 @@ const HEALTHY_RUN: Duration = Duration::from_secs(60);
 /// Exit status when Windows cannot load a DLL the engine needs: the Microsoft Visual
 /// C++ runtime, which the OBS runtime requires, or a file of a damaged OBS runtime.
 const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
+/// How long `shutdown` waits for the line that tells how the engine ended (A21).
+const EXIT_LINE_WAIT: Duration = Duration::from_secs(2);
 
 /// "exit code 0xC0000005 (STATUS_ACCESS_VIOLATION)": codes past 0xFFFF in hex, as
 /// Windows writes them, with the name of the known ones (A19).
@@ -80,6 +82,19 @@ struct Inner {
     quitting: AtomicBool,
     /// Set by `restart`: the next exit is asked for, not a failure.
     restarting: AtomicBool,
+    /// Whether a supervisor thread runs (see `resume`).
+    supervising: AtomicBool,
+    /// Engines whose end engine.log has told, and a signal for each (A21).
+    exits_logged: (Mutex<u64>, Condvar),
+}
+
+/// Clears `Inner::supervising` when the supervisor returns.
+struct Supervising<'a>(&'a AtomicBool);
+
+impl Drop for Supervising<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 impl Engine {
@@ -95,6 +110,8 @@ impl Engine {
             microphone: Mutex::new(json!({ "state": "starting" })),
             quitting: AtomicBool::new(false),
             restarting: AtomicBool::new(false),
+            supervising: AtomicBool::new(false),
+            exits_logged: (Mutex::new(0), Condvar::new()),
         }));
         let supervisor = engine.clone();
         std::thread::Builder::new().name("engine-supervisor".into()).spawn(move || supervisor.supervise()).unwrap();
@@ -142,21 +159,55 @@ impl Engine {
     }
 
     /// Asks the engine to quit and stops supervising it; kills it if it hangs.
+    ///
+    /// A21 of the stability tests: the line that tells how the engine ended comes
+    /// from the supervisor once it sees the exit, so Laurel, which closes (or runs
+    /// an update's installer) right after this, waits a little for that line.
+    /// Otherwise the last engine of every session looked like one that ended
+    /// without a word (A5, A19).
     pub fn shutdown(&self) {
         if self.0.quitting.swap(true, Ordering::SeqCst) {
             return;
         }
+        let running = matches!(self.0.child.lock().unwrap().as_mut().map(|c| c.try_wait()), Some(Ok(None)));
+        let logged = *self.0.exits_logged.0.lock().unwrap();
         let _ = self.request("shutdown", Value::Null, Duration::from_secs(5));
         let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            match self.0.child.lock().unwrap().as_mut().map(|c| c.try_wait()) {
-                Some(Ok(None)) => {}
-                _ => return,
+        let exited = loop {
+            if !matches!(self.0.child.lock().unwrap().as_mut().map(|c| c.try_wait()), Some(Ok(None))) {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
             }
             std::thread::sleep(Duration::from_millis(100));
+        };
+        if !exited {
+            log!("engine did not exit after shutdown; killing it");
+            self.kill();
         }
-        log!("engine did not exit after shutdown; killing it");
-        self.kill();
+        if running {
+            let (count, signal) = &self.0.exits_logged;
+            let (_count, waited) = signal.wait_timeout_while(count.lock().unwrap(), EXIT_LINE_WAIT, |n| *n == logged).unwrap();
+            if waited.timed_out() {
+                log!("engine.log did not tell how the engine ended within {} s", EXIT_LINE_WAIT.as_secs());
+            }
+        }
+    }
+
+    /// Supervises the engine again after `shutdown`, when Laurel goes on after all
+    /// (an update whose installer did not start).
+    pub fn resume(&self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.0.supervising.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if self.0.supervising.load(Ordering::SeqCst) || !self.0.quitting.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        log!("engine resumed");
+        let supervisor = self.clone();
+        std::thread::Builder::new().name("engine-supervisor".into()).spawn(move || supervisor.supervise()).unwrap();
     }
 
     /// Terminates the engine process; the supervisor restarts it unless quitting.
@@ -186,6 +237,8 @@ impl Engine {
     }
 
     fn supervise(&self) {
+        self.0.supervising.store(true, Ordering::SeqCst);
+        let _supervising = Supervising(&self.0.supervising);
         let mut quick_failures = 0;
         let mut restarted = false;
         while !self.0.quitting.load(Ordering::SeqCst) {
@@ -267,6 +320,7 @@ impl Engine {
         });
         let log_path = cfg.work_dir.join("logs").join("engine.log");
         let (exit_tx, exit_rx) = channel::<String>();
+        let logger = self.clone();
         std::thread::spawn(move || {
             let mut file = crate::log::Rotating::open(&log_path, 0, crate::log::MAX_BYTES);
             file.line(&format!("[{}] ==== engine start", crate::win::clock()));
@@ -283,6 +337,9 @@ impl Engine {
             if let Ok(exit) = exit_rx.recv_timeout(Duration::from_secs(5)) {
                 file.line(&format!("[{}] ==== engine exited: {exit}", crate::win::clock()));
             }
+            let (count, signal) = &logger.0.exits_logged;
+            *count.lock().unwrap() += 1;
+            signal.notify_all();
         });
 
         let exited = loop {
