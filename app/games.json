@@ -1,5 +1,5 @@
 {
-  "about": "Laurel's curated game list (spec game.detection). Games installed through Steam, Epic, Riot and Xbox are found from their libraries; this list only adds games from other launchers, store entries that are not games, and helper or client executables that live in game folders. Keys: <store>:<id> or exe:<lowercase file name>.",
+  "about": "Laurel's curated game list (spec game.detection). Games installed through Steam, Epic, Riot and Xbox are found from their libraries; this list only adds games from other launchers, store entries that are not games, and helper or client executables that live in game folders. Keys: <store>:<id> or exe:<lowercase file name>. windowGames are games that run in a shared program from any folder (Java), found by the program, its window class and its command line (or, when that cannot be read, its title).",
   "notGames": [
     "steam:228980",
     "steam:250820",
@@ -51,6 +51,16 @@
     "unins",
     "updater",
     "upload"
+  ],
+  "windowGames": [
+    {
+      "key": "minecraft:java",
+      "name": "Minecraft",
+      "exes": ["java.exe", "javaw.exe"],
+      "classes": ["GLFW30", "LWJGL", "SDL_app"],
+      "commandLine": ["minecraft", "org.prismlauncher.entrypoint", "org.multimc.entrypoint", "net.fabricmc.", "org.quiltmc.", "net.neoforged.", "cpw.mods."],
+      "titles": ["minecraft"]
+    }
   ],
   "games": [
     { "exe": "Diablo IV.exe", "name": "Diablo IV" },

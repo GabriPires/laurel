@@ -1200,6 +1200,9 @@ fn on_session(event: win::SessionEvent) {
 
 /// Scripted end-to-end check for development: clip, screenshot, engine crash and
 /// restart, clip again. Writes "selftest: PASS" or "selftest: FAIL ..." to app.log.
+/// The copy of settings.json made before the self-test (see setup).
+struct SettingsBackup(PathBuf);
+
 fn selftest(app: AppHandle) {
     let engine = app.state::<Engine>().inner().clone();
     let wait_ready = |what: &str| {
@@ -1264,6 +1267,17 @@ fn selftest(app: AppHandle) {
     let outcome = run();
     i18n::set(&user_settings.language);
     let _ = notifier.set_settings(user_settings);
+    // Back to the settings copied before the self-test, also after a check that
+    // failed before putting its own changes back.
+    if let Some(backup) = app.try_state::<SettingsBackup>() {
+        let saved = Store::open(&backup.0).get();
+        match app.state::<Arc<Store>>().set(saved) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&backup.0);
+            }
+            Err(e) => log!("selftest: settings not put back: {e}"),
+        }
+    }
     match outcome {
         Ok(()) => log!("selftest: PASS"),
         Err(e) => log!("selftest: FAIL {e}"),
@@ -1444,6 +1458,27 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
             }
         } else {
             log!("[selftest] no installed games; library classification not exercised");
+        }
+        // Minecraft (Java) is found by its window and command line, from any Java
+        // runtime: vanilla (an SDL window since 26.x, GLFW before), a Prism instance (whose main class and game arguments go
+        // through stdin), an old LWJGL 2 version by its title when the command line
+        // cannot be read; not a Swing installer nor another Java game.
+        let java = r"C:\Laurel self-test\runtime\bin\javaw.exe";
+        let minecraft = |class: &str, title: &str, line: Option<&str>, settings: &Settings| catalog.classify_window(java, class, title, || line.map(String::from), settings);
+        let ignoring = Settings { ignored_games: vec![IgnoredGame { key: "minecraft:java".into(), name: "Minecraft".into() }], ..settings.clone() };
+        let cases = [
+            ("vanilla sdl", minecraft("SDL_app", "Minecraft 26.3", Some(r"C:\runtime\bin\javaw.exe -XX:HeapDumpPath=MojangTricksIntelDriversForPerformance_javaw.exe_minecraft.exe.heapdump --gameDir C:\.minecraft"), &settings), true),
+            ("vanilla", minecraft("GLFW30", "Minecraft* 26.2", Some(r#""C:\runtime\bin\javaw.exe" -Xmx2G -cp C:\libraries\client.jar net.minecraft.client.main.Main --version 26.2"#), &settings), true),
+            ("prism", minecraft("GLFW30", "Homestead", Some(r"javaw.exe -Djava.library.path=C:\instances\Homestead\natives -cp C:\libraries\NewLaunch.jar;C:\libraries\net\fabricmc\loader.jar org.prismlauncher.EntryPoint"), &settings), true),
+            ("lwjgl2 title", minecraft("LWJGL", "Minecraft 1.12.2", None, &settings), true),
+            ("swing installer", minecraft("SunAwtFrame", "Forge Installer", Some("java -jar forge-installer.jar net.minecraftforge.installer.SimpleInstaller"), &settings), false),
+            ("other java game", minecraft("GLFW30", "Mindustry", Some("javaw.exe -jar Mindustry.jar"), &settings), false),
+        ];
+        let wrong: Vec<&str> = cases.iter().filter(|(_, verdict, game)| matches!(verdict, Verdict::Game(id) if id.key == "minecraft:java") != *game).map(|(name, _, _)| *name).collect();
+        let ignored = minecraft("GLFW30", "Minecraft* 26.2", Some("net.minecraft.client.main.Main"), &ignoring);
+        log!("[selftest] minecraft windows: {} cases, wrong: {wrong:?}; ignored {:?}", cases.len(), matches!(ignored, Verdict::Ignored(_)));
+        if !wrong.is_empty() || !matches!(ignored, Verdict::Ignored(_)) {
+            return Err(format!("minecraft classification failed: {wrong:?}"));
         }
         let system = catalog.classify(r"C:\Windows\explorer.exe", &settings);
         if system != Verdict::NotGame {
@@ -2468,7 +2503,26 @@ fn main() {
             if let Err(e) = win::watch_session(on_session) {
                 log!("session end not watched: {e}");
             }
-            let store = Arc::new(Store::open(&work_dir.join("settings.json")));
+            // The self-test changes settings and puts them back at its end. A copy made
+            // at its start puts them back after a self-test that was stopped: one once
+            // left its test game and its notice settings among the user's settings.
+            let settings_path = work_dir.join("settings.json");
+            let backup = work_dir.join("settings.selftest-backup.json");
+            if backup.exists() {
+                match std::fs::rename(&backup, &settings_path) {
+                    Ok(()) => log!("settings: restored the copy made before a self-test that did not finish"),
+                    Err(e) => log!("settings: could not restore the copy made before a self-test: {e}"),
+                }
+            }
+            if selftest_mode && settings_path.exists() {
+                match std::fs::copy(&settings_path, &backup) {
+                    Ok(_) => {
+                        app.manage(SettingsBackup(backup.clone()));
+                    }
+                    Err(e) => log!("settings: no copy before the self-test: {e}"),
+                }
+            }
+            let store = Arc::new(Store::open(&settings_path));
             app.manage(store.clone());
             i18n::set(&store.get().language);
             log!("language: {} ({})", store.get().language, i18n::current());

@@ -5,8 +5,9 @@
 //! the user's own choices (game.manual-add), which always win.
 //!
 //! A game is identified by its store and its ID there (`steam:1808500`,
-//! `riot:valorant`), or by `exe:<file name>` for the curated list and `user:<path>`
-//! for games the user added.
+//! `riot:valorant`), by `exe:<file name>` for the curated list, by the curated key
+//! of a game found by its window (`minecraft:java`), and by `user:<path>` for games
+//! the user added.
 
 use std::path::{Path, PathBuf};
 
@@ -42,7 +43,23 @@ pub struct Installed {
     prefix: String,
 }
 
+/// A game that runs in a shared program from any folder, such as Minecraft (Java)
+/// in the javaw.exe of whichever Java runtime its launcher brought (app/games.json,
+/// windowGames).
+struct WindowGame {
+    id: GameId,
+    /// Lowercase program file names.
+    exes: Vec<String>,
+    /// Window classes, compared without case.
+    classes: Vec<String>,
+    /// Lowercase parts of the command line, any one of which marks the game.
+    command_line: Vec<String>,
+    /// Lowercase title prefixes, used when the command line cannot be read.
+    titles: Vec<String>,
+}
+
 struct Curated {
+    window_games: Vec<WindowGame>,
     not_games: Vec<String>,
     blocked_exes: Vec<String>,
     blocked_patterns: Vec<String>,
@@ -60,7 +77,17 @@ impl Curated {
             .flatten()
             .filter_map(|g| Some((g["exe"].as_str()?.to_lowercase(), g["name"].as_str()?.to_string())))
             .collect();
-        Curated { not_games: strings("notGames"), blocked_exes: strings("blockedExes"), blocked_patterns: strings("blockedPatterns"), games }
+        let list = |g: &Value, key: &str| -> Vec<String> { g[key].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_lowercase).collect() };
+        let window_games = v["windowGames"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|g| {
+                let id = GameId { key: g["key"].as_str()?.to_string(), name: g["name"].as_str()?.to_string(), source: "list" };
+                Some(WindowGame { id, exes: list(g, "exes"), classes: list(g, "classes"), command_line: list(g, "commandLine"), titles: list(g, "titles") })
+            })
+            .collect();
+        Curated { window_games, not_games: strings("notGames"), blocked_exes: strings("blockedExes"), blocked_patterns: strings("blockedPatterns"), games }
     }
 
     fn blocks(&self, file: &str) -> bool {
@@ -140,6 +167,39 @@ impl Catalog {
             Some(_) if self.curated.blocks(&file) => Verdict::NotGame,
             Some(id) if settings.ignored_games.iter().any(|g| g.key == id.key) => Verdict::Ignored(id),
             Some(id) => Verdict::Game(id),
+        }
+    }
+
+    /// Decides whether a window is a game's: by its program as `classify` does, and
+    /// for the games of `windowGames`, by the program's file name, the window class
+    /// and the command line (read only for those candidates), or the title when the
+    /// command line cannot be read. Minecraft (Java) runs in the javaw.exe of the
+    /// Java runtime its launcher brought, a different one for each launcher and
+    /// often for each modpack, so its path says nothing.
+    pub fn classify_window(&self, exe_path: &str, class: &str, title: &str, command_line: impl FnOnce() -> Option<String>, settings: &Settings) -> Verdict {
+        let verdict = self.classify(exe_path, settings);
+        if verdict != Verdict::NotGame {
+            return verdict;
+        }
+        let file = file_name_lower(exe_path);
+        let class = class.to_lowercase();
+        let Some(game) = self.curated.window_games.iter().find(|g| g.exes.contains(&file) && g.classes.contains(&class)) else {
+            return Verdict::NotGame;
+        };
+        let matches = match command_line() {
+            Some(line) => {
+                let line = line.to_lowercase();
+                game.command_line.iter().any(|m| line.contains(m.as_str()))
+            }
+            None => {
+                let title = title.trim().to_lowercase();
+                game.titles.iter().any(|t| title.starts_with(t.as_str()))
+            }
+        };
+        match matches {
+            false => Verdict::NotGame,
+            true if settings.ignored_games.iter().any(|g| g.key == game.id.key) => Verdict::Ignored(game.id.clone()),
+            true => Verdict::Game(game.id.clone()),
         }
     }
 }

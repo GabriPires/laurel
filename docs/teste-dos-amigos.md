@@ -4,6 +4,14 @@ O Laurel guarda os últimos segundos do jogo que você está jogando e salva um 
 
 Esta é uma versão de teste. Ela pode ter erros, e é exatamente isso que queremos achar com a sua ajuda.
 
+## O que mudou na 0.1.0-rc.11
+
+Esta versão é para quem joga Minecraft.
+
+- **Minecraft de qualquer launcher.** O Laurel agora reconhece o Minecraft Java sozinho, venha do launcher oficial ou de launchers de modpacks como o Prism, inclusive modpacks com Fabric, Forge ou NeoForge. Antes era preciso adicionar o Minecraft à mão, e um modpack que usasse outra versão do Java deixava de ser reconhecido. Os clipes saem com o nome **Minecraft**.
+- **Se você adicionou o Minecraft à mão,** em **Configurações > Jogos**, na parte **Seus jogos**, pode remover essa entrada: o Laurel já encontra o jogo sem ela.
+- **Modpacks pesados.** Durante a tela de carregamento de alguns modpacks, o Laurel pode gravar pela janela do jogo por alguns segundos. Quando o jogo termina de abrir, a gravação volta ao normal sozinha.
+
 ## O que mudou na 0.1.0-rc.10
 
 Esta versão corrige o que o último pacote de logs mostrou. Obrigado a quem mandou!
@@ -103,7 +111,7 @@ Quem já tem a versão anterior recebe a atualização pelo próprio Laurel: apa
 Não precisa fazer tudo. O que você conseguir já ajuda muito.
 
 1. **Instalação ou atualização:** instalou ou atualizou sem erro? Pediu administrador? Seu PC tinha OBS instalado?
-2. **Jogo encontrado:** abriu um jogo e o Laurel mostrou **Gravando** com o nome certo? Em jogos com anti-cheat, como o Fortnite, o clipe mostra o jogo, e não a tela do anti-cheat?
+2. **Jogo encontrado:** abriu um jogo e o Laurel mostrou **Gravando** com o nome certo? Em jogos com anti-cheat, como o Fortnite, o clipe mostra o jogo, e não a tela do anti-cheat? Se você joga Minecraft, o Laurel mostrou **Gravando** com o nome **Minecraft** sem você adicionar nada? Diga qual launcher e qual modpack você usa.
 3. **Clipe:** o F8 salvou o clipe? Tocou o som de clipe salvo? O clipe tem imagem e som, e pelo menos 30 segundos?
 4. **Som:** com o padrão (jogo e microfone), o Discord e a música ficaram fora do clipe? Teste também as outras opções de **Som do clipe**, e **Gravar meu microfone** desligado. Se usa fone Bluetooth com microfone, diga se o som do fone ficou normal com o Laurel aberto, sem jogo, e durante o jogo. Se aparecer o aviso **Gravando {jogo} pela janela**, confira se o clipe tem o som do jogo e se, depois de um tempo, a gravação voltou ao normal (no Windows 10, a borda amarela some).
 5. **Placa de vídeo:** em **Configurações > Gravação**, o item **Gravando agora** mostra o codificador em uso. Diga qual apareceu, qual é a sua placa (NVIDIA, AMD ou Intel) e se o seu PC é um notebook com duas placas de vídeo. Testar em placas AMD e Intel é muito importante.

@@ -76,6 +76,11 @@ extern "system" {
     fn SetFileAttributesW(path: *const u16, attributes: u32) -> i32;
 }
 
+#[link(name = "ntdll", kind = "raw-dylib")]
+extern "system" {
+    fn NtQueryInformationProcess(process: isize, class: u32, info: *mut c_void, length: u32, returned: *mut u32) -> i32;
+}
+
 #[link(name = "shell32", kind = "raw-dylib")]
 extern "system" {
     fn SHGetKnownFolderPath(id: *const Guid, flags: u32, token: isize, path: *mut *mut u16) -> i32;
@@ -908,6 +913,41 @@ pub fn app_windows() -> Vec<AppWindow> {
             AppWindow { hwnd, pid, title: window_string(hwnd, GetWindowTextW), class: window_string(hwnd, GetClassNameW), rect: window_rect(hwnd) }
         })
         .collect()
+}
+
+/// The command line a process was started with (Windows 8.1 and later), or None
+/// when it cannot be read. Game detection reads it only for programs such as
+/// javaw.exe, where the path does not tell which game runs (Minecraft).
+pub fn process_command_line(pid: u32) -> Option<String> {
+    const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process == 0 {
+            return None;
+        }
+        let mut needed = 0u32;
+        let mut buf: Vec<u64> = vec![0; 64];
+        let mut status = NtQueryInformationProcess(process, PROCESS_COMMAND_LINE_INFORMATION, buf.as_mut_ptr().cast(), (buf.len() * 8) as u32, &mut needed);
+        if status == STATUS_INFO_LENGTH_MISMATCH && needed > 0 {
+            buf = vec![0; (needed as usize).div_ceil(8)];
+            status = NtQueryInformationProcess(process, PROCESS_COMMAND_LINE_INFORMATION, buf.as_mut_ptr().cast(), (buf.len() * 8) as u32, &mut needed);
+        }
+        CloseHandle(process);
+        if status < 0 {
+            return None;
+        }
+        // A UNICODE_STRING (length in bytes, maximum, then a pointer) whose text
+        // follows it in the same buffer.
+        let length = (buf[0] & 0xFFFF) as usize / 2;
+        let text = buf[1] as *const u16;
+        let start = buf.as_ptr() as usize;
+        let end = start + buf.len() * 8;
+        if text.is_null() || (text as usize) < start || (text as usize) + length * 2 > end {
+            return None;
+        }
+        Some(String::from_utf16_lossy(std::slice::from_raw_parts(text, length)))
+    }
 }
 
 /// Full path of a process's executable; works for elevated and protected games too.

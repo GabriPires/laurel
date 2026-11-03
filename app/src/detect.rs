@@ -353,7 +353,7 @@ impl Detector {
                 continue;
             }
             let Some(path) = paths.entry(pid).or_insert_with(|| win::process_path(pid)).clone() else { continue };
-            let Verdict::Game(id) = catalog.classify(&path, &settings) else { continue };
+            let Verdict::Game(id) = catalog.classify_window(&path, &class, &title, || win::process_command_line(pid), &settings) else { continue };
             let active = Active { id, path, pid, hwnd, title, class };
             match found.iter_mut().find(|a| a.id.key == active.id.key) {
                 Some(existing) if hwnd == foreground => *existing = active,
@@ -748,7 +748,7 @@ pub fn running_programs(detector: &Detector) -> Vec<Value> {
             continue;
         }
         let Some(path) = win::process_path(w.pid) else { continue };
-        if !seen.insert(path.to_lowercase()) || catalog.classify(&path, &settings) != Verdict::NotGame {
+        if !seen.insert(path.to_lowercase()) || catalog.classify_window(&path, &w.class, &w.title, || win::process_command_line(w.pid), &settings) != Verdict::NotGame {
             continue;
         }
         let lower = path.to_lowercase();
