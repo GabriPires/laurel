@@ -34,10 +34,15 @@
 //!   --script "cmd; cmd; ..."    commands: wait N | save | screenshot | stats | beep N |
 //!                               capture <monitor[:N[:method]]|window:..|game[:..]> |
 //!                               mix <game|game-mic|pc-mic> | probe [on|off] |
-//!                               mic [retry|on|off|device <id>] | mics | crash | quit
+//!                               mic [retry|on|off|device <id>] | mics | crash |
+//!                               simulate device|stall|stall-hang | quit
 //!                               (without --script or --rpc, commands are read from stdin)
 //! Logs (libobs and the engine's own) always go to stderr, and so does the report of
 //! an unhandled exception (crash.rs; `crash` and the `crash` request cause one, for tests).
+//! The health watch (health.rs) ends the engine with its own exit code when the
+//! graphics device is lost (60), the replay buffer gets no video (61) or the GPU to
+//! render on changed (62); `simulate` and the `simulateHealth` request fake the first
+//! two, for tests.
 //!
 //! libobs and its plugins come from Laurel's own OBS runtime, staged by
 //! tools/obs-runtime.py: the engine runs from `<runtime>\bin\64bit`, next to obs.dll.
@@ -55,12 +60,14 @@ macro_rules! log {
 
 mod crash;
 mod gpu;
+mod health;
 mod obs;
 mod recorder;
 mod rpc;
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use obs::{Data, EncoderType, Obs, VideoConfig};
@@ -336,12 +343,17 @@ fn main() {
         log!("[laurel] could not set per-monitor DPI awareness");
     }
     let rpc = args.rpc;
-    if let Err(e) = run(args) {
-        log!("[laurel] error: {e}");
-        if rpc {
-            rpc::notify("fatal", json!({ "message": e }));
+    match run(args) {
+        Ok(0) => {}
+        // A24, A25: libobs is shut down; the app starts a new engine.
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            log!("[laurel] error: {e}");
+            if rpc {
+                rpc::notify("fatal", json!({ "message": e }));
+            }
+            std::process::exit(1);
         }
-        std::process::exit(1);
     }
 }
 
@@ -445,7 +457,8 @@ fn fallbacks_json(rec: &Recorder) -> Value {
     Value::Array(rec.encoder_fallbacks().iter().map(|(id, error)| json!({ "encoder": id, "error": error })).collect())
 }
 
-fn run(args: Args) -> Result<(), String> {
+/// Runs the engine; the exit code when the health watch ended it, else 0.
+fn run(args: Args) -> Result<i32, String> {
     let config_dir = args.work_dir.join("obs-config");
     let clips_dir = args.clips_dir.clone().unwrap_or_else(|| args.work_dir.join("clips"));
     let shots_dir = args.screenshots_dir.clone().unwrap_or_else(|| args.work_dir.join("screenshots"));
@@ -504,7 +517,7 @@ fn run(args: Args) -> Result<(), String> {
         for (label, spec) in obs.source_list_property("wasapi_process_output_capture", "window") {
             log!("[laurel] app audio window {label} = {spec}");
         }
-        return Ok(());
+        return Ok(0);
     }
 
     let choices = encoder_candidates(&args.encoder, &args.codec, &encoders);
@@ -534,7 +547,15 @@ fn run(args: Args) -> Result<(), String> {
         cfg.capture, args.base.0, args.base.1, out.0, out.1, args.fps, rec.encoder(), args.rate, args.preset, args.bitrate, args.buffer, args.desktop_audio, args.mic, args.mic_enabled, args.mic_device, rec.audio_mix().name(), args.record, args.paused
     );
 
+    // A24, A25: the health watch ends the engine when it can no longer record. The
+    // GPU choice is watched only when gpu.rs made it (not with --adapter).
+    let auto_adapter = gpu.adapter.clone().filter(|_| args.adapter.is_none());
     if args.rpc {
+        let (tx, events) = channel::<rpc::Event<health::Problem>>();
+        rpc::read_stdin(tx.clone());
+        let watch = health::start(rec.weak_output(), auto_adapter, move |problem| {
+            let _ = tx.send(rpc::Event::Stop(problem));
+        });
         let dirs = Dirs { clips: clips_dir, screenshots: shots_dir, thumbnails: thumbs_dir };
         rpc::notify(
             "ready",
@@ -544,6 +565,7 @@ fn run(args: Args) -> Result<(), String> {
                 "encoderRequested": args.encoder,
                 "codec": args.codec,
                 "encoderFallbacks": fallbacks_json(&rec),
+                "encoderCopy": rec.encoder_copy(),
                 "encoders": video_encoder_list(&encoders),
                 "adapter": gpu.json(),
                 "target": args.capture_spec,
@@ -558,23 +580,40 @@ fn run(args: Args) -> Result<(), String> {
                 "screenshotsDir": dirs.screenshots,
             }),
         );
-        serve_app(&obs, &mut rec, &args, &dirs);
-        drop(rec);
-        log!("[laurel] shutdown ({} libobs UI tasks run)", obs::ui_tasks_run());
-        return Ok(());
+        let problem = serve_app(&obs, &mut rec, &args, &dirs, events);
+        return Ok(finish(watch, rec, problem));
     }
+
+    let (tx, problems) = channel::<health::Problem>();
+    let watch = health::start(rec.weak_output(), auto_adapter, move |problem| {
+        let _ = tx.send(problem);
+    });
+    let mut problem = None;
 
     let commands: Box<dyn Iterator<Item = String>> = match &args.script {
         Some(s) => Box::new(s.split(';').map(|c| c.trim().to_string()).collect::<Vec<_>>().into_iter()),
         None => Box::new(std::io::stdin().lock().lines().map_while(Result::ok).collect::<Vec<_>>().into_iter()),
     };
     for cmd in commands {
+        if let Ok(p) = problems.try_recv() {
+            problem = Some(p);
+            break;
+        }
         let mut parts = cmd.split_whitespace();
         match parts.next() {
             None => {}
             Some("wait") => {
                 let secs: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1.0);
-                std::thread::sleep(Duration::from_secs_f64(secs));
+                let wait = Duration::from_secs_f64(secs);
+                let until = Instant::now() + wait;
+                match problems.recv_timeout(wait) {
+                    Ok(p) => {
+                        problem = Some(p);
+                        break;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => std::thread::sleep(until.saturating_duration_since(Instant::now())),
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
             }
             Some("save") => {
                 log!("[laurel] save at {}", clock());
@@ -628,13 +667,31 @@ fn run(args: Args) -> Result<(), String> {
             }
             Some("mics") => log!("[laurel] microphones: {}", microphone_list()),
             Some("crash") => crash::deliberate(),
+            Some("simulate") => {
+                if let Err(e) = health::simulate(parts.next().unwrap_or_default()) {
+                    log!("[laurel] {e}");
+                }
+            }
             Some("quit") => break,
             Some(other) => log!("[laurel] unknown command {other}"),
         }
     }
+    let problem = problem.or_else(|| problems.try_recv().ok());
+    Ok(finish(watch, rec, problem))
+}
+
+/// Shuts the recorder down in order, after the health watch, and gives the exit
+/// code: the problem's, or 0. A stuck output can make this hang; the watch then
+/// ends the process after its grace (health.rs).
+fn finish(watch: health::Watch, rec: Recorder, problem: Option<health::Problem>) -> i32 {
+    watch.stop();
+    if problem.is_some() && health::hang_requested() {
+        log!("[laurel] health: holding the shutdown, as a stuck output would (test)");
+        std::thread::sleep(Duration::from_secs(60));
+    }
     drop(rec);
     log!("[laurel] shutdown ({} libobs UI tasks run)", obs::ui_tasks_run());
-    Ok(())
+    problem.map_or(0, |p| p.code)
 }
 
 /// The microphones the player can choose (spec audio.mic), without OBS's own
@@ -654,10 +711,11 @@ struct Dirs {
     thumbnails: PathBuf,
 }
 
-/// Answers the app's requests (see rpc.rs) until it disconnects or asks to quit.
-fn serve_app(obs: &Obs, rec: &mut Recorder, args: &Args, dirs: &Dirs) {
+/// Answers the app's requests (see rpc.rs) until it disconnects or asks to quit, or
+/// until the health watch finds a problem, which it returns.
+fn serve_app(obs: &Obs, rec: &mut Recorder, args: &Args, dirs: &Dirs, events: std::sync::mpsc::Receiver<rpc::Event<health::Problem>>) -> Option<health::Problem> {
     let mut target = args.capture_spec.clone();
-    rpc::serve(|method, params| {
+    rpc::serve(events, |method, params| {
         let result = match method {
             "status" => {
                 let s = obs.stats();
@@ -701,6 +759,11 @@ fn serve_app(obs: &Obs, rec: &mut Recorder, args: &Args, dirs: &Dirs) {
             "listMicrophones" => Ok(microphone_list()),
             // A19: the self-test checks the crash report in engine.log.
             "crash" => crash::deliberate(),
+            // A24, A25: the self-test fakes a lost device or a replay buffer without video.
+            "simulateHealth" => {
+                let problem = params.get("problem").and_then(Value::as_str).unwrap_or_default();
+                health::simulate(problem).map(|_| json!({ "simulated": problem }))
+            }
             "setMicrophone" => {
                 // Spec audio.mic: the switch and the device apply without a restart.
                 let enabled = params.get("enabled").and_then(Value::as_bool);
@@ -761,11 +824,12 @@ fn serve_app(obs: &Obs, rec: &mut Recorder, args: &Args, dirs: &Dirs) {
             "setRecording" => {
                 // Pauses or resumes the replay buffer (low disk space, record.toggle).
                 let enabled = params.get("enabled").and_then(Value::as_bool).unwrap_or(true);
-                let before = rec.encoder().to_string();
+                let before = (rec.encoder().to_string(), rec.encoder_copy());
                 let result = rec.set_recording(enabled).map(|_| json!({ "recording": rec.active(), "encoder": rec.encoder() }));
-                if rec.encoder() != before {
-                    // A fallback while resuming (spec quality.encoding): the app tells the player.
-                    rpc::notify("encoder", json!({ "encoder": rec.encoder(), "encoderFallbacks": fallbacks_json(rec) }));
+                if rec.encoder() != before.0 || rec.encoder_copy() != before.1 {
+                    // A fallback while resuming (spec quality.encoding): the app tells the
+                    // player. A28: OBS's copy through memory only goes to the state.
+                    rpc::notify("encoder", json!({ "encoder": rec.encoder(), "encoderFallbacks": fallbacks_json(rec), "encoderCopy": rec.encoder_copy() }));
                 }
                 result
             }
@@ -773,5 +837,5 @@ fn serve_app(obs: &Obs, rec: &mut Recorder, args: &Args, dirs: &Dirs) {
             other => Err(format!("method not found: {other}")),
         };
         (result, rpc::Flow::Continue)
-    });
+    })
 }

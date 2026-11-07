@@ -4,6 +4,15 @@ O Laurel guarda os últimos segundos do jogo que você está jogando e salva um 
 
 Esta é uma versão de teste. Ela pode ter erros, e é exatamente isso que queremos achar com a sua ajuda.
 
+## O que mudou na 0.1.0-rc.12
+
+Esta versão corrige o que o pacote de logs do notebook mostrou. Obrigado a quem mandou!
+
+- **Placa de vídeo reiniciada.** Se o driver da placa de vídeo for instalado, atualizado ou reiniciar com o Laurel aberto, o Laurel reinicia o gravador sozinho em poucos segundos. Antes, ele parava de gravar até ser aberto de novo e podia ocupar cada vez mais memória.
+- **Mudar uma configuração com o jogo aberto.** Depois de mudar uma configuração de vídeo, a gravação volta com a imagem do jogo. Antes, às vezes os clipes saíam sem imagem até você desligar e ligar a gravação.
+- **Programas que você adicionou.** Um programa que você adicionou à mão, como o Spotify, não tira mais a gravação do jogo numa troca rápida de janela: só se ficar uns 30 segundos na frente. O nome de um programa novo vem do próprio programa, e não do título da janela. Se o nome de algum que você já adicionou ficou estranho (o nome de uma música, por exemplo), clique nele em **Configurações > Jogos**, na parte **Seus jogos**, e troque.
+- **Jogos que rodam como administrador.** O aviso continua o mesmo, mas o Laurel para de tentar gravar o jogo enquanto você não o reiniciar como administrador.
+
 ## O que mudou na 0.1.0-rc.11
 
 Esta versão é para quem joga Minecraft.
@@ -111,7 +120,7 @@ Quem já tem a versão anterior recebe a atualização pelo próprio Laurel: apa
 Não precisa fazer tudo. O que você conseguir já ajuda muito.
 
 1. **Instalação ou atualização:** instalou ou atualizou sem erro? Pediu administrador? Seu PC tinha OBS instalado?
-2. **Jogo encontrado:** abriu um jogo e o Laurel mostrou **Gravando** com o nome certo? Em jogos com anti-cheat, como o Fortnite, o clipe mostra o jogo, e não a tela do anti-cheat? Se você joga Minecraft, o Laurel mostrou **Gravando** com o nome **Minecraft** sem você adicionar nada? Diga qual launcher e qual modpack você usa.
+2. **Jogo encontrado:** abriu um jogo e o Laurel mostrou **Gravando** com o nome certo? Em jogos com anti-cheat, como o Fortnite, o clipe mostra o jogo, e não a tela do anti-cheat? Se você joga Minecraft, o Laurel mostrou **Gravando** com o nome **Minecraft** sem você adicionar nada? Diga qual launcher e qual modpack você usa. Se você adicionou um programa à mão, ele ainda tira a gravação do jogo quando você troca de janela rapidinho?
 3. **Clipe:** o F8 salvou o clipe? Tocou o som de clipe salvo? O clipe tem imagem e som, e pelo menos 30 segundos?
 4. **Som:** com o padrão (jogo e microfone), o Discord e a música ficaram fora do clipe? Teste também as outras opções de **Som do clipe**, e **Gravar meu microfone** desligado. Se usa fone Bluetooth com microfone, diga se o som do fone ficou normal com o Laurel aberto, sem jogo, e durante o jogo. Se aparecer o aviso **Gravando {jogo} pela janela**, confira se o clipe tem o som do jogo e se, depois de um tempo, a gravação voltou ao normal (no Windows 10, a borda amarela some).
 5. **Placa de vídeo:** em **Configurações > Gravação**, o item **Gravando agora** mostra o codificador em uso. Diga qual apareceu, qual é a sua placa (NVIDIA, AMD ou Intel) e se o seu PC é um notebook com duas placas de vídeo. Testar em placas AMD e Intel é muito importante.

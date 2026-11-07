@@ -61,6 +61,34 @@ pub enum AudioEvent {
 
 static AUDIO_EVENTS: Mutex<Option<Sender<AudioEvent>>> = Mutex::new(None);
 
+/// A28 of the stability tests: why OBS's NVENC texture encoder could not take the
+/// frames on the GPU, from obs-nvenc's own lines. The encoder then reroutes to the
+/// NVENC encoder that copies each frame through system memory, which libobs does
+/// not report (obs_encoder_get_id keeps the original id). On a laptop whose NVIDIA
+/// GPU is not DXGI adapter 0 that is every recording: obs-nvenc's texture encoder
+/// opens its own Direct3D 11 device on adapter 0.
+static NVENC_TEXTURE_FAILURE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Takes (and clears) what obs-nvenc logged about its texture encoder failing.
+pub fn take_nvenc_texture_failure() -> Option<String> {
+    NVENC_TEXTURE_FAILURE.lock().ok().and_then(|mut slot| slot.take())
+}
+
+/// The reason in an obs-nvenc line about its texture encoder, if it is one: an
+/// error ("init_session: ... failed: 1 (NV_ENC_ERR_NO_ENCODE_DEVICE)" gives the
+/// error's name) or a fallback it chose ("..., falling back to non-texture encoder").
+fn nvenc_texture_failure(level: i32, line: &str) -> Option<String> {
+    let message = line.strip_prefix("[obs-nvenc] ")?;
+    if message.contains("falling back to") {
+        return Some(message.to_string());
+    }
+    if level != ffi::LOG_ERROR {
+        return None;
+    }
+    let named = message.rsplit_once('(').and_then(|(_, rest)| rest.strip_suffix(')')).filter(|name| name.starts_with("NV_ENC_ERR_"));
+    Some(named.unwrap_or(message).to_string())
+}
+
 thread_local! {
     /// The error of the last "[WASAPISource::TryInitialize]" line on this thread;
     /// the same thread then logs which source failed to start.
@@ -115,10 +143,19 @@ unsafe extern "C" fn on_log(level: i32, msg: *const c_char, args: *mut c_void, _
         _ => "debug",
     };
     log!("{prefix}: {line}");
+    if let Some(reason) = nvenc_texture_failure(level, &line) {
+        if let Ok(mut slot) = NVENC_TEXTURE_FAILURE.lock() {
+            *slot = Some(reason);
+        }
+    }
     if let Some(event) = audio_event(&line) {
         if let Some(tx) = AUDIO_EVENTS.lock().ok().as_ref().and_then(|slot| slot.as_ref()) {
             let _ = tx.send(event);
         }
+    }
+    // A24: libobs logs this after a Direct3D 11 call fails on a lost device.
+    if line.contains("Device Removed Reason") {
+        crate::health::wake();
     }
     if let Some(name) = shared_texture_failure(&line) {
         if let Some(tx) = SHARED_TEXTURE_FAILURES.lock().ok().as_ref().and_then(|slot| slot.as_ref()) {
@@ -733,5 +770,39 @@ impl Output {
 impl Drop for Output {
     fn drop(&mut self) {
         unsafe { ffi::obs_output_release(self.0) }
+    }
+}
+
+impl Output {
+    /// A weak reference for another thread (health.rs): it never keeps the output
+    /// alive, so the output is still destroyed where the recorder drops it.
+    pub fn weak(&self) -> WeakOutput {
+        WeakOutput(unsafe { ffi::obs_output_get_weak_output(self.0) })
+    }
+}
+
+/// A weak reference to an output, usable from another thread: libobs' output
+/// getters used here read counters and flags only.
+pub struct WeakOutput(*mut ffi::obs_weak_output_t);
+
+unsafe impl Send for WeakOutput {}
+
+impl WeakOutput {
+    /// The output's state now, if it still exists: (active, video frames sent to it
+    /// since it last started).
+    pub fn state(&self) -> Option<(bool, i32)> {
+        let output = unsafe { ffi::obs_weak_output_get_output(self.0) };
+        if output.is_null() {
+            return None;
+        }
+        let state = unsafe { (ffi::obs_output_active(output), ffi::obs_output_get_total_frames(output)) };
+        unsafe { ffi::obs_output_release(output) };
+        Some(state)
+    }
+}
+
+impl Drop for WeakOutput {
+    fn drop(&mut self) {
+        unsafe { ffi::obs_weak_output_release(self.0) }
     }
 }

@@ -563,5 +563,10 @@
   "Windows default": "Padrão do Windows",
   "Microphone not connected": "Microfone desconectado",
   "The chosen microphone is not connected: clips go without your voice until it is.": "O microfone escolhido não está conectado: os clipes saem sem a sua voz até ele voltar.",
-  "A Bluetooth headset's microphone puts the headset in call mode, with lower sound, while Laurel records.": "O microfone de um fone Bluetooth põe o fone no modo de chamada, com som pior, enquanto o Laurel grava."
+  "A Bluetooth headset's microphone puts the headset in call mode, with lower sound, while Laurel records.": "O microfone de um fone Bluetooth põe o fone no modo de chamada, com som pior, enquanto o Laurel grava.",
+  "Name of {path}": "Nome de {path}",
+  "Click to rename": "Clique para renomear",
+  "Could not rename the game: {error}": "Não foi possível renomear o jogo: {error}",
+  "The name cannot be empty": "O nome não pode ficar vazio",
+  "This game is not in your games": "Este jogo não está entre os seus jogos"
 }

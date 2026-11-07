@@ -48,12 +48,28 @@ function renderGames(o) {
   }));
   if (!o.installed.length) installed.replaceChildren(gameItem(t('No games found in the store libraries')));
 
+  // The games the user added; the name can be changed (A27: it used to be the
+  // window title, which a music player changes with each song).
   $('games-custom').replaceChildren(...o.custom.map((g) => {
     const remove = document.createElement('button');
     remove.className = 'btn btn-secondary';
     remove.textContent = t('Remove');
     remove.onclick = async () => renderGames(await invoke('games_remove', { path: g.path }));
-    return gameItem(g.name, ...liveBadge(`user:${g.path.toLowerCase()}`), span('game-path', g.path), remove);
+    const name = document.createElement('input');
+    name.type = 'text';
+    name.className = 'game-name game-name-input';
+    name.value = g.name;
+    name.spellcheck = false;
+    name.setAttribute('aria-label', t('Name of {path}', { path: g.path }));
+    name.title = t('Click to rename');
+    name.onkeydown = (e) => {
+      if (e.key === 'Enter') name.blur();
+      if (e.key === 'Escape') { name.value = g.name; name.blur(); }
+    };
+    name.onchange = () => renameGame(g.path, name, g.name);
+    const li = document.createElement('li');
+    li.append(name, ...liveBadge(`user:${g.path.toLowerCase()}`), span('game-path', g.path), remove);
+    return li;
   }));
 
   // Ignored games that are not in the installed list (for example from Laurel's list).
@@ -96,12 +112,27 @@ async function loadRunning() {
   $('games-add-running').disabled = !running.length;
 }
 
-async function addGame(path, name) {
+// The name comes from the program; the window title only when it has none.
+async function addGame(path, title) {
   try {
-    renderGames(await invoke('games_add', { path, name }));
+    renderGames(await invoke('games_add', { path, name: null, title }));
     loadRunning();
   } catch (e) {
     $('settings-status').textContent = t('Could not add the game: {error}', { error: e });
+  }
+}
+
+async function renameGame(path, input, before) {
+  const name = input.value.trim();
+  if (!name || name === before) {
+    input.value = before;
+    return;
+  }
+  try {
+    renderGames(await invoke('games_rename', { path, name }));
+  } catch (e) {
+    input.value = before;
+    $('settings-status').textContent = t('Could not rename the game: {error}', { error: e });
   }
 }
 

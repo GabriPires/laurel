@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 
 use crate::obs::{
     clear_output_channel, cstr, ffi, list_source_property, opt_string, watch_audio_events, watch_shared_texture_failures, AudioEvent, Data, Encoder, Obs, Output,
-    Scene, SharedSource, Source,
+    Scene, SharedSource, Source, WeakOutput, take_nvenc_texture_failure,
 };
 
 const VIDEO_CHANNEL: u32 = 0;
@@ -332,6 +332,13 @@ fn spawn_texture_watch(watch: Arc<TextureWatch>) -> JoinHandle<()> {
                     source.share()
                 })
             };
+            // A24: on a lost device every shared texture fails to open; that is
+            // not a game on another GPU, and the engine is about to start again.
+            if let (Some(_), Some(reason)) = (&source, crate::health::device_lost()) {
+                log!("[laurel] game capture '{name}': the graphics device is lost ({reason}), not trying shared-memory capture");
+                crate::health::wake();
+                continue;
+            }
             if let Some(source) = source {
                 log!("[laurel] game capture '{name}': OBS cannot open the game's shared texture (the game runs on another GPU); trying shared-memory capture");
                 source.update(&Data::new().bool("sli_compatibility", true));
@@ -510,6 +517,8 @@ pub struct Recorder {
     video_choices: Vec<VideoChoice>,
     video_index: usize,
     fallbacks: Vec<(String, String)>,
+    /// A28: the NVENC encoder OBS rerouted the texture encoder to, and why.
+    encoder_copy: Option<(String, String)>,
 }
 
 unsafe extern "C" fn on_replay_saved(data: *mut c_void, _cd: *mut ffi::calldata_t) {
@@ -565,6 +574,7 @@ impl Recorder {
                 video_choices,
                 video_index: 0,
                 fallbacks: vec![],
+                encoder_copy: None,
             });
         }
 
@@ -649,6 +659,7 @@ impl Recorder {
             video_choices,
             video_index: 0,
             fallbacks: vec![],
+            encoder_copy: None,
         };
         rec.set_mix(cfg.mix)?;
         rec.first_video_encoder()?;
@@ -699,8 +710,12 @@ impl Recorder {
     /// (spec quality.encoding); the reasons are kept for the app.
     fn start_output(&mut self) -> Result<(), String> {
         loop {
+            let _ = take_nvenc_texture_failure();
             let error = match self.output()?.start() {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.note_encoder_copy();
+                    return Ok(());
+                }
                 Err(e) => e,
             };
             let failed = self.encoder().to_string();
@@ -710,6 +725,24 @@ impl Recorder {
                 return Err(format!("no video encoder could start: {error}"));
             }
         }
+    }
+
+    /// A28: an NVENC texture encoder that started may have been rerouted by OBS to
+    /// the NVENC encoder that copies each frame through system memory; obs-nvenc
+    /// logs why while the output starts, and nothing else tells.
+    fn note_encoder_copy(&mut self) {
+        let id = self.encoder().to_string();
+        let reason = take_nvenc_texture_failure().filter(|_| id.starts_with("obs_nvenc") && id.ends_with("_tex"));
+        let copy = reason.map(|reason| (format!("{}_soft", id.trim_end_matches("_tex")), reason));
+        if let Some((soft, reason)) = copy.as_ref().filter(|_| copy != self.encoder_copy) {
+            log!("[laurel] video encoder {id} cannot take the frames on the GPU ({reason}); OBS encodes with {soft}, copying each frame through system memory");
+        }
+        self.encoder_copy = copy;
+    }
+
+    /// A28: the encoder OBS uses in place of the texture encoder, and why, or null.
+    pub fn encoder_copy(&self) -> Value {
+        self.encoder_copy.as_ref().map_or(Value::Null, |(encoder, reason)| json!({ "encoder": encoder, "reason": reason }))
     }
 
     /// The video encoder in use.
@@ -1010,6 +1043,11 @@ impl Recorder {
     pub fn active(&self) -> bool {
         self.output.as_ref().is_some_and(Output::active)
     }
+
+    /// The replay buffer, for the health watch (A25), if there is one.
+    pub fn weak_output(&self) -> Option<WeakOutput> {
+        self.output.as_ref().map(Output::weak)
+    }
 }
 
 impl Drop for Recorder {
@@ -1135,14 +1173,17 @@ pub fn format_stats(obs: &Obs, rec: &Recorder) -> String {
     let s = obs.stats();
     let (cw, ch) = rec.capture_size();
     format!(
-        "capture={cw}x{ch} active_fps={:.2} avg_frame_ms={:.3} lagged={} skipped={}/{} output_dropped={} output_active={}",
+        "capture={cw}x{ch} active_fps={:.2} avg_frame_ms={:.3} lagged={} skipped={}/{} output_dropped={} output_active={} encoder={}{}",
         s.active_fps,
         s.average_frame_time_ms,
         s.lagged_frames,
         s.skipped_frames,
         s.total_frames,
         rec.frames_dropped(),
-        rec.active()
+        rec.active(),
+        rec.encoder(),
+        // A28: the encoder OBS uses in place of a texture encoder that could not start.
+        rec.encoder_copy.as_ref().map_or(String::new(), |(soft, _)| format!(" (as {soft})"))
     )
 }
 

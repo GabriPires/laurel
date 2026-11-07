@@ -29,6 +29,16 @@ const HEALTHY_RUN: Duration = Duration::from_secs(60);
 const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
 /// How long `shutdown` waits for the line that tells how the engine ended (A21).
 const EXIT_LINE_WAIT: Duration = Duration::from_secs(2);
+/// How long an engine asked to quit gets to answer, and then to end, before it is
+/// killed.
+const QUIT_WAIT: Duration = Duration::from_secs(5);
+/// A26 of the stability tests: the least wait before starting a new engine after
+/// one that ended on its own (a crash, a kill, the health watch). An engine that
+/// ends without stopping its game capture leaves OBS's hook in the game capturing
+/// for it; the hook notices only when it next checks the capture's keepalive
+/// mutex, every 5 s, and a new engine creates a mutex of the same name, so one
+/// that starts before that check finds the hook busy and never gets the game.
+const HOOK_RELEASE_WAIT: Duration = Duration::from_secs(6);
 
 /// "exit code 0xC0000005 (STATUS_ACCESS_VIOLATION)": codes past 0xFFFF in hex, as
 /// Windows writes them, with the name of the known ones (A19).
@@ -38,6 +48,10 @@ fn describe_exit(status: &std::process::ExitStatus) -> String {
     };
     let name = match code {
         101 => Some("a Rust panic"),
+        // A24, A25: the engine's health watch (engine/src/health.rs).
+        60 => Some("the engine's graphics device was lost"),
+        61 => Some("the replay buffer got no video"),
+        62 => Some("the GPU to render on changed"),
         0xC000_0005 => Some("STATUS_ACCESS_VIOLATION"),
         0xC000_001D => Some("STATUS_ILLEGAL_INSTRUCTION"),
         0xC000_00FD => Some("STATUS_STACK_OVERFLOW"),
@@ -169,23 +183,9 @@ impl Engine {
         if self.0.quitting.swap(true, Ordering::SeqCst) {
             return;
         }
-        let running = matches!(self.0.child.lock().unwrap().as_mut().map(|c| c.try_wait()), Some(Ok(None)));
+        let running = self.running_pid().is_some();
         let logged = *self.0.exits_logged.0.lock().unwrap();
-        let _ = self.request("shutdown", Value::Null, Duration::from_secs(5));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let exited = loop {
-            if !matches!(self.0.child.lock().unwrap().as_mut().map(|c| c.try_wait()), Some(Ok(None))) {
-                break true;
-            }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        };
-        if !exited {
-            log!("engine did not exit after shutdown; killing it");
-            self.kill();
-        }
+        self.end_in_order();
         if running {
             let (count, signal) = &self.0.exits_logged;
             let (_count, waited) = signal.wait_timeout_while(count.lock().unwrap(), EXIT_LINE_WAIT, |n| *n == logged).unwrap();
@@ -217,16 +217,49 @@ impl Engine {
         }
     }
 
+    /// The running engine's process id, if one runs.
+    fn running_pid(&self) -> Option<u32> {
+        let mut slot = self.0.child.lock().unwrap();
+        let child = slot.as_mut()?;
+        matches!(child.try_wait(), Ok(None)).then(|| child.id())
+    }
+
+    /// Asks the running engine to quit and waits for it to end, killing it if it
+    /// does not; an engine the supervisor starts meanwhile is left alone.
+    fn end_in_order(&self) {
+        let Some(pid) = self.running_pid() else { return };
+        let _ = self.request("shutdown", Value::Null, QUIT_WAIT);
+        let deadline = Instant::now() + QUIT_WAIT;
+        while self.running_pid() == Some(pid) {
+            if Instant::now() >= deadline {
+                log!("engine did not exit after shutdown; killing it");
+                if let Some(child) = self.0.child.lock().unwrap().as_mut().filter(|c| c.id() == pid) {
+                    let _ = child.kill();
+                }
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Restarts the engine with fresh options (new settings), or restarts
     /// supervision after the supervisor gave up. A restart asked for is not counted
     /// as a failure and starts again at once.
+    ///
+    /// A26 of the stability tests: the engine is asked to quit, not killed, so that
+    /// it stops its game capture and the hook in the game is free for the next one
+    /// (see HOOK_RELEASE_WAIT). It takes about a second, on a thread of its own:
+    /// the callers are the settings and the UI.
     pub fn restart(&self) {
         if self.state()["state"] == "failed" {
             let supervisor = self.clone();
             std::thread::spawn(move || supervisor.supervise());
         } else {
             self.0.restarting.store(true, Ordering::SeqCst);
-            self.kill();
+            let engine = self.clone();
+            if std::thread::Builder::new().name("engine-restart".into()).spawn(move || engine.end_in_order()).is_err() {
+                self.kill();
+            }
         }
     }
 
@@ -279,7 +312,7 @@ impl Engine {
                 return;
             }
             self.set_state(json!({ "state": "stopped", "message": message }));
-            std::thread::sleep(Duration::from_secs(1 << quick_failures.min(4)));
+            std::thread::sleep(Duration::from_secs(1 << quick_failures.min(4)).max(HOOK_RELEASE_WAIT));
         }
         self.set_state(json!({ "state": "stopped", "message": "Laurel is closing", "closing": true }));
     }
@@ -398,6 +431,12 @@ impl Engine {
             Some("microphone") => {
                 log!("engine microphone: {params}");
                 self.set_microphone(params);
+            }
+            // A24, A25: the engine can no longer record and ends to be started again.
+            Some("unhealthy") => {
+                let text = params.get("reason").and_then(Value::as_str).unwrap_or_default().to_string();
+                log!("engine unhealthy: {text}");
+                *fatal.lock().unwrap() = Some(text);
             }
             Some("fatal") => {
                 let text = params.get("message").and_then(Value::as_str).unwrap_or_default().to_string();

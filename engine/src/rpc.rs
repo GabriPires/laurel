@@ -1,9 +1,11 @@
 //! JSON-RPC 2.0 between the Laurel app and the engine (PoC-U1): one JSON object per
 //! line, requests on stdin, responses and notifications on stdout. Only protocol
 //! messages go to stdout; logs go to stderr. EOF on stdin means the app is gone, and
-//! the engine shuts down.
+//! the engine shuts down. The lines are read on a thread of their own, so that the
+//! health watch (health.rs) can stop the loop while it waits for the app.
 
 use std::io::{BufRead, Write};
+use std::sync::mpsc::{Receiver, Sender};
 
 use serde_json::{json, Value};
 
@@ -22,10 +24,39 @@ pub fn notify(method: &str, params: Value) {
     send(json!({ "jsonrpc": "2.0", "method": method, "params": params }));
 }
 
-/// Answers requests until stdin closes or `handle` asks to quit. Requests without
-/// an id are treated as notifications and get no response.
-pub fn serve(mut handle: impl FnMut(&str, &Value) -> (Result<Value, String>, Flow)) {
-    for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+/// What the loop gets: a line from the app, the end of stdin, or a reason to stop
+/// from elsewhere in the engine.
+pub enum Event<T> {
+    Line(String),
+    Closed,
+    Stop(T),
+}
+
+/// Reads the app's lines on a thread of its own and sends them to `tx`.
+pub fn read_stdin<T: Send + 'static>(tx: Sender<Event<T>>) {
+    let reader = std::thread::Builder::new().name("laurel: stdin".into()).spawn(move || {
+        for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+            if tx.send(Event::Line(line)).is_err() {
+                return;
+            }
+        }
+        let _ = tx.send(Event::Closed);
+    });
+    if let Err(e) = reader {
+        log!("[laurel] no thread to read the app's requests: {e}");
+    }
+}
+
+/// Answers requests until stdin closes or `handle` asks to quit (None), or until a
+/// `Stop` arrives (its reason). Requests without an id are treated as notifications
+/// and get no response.
+pub fn serve<T>(events: Receiver<Event<T>>, mut handle: impl FnMut(&str, &Value) -> (Result<Value, String>, Flow)) -> Option<T> {
+    for event in events {
+        let line = match event {
+            Event::Line(line) => line,
+            Event::Closed => return None,
+            Event::Stop(reason) => return Some(reason),
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -47,7 +78,8 @@ pub fn serve(mut handle: impl FnMut(&str, &Value) -> (Result<Value, String>, Flo
             });
         }
         if let Flow::Quit = flow {
-            break;
+            return None;
         }
     }
+    None
 }

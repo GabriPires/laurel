@@ -14,6 +14,7 @@ pub type obs_scene_t = c_void;
 pub type obs_sceneitem_t = c_void;
 pub type obs_encoder_t = c_void;
 pub type obs_output_t = c_void;
+pub type obs_weak_output_t = c_void;
 pub type obs_module_t = c_void;
 pub type obs_properties_t = c_void;
 pub type obs_property_t = c_void;
@@ -51,6 +52,9 @@ pub const OBS_BOUNDS_SCALE_INNER: i32 = 2;
 pub const OBS_ALIGN_CENTER: u32 = 0;
 
 pub const OBS_VIDEO_SUCCESS: i32 = 0;
+
+// graphics.h device types (gs_get_device_type)
+pub const GS_DEVICE_DIRECT3D_11: i32 = 2;
 
 #[repr(C)]
 pub struct vec2 {
@@ -210,6 +214,16 @@ extern "C" {
     pub fn obs_output_get_signal_handler(output: *const obs_output_t) -> *mut signal_handler_t;
     pub fn obs_source_get_signal_handler(source: *const obs_source_t) -> *mut signal_handler_t;
     pub fn obs_output_release(output: *mut obs_output_t);
+    pub fn obs_output_get_total_frames(output: *const obs_output_t) -> i32;
+    pub fn obs_output_get_weak_output(output: *mut obs_output_t) -> *mut obs_weak_output_t;
+    pub fn obs_weak_output_get_output(weak: *mut obs_weak_output_t) -> *mut obs_output_t;
+    pub fn obs_weak_output_release(weak: *mut obs_weak_output_t);
+
+    // graphics (health.rs: whether the Direct3D 11 device was lost)
+    pub fn obs_enter_graphics();
+    pub fn obs_leave_graphics();
+    pub fn gs_get_device_type() -> i32;
+    pub fn gs_get_device_obj() -> *mut c_void;
 
     // callbacks and calldata
     pub fn proc_handler_call(handler: *mut proc_handler_t, name: *const c_char, params: *mut calldata_t) -> bool;

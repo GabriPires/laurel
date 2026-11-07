@@ -38,6 +38,17 @@ const MIN_HEIGHT: i32 = 360;
 const MISSING_SCANS: u32 = 3;
 /// Scans another game must stay in focus before the capture moves to it.
 const FOCUS_SCANS: u32 = 2;
+/// The same when the current game's capture is hooked (A27 of the stability tests):
+/// 30 s, so that a quick switch to another program the player added, such as a
+/// music player, does not take the capture from the game being played, while a
+/// game started and played next to an idle one still gets it.
+const HOOKED_FOCUS_SCANS: u32 = 15;
+
+/// Scans in focus another game needs before it takes the capture from the current
+/// one, which is or is not hooked.
+pub fn focus_scans_needed(current_hooked: bool) -> u32 {
+    if current_hooked { HOOKED_FOCUS_SCANS } else { FOCUS_SCANS }
+}
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// A game not hooked this long after the engine started capturing it is checked
 /// for elevation.
@@ -142,6 +153,11 @@ struct State {
     hook_checked: Option<String>,
     /// The game that runs as administrator while Laurel does not.
     needs_admin: Option<String>,
+    /// The process of a game confirmed to run as administrator while Laurel does
+    /// not (A29 of the stability tests): its capture waits, instead of OBS trying
+    /// to open the process every 2 s, until Laurel runs as administrator, the game
+    /// closes or its window moves to another process.
+    parked: Option<u32>,
     /// The game recorded through its window because its hook did not start.
     fallback: Option<String>,
     /// The tries of the fallback game's hook.
@@ -175,7 +191,7 @@ impl Detector {
             app,
             store,
             catalog: RwLock::new(catalog),
-            state: Mutex::new(State { mode, enabled, current: None, missing: 0, focus: None, disk_paused: false, applied: None, applied_pid: None, moved: None, kept: None, capture_started: None, hook_checked: None, needs_admin: None, fallback: None, retry: None, screen }),
+            state: Mutex::new(State { mode, enabled, current: None, missing: 0, focus: None, disk_paused: false, applied: None, applied_pid: None, moved: None, kept: None, capture_started: None, hook_checked: None, needs_admin: None, parked: None, fallback: None, retry: None, screen }),
             apply_lock: Mutex::new(()),
             wake: (Mutex::new(false), Condvar::new()),
             elevated: win::self_elevated(),
@@ -262,6 +278,7 @@ impl Detector {
             // The hook is checked again once the capture starts again.
             s.hook_checked = None;
             s.needs_admin = None;
+            s.parked = None;
             s.fallback = None;
             s.retry = None;
         }
@@ -318,6 +335,10 @@ impl Detector {
         {
             let mut s = self.state.lock().unwrap();
             s.applied = None;
+            // A26: the new engine hooks the game anew, so its hook is checked again
+            // (a game hooked before a restart could stay without image); the
+            // administrator notice is not shown a second time (see check_hook).
+            s.hook_checked = None;
             // A new engine has no hook try running: the next one starts now.
             if let Some(retry) = s.retry.as_mut() {
                 *retry = Retry { next: Instant::now(), until: None, ..*retry };
@@ -370,13 +391,17 @@ impl Detector {
         }
         let found = self.game_windows();
         let foreground = win::foreground_window();
-        let (started, ended, moved) = {
+        let mut held = None;
+        let mut renamed = false;
+        let (started, ended, moved, unparked) = {
             let mut s = self.state.lock().unwrap();
             let mut ended = None;
             if let Some(current) = s.current.clone() {
                 match found.iter().find(|a| a.id.key == current.id.key) {
                     Some(same) => {
                         s.missing = 0;
+                        // The player renamed the game (A27): the app shows the new name.
+                        renamed = same.id.name != current.id.name;
                         s.current = Some(same.clone());
                     }
                     // Minimized (or hidden) is not closed: the window is still there,
@@ -391,8 +416,10 @@ impl Detector {
                     }
                 }
             }
-            // Another game in focus takes over after a few scans.
+            // Another game in focus takes over after a few scans, or after more of
+            // them when the current game's capture is hooked (A27).
             let focused = found.iter().find(|a| a.hwnd == foreground && s.current.as_ref().is_some_and(|c| c.id.key != a.id.key)).cloned();
+            let hooked = s.current.as_ref().is_some_and(|c| s.hook_checked.as_deref() == Some(c.id.key.as_str())) && s.fallback.is_none() && s.needs_admin.is_none();
             let mut started = None;
             match focused {
                 Some(other) => {
@@ -401,10 +428,12 @@ impl Detector {
                         _ => 1,
                     };
                     s.focus = Some((other.id.key.clone(), scans));
-                    if scans >= FOCUS_SCANS {
+                    if scans >= focus_scans_needed(hooked) {
                         ended = s.current.replace(other.clone());
                         started = Some(other);
                         s.focus = None;
+                    } else if hooked && scans == FOCUS_SCANS {
+                        held = s.current.as_ref().map(|c| (other.id.name.clone(), c.id.name.clone()));
                     }
                 }
                 None => s.focus = None,
@@ -415,6 +444,15 @@ impl Detector {
                     s.current = Some(next.clone());
                     started = Some(next);
                 }
+            }
+            // A29: a parked game whose window is now another process's (a launcher
+            // running as administrator, then the game itself) is checked again.
+            let mut unparked = None;
+            let moved_on = s.current.clone().filter(|c| s.parked.is_some_and(|pid| pid != c.pid));
+            if let Some(c) = moved_on.filter(|_| started.is_none() && ended.is_none()) {
+                s.parked = None;
+                s.hook_checked = None;
+                unparked = Some(c);
             }
             // A23: the game's window moved to another of its processes, as Fortnite's
             // from its anti-cheat bootstrapper's splash screen to the game itself,
@@ -451,6 +489,7 @@ impl Detector {
             if ended.is_some() || started.is_some() {
                 s.hook_checked = None;
                 s.needs_admin = None;
+                s.parked = None;
                 s.fallback = None;
                 s.retry = None;
                 s.moved = None;
@@ -461,13 +500,19 @@ impl Detector {
                 s.fallback = Some(game.id.key.clone());
                 s.retry = Some(Retry::after_fallback());
             }
-            (started, ended, moved)
+            (started, ended, moved, unparked)
         };
+        if let Some((other, current)) = &held {
+            log!("{other} in focus: {current} keeps the capture while it is hooked, unless {other} stays in focus for {} s", u64::from(HOOKED_FOCUS_SCANS) * SCAN_EVERY.as_secs());
+        }
         if let Some(game) = &ended {
             log!("game closed or left: {} ({})", game.id.name, game.path);
         }
         if let Some(game) = &started {
             log!("game found: {} [{}] {} pid {} window {:?}", game.id.name, game.id.key, game.path, game.pid, game.title);
+        }
+        if renamed && started.is_none() && ended.is_none() {
+            let _ = self.app.emit("game-state", self.snapshot());
         }
         if started.is_some() || ended.is_some() {
             self.apply();
@@ -479,6 +524,11 @@ impl Detector {
         }
         if let Some(game) = moved {
             self.follow(game);
+        }
+        if let Some(game) = unparked {
+            log!("capture: {} moved to {} (pid {}); its capture starts again", game.id.name, game.exe(), game.pid);
+            self.apply();
+            let _ = self.app.emit("game-state", self.snapshot());
         }
         self.check_hook();
         self.retry_hook();
@@ -552,6 +602,7 @@ impl Detector {
             return;
         }
         let notified;
+        let parked;
         {
             let mut s = self.state.lock().unwrap();
             if s.current.as_ref().map(|g| &g.id.key) != Some(&game.id.key) {
@@ -562,17 +613,28 @@ impl Detector {
             // that process decides, and the notice is not shown a second time.
             notified = s.needs_admin.is_some();
             s.needs_admin = needs_admin.then(|| game.id.key.clone());
+            // A29: a process known to run as administrator cannot be opened by this
+            // Laurel; OBS would try every 2 s for as long as the game runs.
+            parked = needs_admin && elevated == Some(true);
+            if parked {
+                s.parked = Some(game.pid);
+            }
             if fallback {
                 s.fallback = Some(game.id.key.clone());
                 s.retry = Some(Retry::after_fallback());
             }
         }
         if hooked {
+            log!("capture: {} hooked (checked {} s after the capture started)", game.id.name, capturing.as_secs());
             return;
         }
         log!("capture: {} not hooked after {} s of capture; process elevated: {elevated:?}; Laurel elevated: {}", game.id.name, capturing.as_secs(), self.elevated);
         let notifier = self.app.state::<Notifier>();
         if needs_admin {
+            if parked {
+                log!("capture: {} runs as administrator: its capture waits until Laurel runs as administrator, the game closes or its window moves to another process", game.id.name);
+                self.apply();
+            }
             let _ = self.app.emit("game-state", self.snapshot());
             if notified {
                 return;
@@ -712,6 +774,10 @@ fn wanted(s: &State) -> (String, bool) {
         Mode::Detect => {
             let game = s.current.as_ref().filter(|_| s.screen.as_ref().is_none_or(|screen| screen.switch_to_games));
             match (game, &s.screen) {
+                // A29: nothing can be recorded of a parked game; the screen, when the
+                // player records it without a game.
+                (Some(game), Some(screen)) if s.parked == Some(game.pid) => (screen.target(), !s.disk_paused),
+                (Some(game), None) if s.parked == Some(game.pid) => ("none".into(), false),
                 (Some(game), _) if s.fallback.as_deref() == Some(game.id.key.as_str()) => (format!("window:{}", game.spec()), !s.disk_paused),
                 (Some(game), _) => (format!("game:{}", game.spec()), !s.disk_paused),
                 (None, Some(screen)) => (screen.target(), !s.disk_paused),

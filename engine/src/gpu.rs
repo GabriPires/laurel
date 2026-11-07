@@ -23,6 +23,13 @@ pub struct Adapter {
     pub software: bool,
 }
 
+impl Adapter {
+    /// Whether both are the same GPU now (a reinstalled driver gives a new LUID).
+    pub fn same_gpu(&self, other: &Adapter) -> bool {
+        self.luid == other.luid
+    }
+}
+
 /// The adapter the engine renders on, and why it was chosen.
 #[derive(Clone, Debug)]
 pub struct Choice {

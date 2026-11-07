@@ -761,16 +761,53 @@ fn change_games(app: &AppHandle, what: &str, edit: impl FnOnce(&mut Settings)) -
     Ok(games_overview(app.state(), app.state()))
 }
 
-/// Marks a program as a game (spec game.manual-add); its name defaults to the file name.
+/// Programs that run others (Java, Python, script hosts): their version resource
+/// names the runtime, not the game.
+const HOST_PROGRAMS: &[&str] = &["java.exe", "javaw.exe", "python.exe", "pythonw.exe", "node.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "wscript.exe", "cscript.exe", "rundll32.exe"];
+
+/// The name a program added by hand starts with (spec game.manual-add): the one in
+/// its version resource ("Spotify"), not the window title, which a music player or
+/// a browser keeps changing (A27 of the stability tests); for a program that runs
+/// others, or one without that name, the window title, else the file name.
+fn default_game_name(path: &str, title: Option<&str>) -> String {
+    let file = std::path::Path::new(path).file_name().map(|f| f.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let host = HOST_PROGRAMS.contains(&file.as_str());
+    let described = if host { None } else { win::file_description(path) };
+    described
+        .or_else(|| title.map(str::trim).filter(|t| !t.is_empty()).map(String::from))
+        .unwrap_or_else(|| std::path::Path::new(path).file_stem().map_or_else(|| path.to_string(), |s| s.to_string_lossy().into_owned()))
+}
+
+/// Marks a program as a game (spec game.manual-add): with the name given, else the
+/// default name (the program's own, or the window title of the open program).
 #[tauri::command]
-fn games_add(app: AppHandle, path: String, name: Option<String>) -> Result<Value, String> {
-    let name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).unwrap_or_else(|| {
-        std::path::Path::new(&path).file_stem().map_or_else(|| path.clone(), |s| s.to_string_lossy().into_owned())
-    });
+fn games_add(app: AppHandle, path: String, name: Option<String>, title: Option<String>) -> Result<Value, String> {
+    let name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).unwrap_or_else(|| default_game_name(&path, title.as_deref()));
     change_games(&app, &format!("added {name} ({path})"), |s| {
         s.custom_games.retain(|g| g.path.to_lowercase() != path.to_lowercase());
         s.custom_games.push(CustomGame { path: path.clone(), name: name.clone() });
     })
+}
+
+/// Renames a game the player added (A27): its clips are named after it from then on.
+#[tauri::command]
+fn games_rename(app: AppHandle, path: String, name: String) -> Result<Value, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(t!("The name cannot be empty"));
+    }
+    if !store_has_custom(&app, &path) {
+        return Err(t!("This game is not in your games"));
+    }
+    change_games(&app, &format!("renamed {path} to {name}"), |s| {
+        for game in s.custom_games.iter_mut().filter(|g| g.path.to_lowercase() == path.to_lowercase()) {
+            game.name = name.clone();
+        }
+    })
+}
+
+fn store_has_custom(app: &AppHandle, path: &str) -> bool {
+    app.state::<Arc<Store>>().get().custom_games.iter().any(|g| g.path.to_lowercase() == path.to_lowercase())
 }
 
 #[tauri::command]
@@ -1252,12 +1289,27 @@ fn selftest(app: AppHandle) {
         log!("[selftest] status: {}", engine.request("status", Value::Null, SHOT_TIMEOUT)?);
         let log_start = engine_log_len();
         log!("[selftest] killing the engine");
+        let killed = Instant::now();
         engine.kill();
-        std::thread::sleep(Duration::from_millis(500));
+        // A26: an engine that ended on its own is started again only after OBS's
+        // hook in a game could see it go (HOOK_RELEASE_WAIT in engine.rs).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while engine.state()["state"] != "stopped" && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        while engine.state()["state"] == "stopped" && killed.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let gap = killed.elapsed();
+        log!("[selftest] killed engine started again after {:.1} s", gap.as_secs_f64());
+        if gap < Duration::from_secs(6) {
+            return Err(format!("the engine started again {:.1} s after it was killed", gap.as_secs_f64()));
+        }
         wait_ready("after the restart")?;
         check_crash_report(&engine, &wait_ready, log_start)?;
         check_session_end(&engine, &wait_ready)?;
         check_engine_quit(&engine, &wait_ready)?;
+        check_health(&engine, &wait_ready)?;
         std::thread::sleep(Duration::from_secs(4));
         clip()?;
         check_games(&app, &engine)?;
@@ -1331,6 +1383,59 @@ fn check_engine_quit(engine: &Engine, wait_ready: &dyn Fn(&str) -> Result<(), St
         (Some(s), Some(e)) if s < e => Ok(()),
         _ => Err("engine.log does not tell how the engine ended when Engine::shutdown returns".into()),
     }
+}
+
+/// Self-test of A24 and A25: when the health watch finds the graphics device lost
+/// or the running replay buffer without video for 20 s (both faked with the
+/// "simulateHealth" request), the engine shuts down in order and ends with its own
+/// exit code, and the supervisor starts a new one; each new engine checks its real
+/// device at start.
+fn check_health(engine: &Engine, wait_ready: &dyn Fn(&str) -> Result<(), String>) -> Result<(), String> {
+    let start = engine_log_len();
+    let simulate = |problem: &str, secs: u64| -> Result<u128, String> {
+        let asked = Instant::now();
+        engine.request("simulateHealth", json!({ "problem": problem }), SHOT_TIMEOUT)?;
+        let deadline = asked + Duration::from_secs(secs);
+        while engine.state()["state"] == "ready" {
+            if Instant::now() > deadline {
+                return Err(format!("the engine did not end for the simulated {problem}"));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let ended = asked.elapsed().as_millis();
+        wait_ready(&format!("after the simulated {problem}"))?;
+        Ok(ended)
+    };
+    let lost = simulate("device", 15)?;
+    // The stall check needs the replay buffer running.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !engine.request("status", Value::Null, SHOT_TIMEOUT).is_ok_and(|s| s["recording"] == true) {
+        if Instant::now() > deadline {
+            return Err("the replay buffer did not run again after the simulated device loss".into());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let stalled = simulate("stall", 40)?;
+    let text = engine_log_since(start);
+    let lines: Vec<&str> = text.lines().filter(|l| l.contains("[laurel] health:") || l.contains("[laurel] shutdown") || l.contains("==== engine")).collect();
+    log!("[selftest] health: device loss ended the engine in {lost} ms, the stall in {stalled} ms; {lines:?}");
+    for needed in [
+        "[laurel] health: graphics device ok",
+        "[laurel] health: the graphics device was lost: 0x887A0005 (DXGI_ERROR_DEVICE_REMOVED, simulated)",
+        "==== engine exited: exit code 60 (the engine's graphics device was lost)",
+        "[laurel] health: the replay buffer got no video frame for 20 s",
+        "==== engine exited: exit code 61 (the replay buffer got no video)",
+    ] {
+        if !lines.iter().any(|l| l.contains(needed)) {
+            return Err(format!("engine.log has no \"{needed}\""));
+        }
+    }
+    // In order: each of the two engines logged its shutdown before its exit line.
+    let exits: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| l.contains("exit code 60") || l.contains("exit code 61")).map(|(i, _)| i).collect();
+    if exits.iter().any(|&i| i == 0 || !lines[i - 1].contains("[laurel] shutdown")) {
+        return Err("an engine ended for its health without shutting down in order".into());
+    }
+    Ok(())
 }
 
 fn check_crash_report(engine: &Engine, wait_ready: &dyn Fn(&str) -> Result<(), String>, log_start: u64) -> Result<(), String> {
@@ -1486,6 +1591,24 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
         }
     }
 
+    // A27: a program added by hand is named after its version resource, not its
+    // window title (a music player's is the song); a program that runs others keeps
+    // the title. A hooked game keeps the capture longer when another one has focus.
+    {
+        let own = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let root = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        let shell = root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe").to_string_lossy().into_owned();
+        let title = "A song title";
+        let described = win::file_description(&own);
+        let own_name = default_game_name(&own, Some(title));
+        let shell_name = default_game_name(&shell, Some(title));
+        let focus = (detect::focus_scans_needed(false), detect::focus_scans_needed(true));
+        log!("[selftest] added-game names: this program's resource {described:?}, named {own_name:?}; powershell.exe named {shell_name:?}; focus scans to take over: {focus:?}");
+        if described.is_none() || own_name == title || shell_name != title || focus != (2, 15) {
+            return Err("added-game names or focus scans went wrong".into());
+        }
+    }
+
     // With a real game open, detection would pick it: the live check is skipped.
     let open = detector.games_open();
     if !open.is_empty() {
@@ -1528,6 +1651,18 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
         let result = found.and_then(|_| {
             until("recording", &|| status("recording").is_ok_and(|r| r == true))?;
             log!("[selftest] game detected: {}", detector.snapshot());
+            // A27: a game added by hand can be renamed, and the detected game follows.
+            let path = shell.to_string_lossy().into_owned();
+            let renamed = "Laurel renamed test game";
+            games_rename(app.clone(), path.clone(), format!("  {renamed} "))?;
+            until("the renamed game", &|| detector.current().is_some_and(|g| g.id.name == renamed))?;
+            let empty = games_rename(app.clone(), path.clone(), "   ".into());
+            games_rename(app.clone(), path.clone(), name.into())?;
+            until("the game's name back", &|| detector.current().is_some_and(|g| g.id.name == name))?;
+            log!("[selftest] renamed the game to {renamed:?} and back; an empty name: {empty:?}");
+            if empty.is_ok() {
+                return Err("an empty game name was accepted".into());
+            }
             std::thread::sleep(Duration::from_secs(4));
             let mut saved = engine.request("saveClip", Value::Null, CLIP_TIMEOUT)?;
             attach_game(app, &mut saved);
@@ -1539,6 +1674,8 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
             }
             // The fallback deadline counts from the start of the capture, not from
             // when the game was found: after an engine restart it starts over.
+            let log_start = engine_log_len();
+            let asked = Instant::now();
             engine.restart();
             let deadline = Instant::now() + Duration::from_secs(10);
             while engine.state()["state"] == "ready" && Instant::now() < deadline {
@@ -1546,6 +1683,16 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
             }
             until("the engine to restart", &|| engine.state()["state"] == "ready")?;
             let restarted = Instant::now();
+            // A26: a restart for new settings stops the engine in order (its game
+            // capture stops, and the hook in the game is free), not by a kill.
+            let text = engine_log_since(log_start);
+            let shutdown = text.lines().position(|l| l.contains("[laurel] shutdown"));
+            let exited = text.lines().position(|l| l.contains("==== engine exited:"));
+            let exit = exited.and_then(|i| text.lines().nth(i)).and_then(|l| l.split_once("==== engine exited: ")).map(|(_, e)| e.to_string());
+            log!("[selftest] restart with the game: in order {:?}, {exit:?}, ready again after {} ms", shutdown.zip(exited).map(|(s, e)| s < e), asked.elapsed().as_millis());
+            if !matches!((shutdown, exited), (Some(s), Some(e)) if s < e) || exit.as_deref() != Some("exit code 0") {
+                return Err("the restart for new settings did not stop the engine in order".into());
+            }
             // The PowerShell window has no swap chain, so it is never hooked; it is
             // not elevated either, so no restart as administrator may be offered,
             // and after 15 s its window is recorded instead (spec capture.game-hook).
@@ -2000,9 +2147,14 @@ fn check_video(app: &AppHandle, engine: &Engine, wait_ready: &dyn Fn(&str) -> Re
     let list = engine.request("listEncoders", Value::Null, SHOT_TIMEOUT)?;
     let ids: Vec<&str> = list.as_array().into_iter().flatten().filter_map(|e| e["id"].as_str()).collect();
     let info = engine.state()["info"].clone();
-    log!("[selftest] encoders: {ids:?}; recording with {} (fallbacks {})", info["encoder"], info["encoderFallbacks"]);
+    log!("[selftest] encoders: {ids:?}; recording with {} (fallbacks {}, copy through memory {})", info["encoder"], info["encoderFallbacks"], info["encoderCopy"]);
     if !ids.contains(&"obs_x264") || !ids.iter().any(|id| info["encoder"] == *id) {
         return Err(format!("unexpected encoders: {ids:?}, in use {}", info["encoder"]));
+    }
+    // A28: the engine tells when OBS reroutes NVENC's texture encoder (null here,
+    // where the encoder takes the frames on the GPU it renders on).
+    if info.get("encoderCopy").is_none() {
+        return Err("the engine state has no encoderCopy".into());
     }
     // A13: the engine says which GPU it renders on and why (high performance on a
     // PC with two GPUs), so log packages show it.
@@ -2478,6 +2630,7 @@ fn main() {
             games_overview,
             games_running,
             games_add,
+            games_rename,
             games_remove,
             games_set_ignored,
             share_action,

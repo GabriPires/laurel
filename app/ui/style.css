@@ -334,6 +334,9 @@ kbd.hotkey.capturing { border: 1px dashed var(--primary); background: var(--grou
 .game-list li { display: flex; align-items: center; gap: 12px; padding: 10px 18px; }
 .game-list li + li { border-top: 1px solid var(--line); }
 .game-list .game-name { flex: 1 1 auto; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
+.game-list .game-name-input { font: inherit; font-weight: 600; padding: 4px 8px; border-color: transparent; background: transparent; }
+.game-list .game-name-input:hover { border-color: var(--line); }
+.game-list .game-name-input:focus { border-color: var(--primary); background: var(--ground); outline: none; }
 .game-list .game-meta { flex: none; font-size: 12px; color: var(--muted); }
 .game-list .game-path { flex: 1 1 auto; min-width: 0; font: 12px var(--mono); color: var(--muted); overflow-wrap: anywhere; }
 .game-list .live { flex: none; color: var(--primary); font-size: 12px; font-weight: 600; }

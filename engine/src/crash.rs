@@ -59,6 +59,13 @@ pub fn install() {
     let _ = PREVIOUS.set(previous);
 }
 
+/// Ends the process at once with `code`, without running anything else: for an
+/// engine whose shutdown hangs (health.rs).
+pub fn terminate(code: u32) -> ! {
+    unsafe { TerminateProcess(GetCurrentProcess(), code) };
+    std::process::abort()
+}
+
 /// Crashes on purpose, for the self-test of this report: an access violation
 /// writing near address 0, as through a null pointer to a structure. The report is
 /// the same as for a real crash.

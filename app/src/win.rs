@@ -56,6 +56,13 @@ struct ShFileOp {
     progress_title: *const u16,
 }
 
+#[link(name = "version", kind = "raw-dylib")]
+extern "system" {
+    fn GetFileVersionInfoSizeW(file: *const u16, handle: *mut u32) -> u32;
+    fn GetFileVersionInfoW(file: *const u16, handle: u32, len: u32, data: *mut c_void) -> i32;
+    fn VerQueryValueW(block: *const c_void, sub_block: *const u16, buffer: *mut *mut c_void, len: *mut u32) -> i32;
+}
+
 #[link(name = "kernel32", kind = "raw-dylib")]
 extern "system" {
     fn GetLocalTime(time: *mut SystemTime);
@@ -947,6 +954,48 @@ pub fn process_command_line(pid: u32) -> Option<String> {
             return None;
         }
         Some(String::from_utf16_lossy(std::slice::from_raw_parts(text, length)))
+    }
+}
+
+/// The description in a program's version resource ("Spotify"), else its product
+/// name: the name players know the program by (A27 of the stability tests).
+pub fn file_description(path: &str) -> Option<String> {
+    unsafe {
+        let file = wide(path);
+        let mut handle = 0;
+        let size = GetFileVersionInfoSizeW(file.as_ptr(), &mut handle);
+        if size == 0 {
+            return None;
+        }
+        let mut data = vec![0u8; size as usize];
+        if GetFileVersionInfoW(file.as_ptr(), 0, size, data.as_mut_ptr().cast()) == 0 {
+            return None;
+        }
+        let query = |sub: &str| -> Option<(*const u16, usize)> {
+            let mut value: *mut c_void = std::ptr::null_mut();
+            let mut len = 0u32;
+            let ok = VerQueryValueW(data.as_ptr().cast(), wide(sub).as_ptr(), &mut value, &mut len) != 0;
+            (ok && !value.is_null() && len > 0).then_some((value as *const u16, len as usize))
+        };
+        // The languages and code pages of the strings, then US English ones.
+        let mut langs: Vec<String> = Vec::new();
+        if let Some((value, len)) = query(r"\VarFileInfo\Translation") {
+            let pairs = std::slice::from_raw_parts(value, len / 2);
+            langs.extend(pairs.chunks_exact(2).map(|pair| format!("{:04X}{:04X}", pair[0], pair[1])));
+        }
+        langs.extend(["040904B0", "040904E4", "04090000"].map(String::from));
+        for key in ["FileDescription", "ProductName"] {
+            for lang in &langs {
+                let Some((value, len)) = query(&format!(r"\StringFileInfo\{lang}\{key}")) else { continue };
+                let chars = std::slice::from_raw_parts(value, len);
+                let end = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
+                let text = String::from_utf16_lossy(&chars[..end]).trim().to_string();
+                if !text.is_empty() {
+                    return Some(text);
+                }
+            }
+        }
+        None
     }
 }
 
