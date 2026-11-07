@@ -4,6 +4,13 @@ O Laurel guarda os últimos segundos do jogo que você está jogando e salva um 
 
 Esta é uma versão de teste. Ela pode ter erros, e é exatamente isso que queremos achar com a sua ajuda.
 
+## O que mudou na 0.1.0-rc.13
+
+Esta versão traz dois pedidos de vocês. Obrigado pelas ideias!
+
+- **Cortar e excluir o original.** No corte, o novo botão **Salvar e excluir o original** salva o trecho cortado no lugar do clipe: o original vai para **Excluídos recentemente**, e o clipe cortado fica com o nome, a data e a marca **Manter** dele. Se mudar de ideia, clique em **Desfazer** no aviso ou restaure o original em **Excluídos recentemente**. O botão **Salvar cópia cortada** continua como antes.
+- **Redução de ruído do microfone.** Em **Configurações > Gravação**, na parte **Áudio**, a nova opção **Redução de ruído** tira o ruído de fundo da sua voz, como o de ventilador, teclado e ambiente. Ela vem desligada. O **Speex** é leve; o **RNNoise** dá um resultado melhor, mas usa mais processador enquanto o Laurel grava. A troca vale na hora, para os próximos clipes.
+
 ## O que mudou na 0.1.0-rc.12
 
 Esta versão corrige o que o pacote de logs do notebook mostrou. Obrigado a quem mandou!
@@ -122,12 +129,12 @@ Não precisa fazer tudo. O que você conseguir já ajuda muito.
 1. **Instalação ou atualização:** instalou ou atualizou sem erro? Pediu administrador? Seu PC tinha OBS instalado?
 2. **Jogo encontrado:** abriu um jogo e o Laurel mostrou **Gravando** com o nome certo? Em jogos com anti-cheat, como o Fortnite, o clipe mostra o jogo, e não a tela do anti-cheat? Se você joga Minecraft, o Laurel mostrou **Gravando** com o nome **Minecraft** sem você adicionar nada? Diga qual launcher e qual modpack você usa. Se você adicionou um programa à mão, ele ainda tira a gravação do jogo quando você troca de janela rapidinho?
 3. **Clipe:** o F8 salvou o clipe? Tocou o som de clipe salvo? O clipe tem imagem e som, e pelo menos 30 segundos?
-4. **Som:** com o padrão (jogo e microfone), o Discord e a música ficaram fora do clipe? Teste também as outras opções de **Som do clipe**, e **Gravar meu microfone** desligado. Se usa fone Bluetooth com microfone, diga se o som do fone ficou normal com o Laurel aberto, sem jogo, e durante o jogo. Se aparecer o aviso **Gravando {jogo} pela janela**, confira se o clipe tem o som do jogo e se, depois de um tempo, a gravação voltou ao normal (no Windows 10, a borda amarela some).
+4. **Som:** com o padrão (jogo e microfone), o Discord e a música ficaram fora do clipe? Teste também as outras opções de **Som do clipe**, e **Gravar meu microfone** desligado. Se usa fone Bluetooth com microfone, diga se o som do fone ficou normal com o Laurel aberto, sem jogo, e durante o jogo. Teste a **Redução de ruído** com o **Speex** e com o **RNNoise**: a sua voz ficou limpa e natural no clipe? O jogo ficou mais pesado com o RNNoise? Se aparecer o aviso **Gravando {jogo} pela janela**, confira se o clipe tem o som do jogo e se, depois de um tempo, a gravação voltou ao normal (no Windows 10, a borda amarela some).
 5. **Placa de vídeo:** em **Configurações > Gravação**, o item **Gravando agora** mostra o codificador em uso. Diga qual apareceu, qual é a sua placa (NVIDIA, AMD ou Intel) e se o seu PC é um notebook com duas placas de vídeo. Testar em placas AMD e Intel é muito importante.
 6. **Desempenho:** sentiu queda de FPS ou travadas, principalmente quando o jogo abriu ou quando salvou um clipe? Se quiser, ligue **Configurações > Notificações > Mostrar avisos sobre os jogos** e diga se sentiu alguma diferença ao salvar com o aviso na tela. Diga também se o seu monitor usa G-Sync ou FreeSync.
 7. **Português:** o Laurel abriu em português? Algum texto ficou estranho, cortado ou em inglês? Mande uma captura de tela.
 8. **Seleção e Excluídos:** excluir vários clipes de uma vez funcionou? O **Desfazer** trouxe de volta? **Restaurar** devolveu o clipe para a biblioteca?
-9. **Corte:** cortar um clipe na biblioteca funcionou?
+9. **Corte:** cortar um clipe na biblioteca funcionou? Teste também **Salvar e excluir o original**: o clipe cortado ficou no lugar do original, e o **Desfazer** trouxe o original de volta?
 10. **Iniciar com o Windows:** depois de reiniciar o PC, o Laurel abriu sozinho na bandeja e gravou o jogo?
 11. **Atualização:** quando sair uma versão de teste nova, o Laurel vai oferecer a atualização sozinho. Diga se funcionou.
 12. **Conquistas da Steam:** jogando um jogo da Steam, desbloqueie uma conquista. Se ela for comum, ligue antes **Configurações > Clipes automáticos > Qualquer conquista**. O clipe apareceu uns 15 segundos depois, com o troféu na biblioteca? Tocou o som? Em **Clipes automáticos**, a linha de estado mostrou o jogo e as conquistas? Em jogos com anti-cheat, notou algo diferente? Mande o **app.log** se algo não sair.

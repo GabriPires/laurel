@@ -494,6 +494,47 @@ impl Library {
         let game = self.get(&source.to_string_lossy())?.and_then(|item| item["game"].as_str().map(String::from));
         self.add(&out.to_string_lossy(), game)
     }
+
+    /// Puts a trimmed copy in its original's place ("Save and delete original",
+    /// spec edit.trim; friends' request and owner's decision of 2026-11-07): the
+    /// original goes to Recently deleted, where it can be restored, and the copy
+    /// takes its name, its date, its Keep mark and its achievement. The copy's
+    /// thumbnail gets a name of its own, so a later trim of the clip does not find
+    /// it. Returns `{ item, deleted }`: the copy in its new place and the original
+    /// in Recently deleted (null when its file was already gone).
+    pub fn replace_with_trim(&self, original: &str, copy: &str) -> Result<Value, String> {
+        let (original, copy) = (share::windows_path(original), share::windows_path(copy));
+        let item = self.get(&original)?.filter(|i| i["deletedMs"].is_null()).ok_or("item not found")?;
+        let copied = self.get(&copy)?.filter(|i| i["deletedMs"].is_null()).ok_or("trimmed copy not found")?;
+        if original.eq_ignore_ascii_case(&copy) || Path::new(&original).parent() != Path::new(&copy).parent() {
+            return Err("the trimmed copy is not next to its original".into());
+        }
+        let modified = std::fs::metadata(&original).and_then(|m| m.modified()).ok();
+        let deleted = self.delete(&original)?;
+        storage::rename_when_free(Path::new(&copy), Path::new(&original))
+            .map_err(|e| format!("{copy}: {e} ({})", t!("the original is in Recently deleted")))?;
+        // The file's date too, so a rebuilt index keeps the clip in its place.
+        if let Some(time) = modified {
+            let _ = std::fs::File::options().write(true).open(&original).and_then(|f| f.set_modified(time));
+        }
+        self.remove_timeline(Path::new(&copy));
+        let thumbnail = copied["thumbnail"].as_str().filter(|t| Path::new(t).exists()).and_then(|old| {
+            let stem = Path::new(&original).file_stem()?.to_string_lossy().into_owned();
+            let new = self.thumbs_dir.join(format!("{stem}.trim-{}.png", now_ms()));
+            std::fs::rename(old, &new).ok().map(|_| new.to_string_lossy().into_owned())
+        });
+        let achievement = (!item["achievement"].is_null()).then(|| item["achievement"].to_string());
+        self.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE items SET path = ?2, created_ms = ?3, kept = ?4, achievement = ?5, thumbnail = COALESCE(?6, thumbnail) WHERE path = ?1",
+                params![copy, original, item["createdMs"].as_i64().unwrap_or_else(now_ms), item["kept"].as_bool().unwrap_or(false), achievement, thumbnail],
+            )
+            .map_err(|e| e.to_string())?;
+        let fresh = self.get(&original)?.ok_or("item not indexed")?;
+        Ok(json!({ "item": fresh, "deleted": deleted }))
+    }
 }
 
 impl Library {

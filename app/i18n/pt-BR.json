@@ -568,5 +568,18 @@
   "Click to rename": "Clique para renomear",
   "Could not rename the game: {error}": "Não foi possível renomear o jogo: {error}",
   "The name cannot be empty": "O nome não pode ficar vazio",
-  "This game is not in your games": "Este jogo não está entre os seus jogos"
+  "This game is not in your games": "Este jogo não está entre os seus jogos",
+  "Save and delete original": "Salvar e excluir o original",
+  "The original goes to Recently deleted, and the trimmed clip takes its name": "O original vai para Excluídos recentemente, e o clipe cortado fica com o nome dele",
+  "Trimmed clip saved; the original went to Recently deleted.": "Clipe cortado salvo; o original foi para Excluídos recentemente.",
+  "Trimmed clip saved; the original went to Recently deleted: {file}": "Clipe cortado salvo; o original foi para Excluídos recentemente: {file}",
+  "The trimmed copy was saved as {file}, but the original could not be deleted: {error}": "A cópia cortada foi salva como {file}, mas o original não pôde ser excluído: {error}",
+  "the original is in Recently deleted": "o original está em Excluídos recentemente",
+  "Noise suppression": "Redução de ruído",
+  "Off|noise suppression": "Desligada",
+  "Speex (light)": "Speex (leve)",
+  "RNNoise (better)": "RNNoise (melhor)",
+  "Removes background noise from your voice, such as fans, the keyboard and the room.": "Tira o ruído de fundo da sua voz, como ventiladores, o teclado e o ambiente.",
+  "Speex is light on the CPU and removes steady noise, such as fans.": "O Speex é leve para a CPU e tira ruídos constantes, como o de ventiladores.",
+  "RNNoise gives a better result, but uses more CPU while Laurel records.": "O RNNoise dá um resultado melhor, mas usa mais CPU enquanto o Laurel grava."
 }

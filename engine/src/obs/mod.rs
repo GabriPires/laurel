@@ -57,6 +57,8 @@ pub enum AudioEvent {
     Choice { enabled: bool, device: String },
     /// Not from the log: the audio tracks the microphone goes to (the mix).
     Mixers(u32),
+    /// Not from the log: the player's noise suppression (spec audio.mic-processing).
+    Noise(crate::recorder::MicNoise),
 }
 
 static AUDIO_EVENTS: Mutex<Option<Sender<AudioEvent>>> = Mutex::new(None);
@@ -517,6 +519,31 @@ impl Source {
     /// Routes the source to a global output channel (0 = video, 1+ = audio).
     pub fn set_output_channel(&self, channel: u32) {
         unsafe { ffi::obs_set_output_source(channel, self.0) }
+    }
+
+    /// A filter, or another source kept out of OBS's list of named sources.
+    pub fn private(id: &str, name: &str, settings: &Data) -> Result<Source, String> {
+        let (id_c, name_c) = (cstr(id), cstr(name));
+        let p = unsafe { ffi::obs_source_create_private(id_c.as_ptr(), name_c.as_ptr(), settings.ptr()) };
+        if p.is_null() {
+            Err(format!("could not create source {id}"))
+        } else {
+            Ok(Source(p))
+        }
+    }
+
+    /// Puts a filter on this source; the source holds its own reference to the
+    /// filter and lets it go when it is destroyed (obs_source_destroy).
+    pub fn add_filter(&self, filter: &Source) {
+        unsafe { ffi::obs_source_filter_add(self.0, filter.0) }
+    }
+
+    pub fn remove_filter(&self, filter: &Source) {
+        unsafe { ffi::obs_source_filter_remove(self.0, filter.0) }
+    }
+
+    pub fn filter_count(&self) -> usize {
+        unsafe { ffi::obs_source_filter_count(self.0) }
     }
 }
 

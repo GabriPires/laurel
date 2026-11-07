@@ -112,6 +112,21 @@ function showMix(mix) {
   $('audio-mix-desc').classList.toggle('warn', mix === 'pc-mic');
 }
 
+// Noise suppression on the microphone (spec audio.mic-processing): off by default;
+// RNNoise carries a yellow note, since it uses more CPU (owner's decision of
+// 2026-11-07).
+const NOISE_DESC = {
+  off: t('Removes background noise from your voice, such as fans, the keyboard and the room.'),
+  speex: t('Speex is light on the CPU and removes steady noise, such as fans.'),
+  rnnoise: t('RNNoise gives a better result, but uses more CPU while Laurel records.'),
+};
+
+function showNoise(noise) {
+  $('mic-noise-desc').textContent = NOISE_DESC[noise] ?? NOISE_DESC.off;
+  $('mic-noise-desc').classList.toggle('warn', noise === 'rnnoise');
+}
+$('opt-mic-noise').addEventListener('input', () => showNoise($('opt-mic-noise').value));
+
 // The microphone (spec audio.mic): Windows' default communications device or one
 // the engine lists; a chosen one that is not connected stays in the list. The
 // engine opens it only while it records (A20 of the stability tests).
@@ -208,6 +223,9 @@ function fill(s) {
   $('opt-mic').checked = s.micEnabled;
   dim($('opt-mic-device').closest('.row-item'), !s.micEnabled);
   fillMicrophones(s.micDevice);
+  $('opt-mic-noise').value = s.micNoise;
+  dim($('opt-mic-noise').closest('.row-item'), !s.micEnabled);
+  showNoise(s.micNoise);
   showMicDevice();
   $('opt-updates').checked = s.checkUpdates;
   $('opt-language').querySelector('option[value="system"]').textContent = t('Windows language ({language})', { language: LANGUAGE_NAMES[s.systemLanguage] ?? s.systemLanguage });
@@ -280,6 +298,7 @@ async function saveSettings() {
     audioMix: $('opt-audio-mix').value,
     micEnabled: $('opt-mic').checked,
     micDevice: $('opt-mic-device').value || 'default',
+    micNoise: $('opt-mic-noise').value,
     checkUpdates: $('opt-updates').checked,
     language: $('opt-language').value,
   };
@@ -303,7 +322,7 @@ async function saveSettings() {
 }
 
 for (const id of ['opt-autoclip', 'opt-autoclip-sound', 'opt-steam', 'opt-steam-ultra', 'opt-steam-rare', 'opt-steam-any', 'opt-overlay', 'opt-sounds', 'opt-volume', 'opt-naming', 'opt-limit', 'opt-limit-gb', 'opt-recycle', 'opt-min-free', 'opt-deleted-days', 'opt-cursor', 'opt-screen', 'opt-screen-monitor', 'opt-screen-switch',
-  'opt-video-encoder', 'opt-video-codec', 'opt-video-preset', 'opt-video-rate', 'opt-video-bitrate', 'opt-video-height', 'opt-video-fps', 'opt-clip-secs', 'opt-audio-mix', 'opt-mic', 'opt-mic-device', 'opt-updates', 'opt-language']) {
+  'opt-video-encoder', 'opt-video-codec', 'opt-video-preset', 'opt-video-rate', 'opt-video-bitrate', 'opt-video-height', 'opt-video-fps', 'opt-clip-secs', 'opt-audio-mix', 'opt-mic', 'opt-mic-device', 'opt-mic-noise', 'opt-updates', 'opt-language']) {
   $(id).addEventListener('change', saveSettings);
 }
 $('opt-volume').oninput = () => { $('opt-volume-value').textContent = $('opt-volume').value; };

@@ -39,7 +39,7 @@ SOURCES_SHA256 = "c6532380c68a75327fe8b551461adeca8f184dcbe4015096251a6de76362a5
 # Pre-built dependencies used by this OBS release (CMakePresets.json at the tag).
 OBS_DEPS_VERSION = "2025-08-23"
 
-MODULES = ["win-capture", "win-wasapi", "obs-ffmpeg", "obs-x264", "obs-nvenc", "obs-qsv11"]
+MODULES = ["win-capture", "win-wasapi", "obs-ffmpeg", "obs-x264", "obs-nvenc", "obs-qsv11", "obs-filters"]
 
 # libobs and the DLLs it and the modules import, plus the helpers that libobs and the
 # encoder modules start from the executable's folder.
@@ -120,7 +120,8 @@ later (gplv2.txt in this folder). Corresponding source code:
   OBS Studio {VERSION}: https://github.com/obsproject/obs-studio/tree/{VERSION}
     and {SOURCES_NAME} (SHA-256 {SOURCES_SHA256})
     in https://github.com/obsproject/obs-studio/releases/tag/{VERSION}
-  Pre-built dependencies of this release (FFmpeg, x264, libcurl, librist, SRT, zlib):
+  Pre-built dependencies of this release (FFmpeg, x264, libcurl, librist, SRT, zlib,
+  and RNNoise and SpeexDSP, linked into obs-filters.dll):
     obs-deps {OBS_DEPS_VERSION}, https://github.com/obsproject/obs-deps/releases/tag/{OBS_DEPS_VERSION}
 Each Laurel release also carries all of this source, with the libraries obs-deps
 builds into these files, in Laurel-<version>-sources.zip (tools/gpl-sources.py).
@@ -140,8 +141,9 @@ def read_manifest(dest: Path) -> dict[str, str]:
 
 
 def stamp() -> str:
-    # The notice's hash too, so a staged runtime gets a changed notice.
-    return f"# OBS Studio {VERSION} {ZIP_SHA256} notice {hashlib.sha256(notice().encode()).hexdigest()[:12]}"
+    # The notice's hash too, so a staged runtime gets a changed notice, and the
+    # modules, so it gets a new plugin.
+    return f"# OBS Studio {VERSION} {ZIP_SHA256} notice {hashlib.sha256(notice().encode()).hexdigest()[:12]} modules {','.join(MODULES)}"
 
 
 def stage(dest: Path) -> None:

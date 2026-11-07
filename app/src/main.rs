@@ -220,6 +220,8 @@ fn engine_config(work_dir: PathBuf, storage: Arc<Storage>, detector: Arc<Detecto
             s.audio_mix.clone(),
             "--mic-device".into(),
             s.mic_device.clone(),
+            "--mic-noise".into(),
+            s.mic_noise.clone(),
         ]);
         if !s.mic_enabled {
             options.push("--mic-off".into());
@@ -486,7 +488,7 @@ fn microphone_state(app: AppHandle) -> Value {
     let mut state = app.state::<Engine>().microphone();
     let settings = app.state::<Arc<Store>>().get();
     state["mix"] = json!(settings.audio_mix);
-    state["chosen"] = json!({ "enabled": settings.mic_enabled, "device": settings.mic_device });
+    state["chosen"] = json!({ "enabled": settings.mic_enabled, "device": settings.mic_device, "noise": settings.mic_noise });
     state
 }
 
@@ -556,7 +558,7 @@ fn set_settings(app: AppHandle, settings: Value) -> Result<Value, String> {
     let language_changed = new.language != current.language;
     let fewer_days = new.deleted_days < current.deleted_days;
     let mix_changed = new.audio_mix != current.audio_mix;
-    let mic_changed = (new.mic_enabled, &new.mic_device) != (current.mic_enabled, &current.mic_device);
+    let mic_changed = (new.mic_enabled, &new.mic_device, &new.mic_noise) != (current.mic_enabled, &current.mic_device, &current.mic_noise);
     let screen = detect::screen_of(&new);
     store.set(new.clone()).map_err(|e| e.to_string())?;
     log!("settings: {}", new.to_json());
@@ -587,9 +589,10 @@ fn set_settings(app: AppHandle, settings: Value) -> Result<Value, String> {
         }
     }
     if mic_changed && !video_changed {
-        // Spec audio.mic: the switch and the device apply without a restart; a
-        // restarted engine gets --mic-device and --mic-off.
-        if let Err(e) = app.state::<Engine>().request("setMicrophone", json!({ "enabled": new.mic_enabled, "device": new.mic_device }), SHOT_TIMEOUT) {
+        // Spec audio.mic: the switch and the device apply without a restart, and so
+        // does the noise suppression (audio.mic-processing); a restarted engine gets
+        // --mic-device, --mic-off and --mic-noise.
+        if let Err(e) = app.state::<Engine>().request("setMicrophone", json!({ "enabled": new.mic_enabled, "device": new.mic_device, "noise": new.mic_noise }), SHOT_TIMEOUT) {
             log!("setMicrophone failed: {e}");
         }
     }
@@ -941,6 +944,21 @@ async fn library_trim(app: AppHandle, path: String, start: f64, end: f64, exact:
     log!("trimmed clip: {item}");
     let _ = app.emit("library-changed", item.clone());
     Ok(item)
+}
+
+/// "Save and delete original" (spec edit.trim): after library_trim saved the copy,
+/// the original goes to Recently deleted and the copy takes its place.
+#[tauri::command]
+async fn library_replace_with_trim(app: AppHandle, original: String, copy: String) -> Result<Value, String> {
+    let library = app.state::<Arc<Library>>().inner().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || library.replace_with_trim(&original, &copy)).await.map_err(|e| e.to_string());
+    let result = result.and_then(|r| r);
+    match &result {
+        Ok(r) => log!("trim took its original's place: {} (original to {})", r["item"]["path"], r["deleted"]["path"]),
+        Err(e) => log!("trim could not take its original's place: {e}"),
+    }
+    library_changed(&app);
+    result
 }
 
 /// What the trim needs from a clip (spec edit.trim): its frame and keyframe times
@@ -2134,6 +2152,39 @@ fn check_library(app: &AppHandle, saved: &Value) -> Result<(), String> {
     if after_delete != (false, true, (false, true), true) || after_restore != (true, false, (true, false), true) || after_purge != (false, (false, false), false) || !trashed.contains(r"\.deleted\") {
         return Err("delete, restore or removal did not behave".into());
     }
+    // "Save and delete original" (edit.trim, 2026-11-07): the trimmed copy takes the
+    // original's name, date, Keep mark and achievement, with a thumbnail of its own;
+    // the original waits in Recently deleted and comes back under a free name.
+    let target = long_trim["path"].as_str().unwrap_or_default().to_string();
+    library.set_kept(&target, true)?;
+    let trophy = json!({ "name": "Laurel self-test achievement", "percent": 4.5 });
+    let before = library.set_achievement(&target, &trophy)?;
+    let copy = library.trim(&target, 0.5, 2.5, false)?;
+    let copy_path = copy["path"].as_str().unwrap_or_default().to_string();
+    let replaced = library.replace_with_trim(&target, &copy_path)?;
+    let (item, gone) = (&replaced["item"], &replaced["deleted"]);
+    let gone_path = gone["path"].as_str().unwrap_or_default().to_string();
+    let thumbs = (item["thumbnail"].as_str().unwrap_or_default(), before["thumbnail"].as_str().unwrap_or_default());
+    let checks = [
+        ("in the original's place", item["path"] == target.as_str() && exists(&target) && !exists(&copy_path)),
+        ("the trimmed length", (1500..=3500).contains(&item["durationMs"].as_i64().unwrap_or_default())),
+        ("the Keep mark", item["kept"] == true),
+        ("the achievement", item["achievement"] == trophy),
+        ("the original's date", item["createdMs"] == before["createdMs"]),
+        ("its own thumbnail", thumbs.0 != thumbs.1 && exists(thumbs.0) && exists(thumbs.1)),
+        ("the original in Recently deleted", gone["originalPath"] == target.as_str() && exists(&gone_path) && listed(&gone_path)? == (false, true)),
+        ("the copy's entry gone", !library.list(Some("clip"), None)?.iter().any(|i| i["path"] == copy_path.as_str())),
+    ];
+    let back = library.restore(&gone_path)?;
+    let back_path = back["path"].as_str().unwrap_or_default();
+    log!(
+        "[selftest] trim in place of {target}: {} ms, failed checks {:?}; original restored as {back_path}",
+        item["durationMs"],
+        checks.iter().filter(|(_, ok)| !ok).map(|(what, _)| *what).collect::<Vec<_>>()
+    );
+    if checks.iter().any(|(_, ok)| !ok) || back_path == target || !exists(back_path) || !exists(&target) {
+        return Err("Save and delete original did not behave".into());
+    }
     let listed = library.list(Some("clip"), Some("Laurel self-test"))?;
     log!("[selftest] library lists {} self-test clips", listed.len());
     Ok(())
@@ -2166,8 +2217,8 @@ fn check_video(app: &AppHandle, engine: &Engine, wait_ready: &dyn Fn(&str) -> Re
     let store = app.state::<Arc<Store>>();
     let original = store.get();
     let original_mix = original.audio_mix.clone();
-    let original_mic = (original.mic_enabled, original.mic_device.clone());
-    let test = Settings { video_encoder: "x264".into(), video_preset: "performance".into(), video_height: 720, video_fps: 30, clip_secs: 15, audio_mix: "pc-mic".into(), mic_enabled: false, mic_device: "laurel-selftest-mic".into(), ..original.clone() };
+    let original_mic = (original.mic_enabled, original.mic_device.clone(), original.mic_noise.clone());
+    let test = Settings { video_encoder: "x264".into(), video_preset: "performance".into(), video_height: 720, video_fps: 30, clip_secs: 15, audio_mix: "pc-mic".into(), mic_enabled: false, mic_device: "laurel-selftest-mic".into(), mic_noise: "speex".into(), ..original.clone() };
     // A restart is asynchronous: the old engine may still read as ready for a moment,
     // so wait for it to go before waiting for the new one.
     let restart = |what: &str| -> Result<(), String> {
@@ -2191,11 +2242,12 @@ fn check_video(app: &AppHandle, engine: &Engine, wait_ready: &dyn Fn(&str) -> Re
     if changed["encoder"] != "obs_x264" || changed["output"][1] != 720 || changed["fps"] != 30 || changed["bufferSecs"] != 15 || changed["audioMix"] != "pc-mic" {
         return Err("the video settings did not reach the engine".into());
     }
-    // Spec audio.mic: a restarted engine takes the microphone switch and device.
-    if changed["microphone"] != json!({ "enabled": false, "device": "laurel-selftest-mic" }) {
+    // Spec audio.mic: a restarted engine takes the microphone switch and device, and
+    // the noise suppression (audio.mic-processing).
+    if changed["microphone"] != json!({ "enabled": false, "device": "laurel-selftest-mic", "noise": "speex" }) {
         return Err(format!("the microphone choice did not reach the engine: {}", changed["microphone"]));
     }
-    if restored["microphone"] != json!({ "enabled": original_mic.0, "device": original_mic.1 }) {
+    if restored["microphone"] != json!({ "enabled": original_mic.0, "device": original_mic.1, "noise": original_mic.2 }) {
         return Err(format!("the microphone choice was not restored: {}", restored["microphone"]));
     }
     if restored["audioMix"] != original_mix.as_str() {
@@ -2286,16 +2338,40 @@ fn check_microphone(app: &AppHandle, engine: &Engine) -> Result<(), String> {
             std::thread::sleep(Duration::from_millis(20));
         }
         let back = wait_for(OPEN, 10)?;
+        // Noise suppression (audio.mic-processing, 2026-11-07): OBS's filter goes on
+        // the open microphone with each method and comes off when switched off; a
+        // clip saved with RNNoise keeps its three audio tracks.
+        let noise = |method: &str| -> Result<Value, String> {
+            engine.request("setMicrophone", json!({ "noise": method }), SHOT_TIMEOUT)?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while engine.microphone()["noise"] != method && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(engine.microphone()["noiseFilters"].clone())
+        };
+        let filters = [noise("rnnoise")?, noise("speex")?, noise("off")?, noise("rnnoise")?];
+        std::thread::sleep(Duration::from_secs(2));
+        let saved = engine.request("saveClip", Value::Null, CLIP_TIMEOUT)?;
+        let clip = saved["path"].as_str().ok_or("saveClip without path")?;
+        let tracks = mp4::probe(std::path::Path::new(clip))?.audio_tracks;
+        noise("off")?;
+        let open_now = engine.microphone()["state"] == "ok";
         engine.request("setCapture", json!({ "target": target }), SHOT_TIMEOUT)?;
         let closed = wait_for(&["idle"], 5)?;
         log!(
-            "[selftest] microphone: {} listed; no recording {idle}; recording the screen {open}, after another try {retried}; switched off {off}; a device not connected {missing}; back on {back}; capture {target} again {closed}",
+            "[selftest] microphone: {} listed; no recording {idle}; recording the screen {open}, after another try {retried}; switched off {off}; a device not connected {missing}; back on {back}; noise filters on the source with rnnoise, speex, off, rnnoise: {filters:?}, clip with rnnoise {tracks} audio tracks; capture {target} again {closed}",
             mics.as_array().map_or(0, Vec::len)
         );
+        // Without an open microphone (none connected, or denied) there is no source
+        // to filter; the choice still reaches the engine.
+        let expected = if back == "ok" && open_now { [1, 1, 0, 1] } else { [filters[0].as_u64().unwrap_or(9), filters[1].as_u64().unwrap_or(9), 0, filters[3].as_u64().unwrap_or(9)] };
+        if filters.iter().map(|f| f.as_u64().unwrap_or(9)).collect::<Vec<_>>() != expected || tracks != 3 {
+            return Err(format!("noise suppression did not behave: filters {filters:?}, {tracks} audio tracks"));
+        }
         Ok(())
     })();
     let capture = engine.request("setCapture", json!({ "target": target }), SHOT_TIMEOUT);
-    let restored = set(chosen.mic_enabled, &chosen.mic_device);
+    let restored = engine.request("setMicrophone", json!({ "enabled": chosen.mic_enabled, "device": chosen.mic_device, "noise": chosen.mic_noise }), SHOT_TIMEOUT);
     log!("[selftest] microphone restored: {restored:?}");
     outcome.and(capture.map(|_| ())).and(restored.map(|_| ()))
 }
@@ -2610,6 +2686,7 @@ fn main() {
             library_games,
             library_rescan,
             library_trim,
+            library_replace_with_trim,
             library_trim_info,
             library_keep,
             library_delete,

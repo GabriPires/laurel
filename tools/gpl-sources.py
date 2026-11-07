@@ -13,7 +13,7 @@ made here from pinned sources (decision of 2026-10-24: mirror everything):
     obs-deps that reaches the shipped files, at the commit or download its scripts pin.
     Left out: libraries only for OBS plugins Laurel does not ship (luajit, python, swig,
     pcre, bison: scripting; asio, websocketpp, qrcodegencpp: websocket; libdatachannel:
-    WebRTC; freetype: text; rnnoise, speexdsp: filters; vlc; libajantv2), build or test
+    WebRTC; freetype: text; vlc; libajantv2), build or test
     tools (gas-preprocessor for arm64, cmocka), and libpng and zstd, which leave no trace
     in the shipped files.
 
@@ -64,6 +64,11 @@ GIT = [
     ("nlohmann-json", "3.11.3", "https://github.com/nlohmann/json.git", "9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03", "OBS plugins (headers)"),
     ("vpl", "2.14.0", "https://github.com/intel/libvpl.git", "025d43d086a3e663184cb49febe86152bf05409f", "obs-qsv11.dll, obs-qsv-test.exe"),
     ("wil", "1.0.240803.1", "https://github.com/microsoft/wil.git", "f0c6a81c0c9a4b23b6801f40554b8bec425a83b4", "OBS on Windows (headers)"),
+    # Since obs-filters ships (the microphone's noise suppression): obs-deps checks
+    # rnnoise out at this commit, from its pull request 88, and patches speexdsp with
+    # a CMakeLists.txt (deps.windows/patches/speexdsp, in the obs-deps archive).
+    ("rnnoise", "2020-07-28", "https://github.com/xiph/rnnoise.git", "2938bcf94a2fe3f850df542f5de3996905059c97", "obs-filters.dll (noise suppression; the commit of pull request 88 that obs-deps checks out)"),
+    ("speexdsp", "1.2.1", "https://github.com/xiph/speexdsp.git", "1b28a0f61bc31162979e1f26f3981fc3637095c8", "obs-filters.dll (noise suppression; obs-deps adds a CMakeLists.txt patch)"),
 ]
 FILES = [
     ("libvpx", "1.14.1", "https://github.com/webmproject/libvpx/archive/refs/tags/v1.14.1.zip", "f40e4c7e7b4025d18be17a8225f8be2f26b349715399cd36c2de573fe976dfd7", "FFmpeg (libvpx)", "libvpx-1.14.1.zip"),

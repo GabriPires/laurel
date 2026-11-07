@@ -246,6 +246,8 @@ body.player-full .stage { position: fixed; inset: 0; z-index: 50; border: 0; bor
 .trim { flex: none; display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
 .trim .hint { margin: 0; font-size: 12px; color: var(--muted); }
 .trim-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* The two save buttons stay together, on the right even when they wrap. */
+.trim-actions { display: flex; gap: 8px; margin-left: auto; }
 .trim-info { display: flex; align-items: baseline; gap: 12px; }
 .trim-info .hint { flex: 1 1 auto; min-width: 0; }
 .trim-summary { flex: none; font: 500 12px var(--mono); color: var(--soft); font-variant-numeric: tabular-nums; }

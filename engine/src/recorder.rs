@@ -123,9 +123,12 @@ fn mic_connected(device: &str) -> bool {
 struct Mic {
     enabled: bool,
     device: String,
+    noise: MicNoise,
     recording: bool,
     mixers: u32,
     source: Option<Source>,
+    /// The noise suppression filter on the open source, when the player wants one.
+    filter: Option<Source>,
     /// The last Windows error: OBS logs it only on the first failure in a row.
     code: Option<String>,
     /// The wait before the next try while Windows denies it.
@@ -138,7 +141,9 @@ impl Mic {
     /// Tells the app the microphone's state ("off", "idle", "starting", "ok",
     /// "failed", "denied" or "missing"), once per change.
     fn report(&self, now: &str) {
-        let value = json!({ "state": now, "code": self.code, "enabled": self.enabled, "device": self.device });
+        // "noiseFilters": the filters OBS has on the open source (0 when closed).
+        let filters = self.source.as_ref().map_or(0, Source::filter_count);
+        let value = json!({ "state": now, "code": self.code, "enabled": self.enabled, "device": self.device, "noise": self.noise.name(), "noiseFilters": filters });
         let mut current = self.state.lock().unwrap();
         if *current != value {
             log!("[laurel] microphone {now}{}", self.code.as_ref().map_or(String::new(), |c| format!(" ({c})")));
@@ -172,8 +177,11 @@ impl Mic {
         match Source::new("wasapi_input_capture", "microphone", &Data::new().str("device_id", &self.device)) {
             Ok(source) => {
                 source.set_audio_mixers(self.mixers);
-                source.set_output_channel(MIC_CHANNEL);
                 self.source = Some(source);
+                self.apply_noise();
+                if let Some(source) = &self.source {
+                    source.set_output_channel(MIC_CHANNEL);
+                }
                 log!("[laurel] microphone open ({})", self.device);
                 self.report("starting");
             }
@@ -184,8 +192,30 @@ impl Mic {
         }
     }
 
+    /// Puts the noise suppression the player chose on the open source: the filter
+    /// there goes, and a new one comes unless the choice is off.
+    fn apply_noise(&mut self) {
+        let Some(source) = &self.source else { return };
+        if let Some(filter) = self.filter.take() {
+            source.remove_filter(&filter);
+        }
+        if self.noise == MicNoise::Off {
+            return;
+        }
+        match Source::private(NOISE_FILTER, "microphone noise suppression", &Data::new().str("method", self.noise.name())) {
+            Ok(filter) => {
+                source.add_filter(&filter);
+                log!("[laurel] microphone noise suppression: {} ({} filter on the source)", self.noise.name(), source.filter_count());
+                self.filter = Some(filter);
+            }
+            Err(e) => log!("[laurel] microphone noise suppression: {e}"),
+        }
+    }
+
     /// Closes the microphone: its source goes, and with it OBS's hold on the device.
     fn close(&mut self, why: &str) {
+        // The source lets its filter go when it is destroyed.
+        self.filter = None;
         if let Some(source) = self.source.take() {
             clear_output_channel(MIC_CHANNEL);
             drop(source);
@@ -231,6 +261,17 @@ impl Mic {
                 if let Some(source) = &self.source {
                     source.set_audio_mixers(mask);
                 }
+            }
+            AudioEvent::Noise(noise) => {
+                if noise == self.noise {
+                    return;
+                }
+                self.noise = noise;
+                log!("[laurel] microphone noise suppression {}", noise.name());
+                self.apply_noise();
+                // The state carries the choice and the filters on the source.
+                let now = self.state.lock().unwrap()["state"].as_str().unwrap_or("off").to_string();
+                self.report(&now);
             }
             AudioEvent::Retry => {
                 self.wait = MIC_RETRY_FIRST;
@@ -288,14 +329,16 @@ impl Mic {
 
 /// Starts the microphone's thread (see Mic), closed until the recorder says it
 /// records. It ends when the recorder drops its sender and the log watch stops.
-fn spawn_microphone(enabled: bool, device: String, events: Receiver<AudioEvent>, state: Arc<Mutex<Value>>) -> JoinHandle<()> {
+fn spawn_microphone(enabled: bool, device: String, noise: MicNoise, events: Receiver<AudioEvent>, state: Arc<Mutex<Value>>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut mic = Mic {
             enabled,
             device,
+            noise,
             recording: false,
             mixers: MIC_TRACK | MIX_TRACK,
             source: None,
+            filter: None,
             code: None,
             wait: MIC_RETRY_FIRST,
             timer: None,
@@ -376,6 +419,42 @@ impl AudioMix {
         }
     }
 }
+
+/// Noise suppression on the microphone (spec audio.mic-processing, friends'
+/// request of 2026-11-07): off by default, or one of the two methods of OBS's
+/// filter (obs-filters, noise_suppress_filter version 2): Speex, light on the CPU,
+/// or RNNoise, a better result for more CPU. The filter runs on the microphone's
+/// source, so track 3 and the track 1 mix both get the cleaned voice.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum MicNoise {
+    #[default]
+    Off,
+    Speex,
+    RNNoise,
+}
+
+impl MicNoise {
+    pub fn parse(s: &str) -> Option<MicNoise> {
+        match s {
+            "off" => Some(MicNoise::Off),
+            "speex" => Some(MicNoise::Speex),
+            "rnnoise" => Some(MicNoise::RNNoise),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            MicNoise::Off => "off",
+            MicNoise::Speex => "speex",
+            MicNoise::RNNoise => "rnnoise",
+        }
+    }
+}
+
+/// OBS's noise suppression filter: version 2 of noise_suppress_filter (libobs
+/// registers versioned ids as "<id>_v<version>"; version 1 is obsolete).
+const NOISE_FILTER: &str = "noise_suppress_filter_v2";
 
 /// A libobs window spec `title:class:exe`, with ':' and '#' escaped as libobs does.
 fn window_spec(game: &GameInfo) -> String {
@@ -461,6 +540,8 @@ pub struct RecorderConfig {
     /// communications device (spec audio.mic).
     pub mic_enabled: bool,
     pub mic_device: String,
+    /// Noise suppression on the microphone (spec audio.mic-processing).
+    pub mic_noise: MicNoise,
     pub clips_dir: PathBuf,
     pub output_size: (u32, u32),
     /// The canvas the capture is fitted into.
@@ -503,10 +584,11 @@ pub struct Recorder {
     mic_state: Arc<Mutex<Value>>,
     mic_tx: Option<Sender<AudioEvent>>,
     mic_thread: Option<JoinHandle<()>>,
-    /// The player's microphone switch and device, and whether the microphone's
-    /// thread was last told that the recorder records (A20).
+    /// The player's microphone switch, device and noise suppression, and whether
+    /// the microphone's thread was last told that the recorder records (A20).
     mic_enabled: bool,
     mic_device: String,
+    mic_noise: MicNoise,
     mic_recording: bool,
     saved_tx: *mut Sender<()>,
     saved_rx: Receiver<()>,
@@ -566,6 +648,7 @@ impl Recorder {
                 mic_thread: None,
                 mic_enabled: false,
                 mic_device: cfg.mic_device.clone(),
+                mic_noise: cfg.mic_noise,
                 mic_recording: false,
                 saved_tx,
                 saved_rx,
@@ -603,7 +686,7 @@ impl Recorder {
             // follows OBS's lines about it from then on.
             let (tx, rx) = channel();
             watch_audio_events(Some(tx.clone()));
-            mic_thread = Some(spawn_microphone(cfg.mic_enabled, cfg.mic_device.clone(), rx, mic_state.clone()));
+            mic_thread = Some(spawn_microphone(cfg.mic_enabled, cfg.mic_device.clone(), cfg.mic_noise, rx, mic_state.clone()));
             mic_tx = Some(tx);
             track_masks.push(MIC_TRACK);
         }
@@ -651,6 +734,7 @@ impl Recorder {
             mic_thread,
             mic_enabled: cfg.mic_enabled,
             mic_device: cfg.mic_device.clone(),
+            mic_noise: cfg.mic_noise,
             mic_recording: false,
             saved_tx,
             saved_rx,
@@ -818,21 +902,26 @@ impl Recorder {
         tx.send(AudioEvent::Retry).map_err(|_| "the microphone thread stopped".to_string())
     }
 
-    /// The player's microphone switch and device (spec audio.mic): applies to the
-    /// running recording, without a restart.
-    pub fn set_microphone(&mut self, enabled: Option<bool>, device: Option<String>) -> Result<(), String> {
+    /// The player's microphone switch and device (spec audio.mic) and noise
+    /// suppression (spec audio.mic-processing): applies to the running recording,
+    /// without a restart.
+    pub fn set_microphone(&mut self, enabled: Option<bool>, device: Option<String>, noise: Option<MicNoise>) -> Result<(), String> {
         let tx = self.mic_tx.as_ref().ok_or("no microphone (--no-mic)")?;
         let device = device.map(|d| d.trim().to_string()).filter(|d| !d.is_empty());
         let (enabled, device) = (enabled.unwrap_or(self.mic_enabled), device.unwrap_or_else(|| self.mic_device.clone()));
         tx.send(AudioEvent::Choice { enabled, device: device.clone() }).map_err(|_| "the microphone thread stopped".to_string())?;
         self.mic_enabled = enabled;
         self.mic_device = device;
+        if let Some(noise) = noise {
+            tx.send(AudioEvent::Noise(noise)).map_err(|_| "the microphone thread stopped".to_string())?;
+            self.mic_noise = noise;
+        }
         Ok(())
     }
 
-    /// The player's microphone switch and device.
+    /// The player's microphone switch, device and noise suppression.
     pub fn microphone_choice(&self) -> Value {
-        json!({ "enabled": self.mic_enabled, "device": self.mic_device })
+        json!({ "enabled": self.mic_enabled, "device": self.mic_device, "noise": self.mic_noise.name() })
     }
 
     /// The process (or test window) the game audio follows, if any.

@@ -24,6 +24,7 @@
 //!   --mic-device ID             microphone device, from --list (default: Windows' default
 //!                               communications device)
 //!   --mic-off                   the microphone stays closed until setMicrophone turns it on
+//!   --mic-noise off|speex|rnnoise  noise suppression on the microphone (default off)
 //!   --no-mic, --no-cursor       --no-mic: no microphone track at all (tests)
 //!   --no-output                 capture only: no audio, encoders or replay buffer
 //!   --paused                    build the replay buffer but do not start it (the app
@@ -34,7 +35,8 @@
 //!   --script "cmd; cmd; ..."    commands: wait N | save | screenshot | stats | beep N |
 //!                               capture <monitor[:N[:method]]|window:..|game[:..]> |
 //!                               mix <game|game-mic|pc-mic> | probe [on|off] |
-//!                               mic [retry|on|off|device <id>] | mics | crash |
+//!                               mic [retry|on|off|device <id>|noise <off|speex|rnnoise>] |
+//!                               mics | crash |
 //!                               simulate device|stall|stall-hang | quit
 //!                               (without --script or --rpc, commands are read from stdin)
 //! Logs (libobs and the engine's own) always go to stderr, and so does the report of
@@ -71,13 +73,13 @@ use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use obs::{Data, EncoderType, Obs, VideoConfig};
-use recorder::{AudioMix, Capture, GameInfo, Recorder, RecorderConfig, VideoChoice};
+use recorder::{AudioMix, Capture, GameInfo, MicNoise, Recorder, RecorderConfig, VideoChoice};
 use serde_json::{json, Value};
 
 /// Plugins required by the MVP specs. Frontend-only plugins of an OBS install must
 /// not be loaded by a headless host (see wiki/projeto/fase-3-pocs.md). The runtime
 /// ships only these (MODULES in tools/obs-runtime.py).
-const MODULES: &[&str] = &["win-capture", "win-wasapi", "obs-ffmpeg", "obs-x264", "obs-nvenc", "obs-qsv11"];
+const MODULES: &[&str] = &["win-capture", "win-wasapi", "obs-ffmpeg", "obs-x264", "obs-nvenc", "obs-qsv11", "obs-filters"];
 
 struct Args {
     obs_root: PathBuf,
@@ -101,6 +103,7 @@ struct Args {
     mic: bool,
     mic_enabled: bool,
     mic_device: String,
+    mic_noise: MicNoise,
     cursor: bool,
     record: bool,
     paused: bool,
@@ -272,6 +275,7 @@ fn parse_args() -> Result<Args, String> {
         mic: true,
         mic_enabled: true,
         mic_device: "default".into(),
+        mic_noise: MicNoise::Off,
         cursor: true,
         record: true,
         paused: false,
@@ -307,6 +311,10 @@ fn parse_args() -> Result<Args, String> {
             "--game-audio" => a.game_audio = Some(value()?),
             "--no-mic" => a.mic = false,
             "--mic-off" => a.mic_enabled = false,
+            "--mic-noise" => {
+                let noise = value()?;
+                a.mic_noise = MicNoise::parse(&noise).ok_or_else(|| format!("bad --mic-noise {noise}, expected off, speex or rnnoise"))?;
+            }
             "--mic-device" => a.mic_device = Some(value()?.trim().to_string()).filter(|d| !d.is_empty()).unwrap_or_else(|| "default".into()),
             "--no-cursor" => a.cursor = false,
             "--no-output" => a.record = false,
@@ -534,6 +542,7 @@ fn run(args: Args) -> Result<i32, String> {
         mic: args.mic,
         mic_enabled: args.mic_enabled,
         mic_device: args.mic_device.clone(),
+        mic_noise: args.mic_noise,
         clips_dir: clips_dir.clone(),
         output_size: out,
         canvas: args.base,
@@ -543,8 +552,8 @@ fn run(args: Args) -> Result<i32, String> {
     let started = Instant::now();
     let mut rec = Recorder::start(&obs, &cfg, video_choices)?;
     log!(
-        "[laurel] recording: capture={:?} base={}x{} out={}x{} fps={} encoder={} rate={} preset={} bitrate={}kbps buffer={}s game_audio={} mic={} mic_enabled={} mic_device={} mix={} record={} paused={}",
-        cfg.capture, args.base.0, args.base.1, out.0, out.1, args.fps, rec.encoder(), args.rate, args.preset, args.bitrate, args.buffer, args.desktop_audio, args.mic, args.mic_enabled, args.mic_device, rec.audio_mix().name(), args.record, args.paused
+        "[laurel] recording: capture={:?} base={}x{} out={}x{} fps={} encoder={} rate={} preset={} bitrate={}kbps buffer={}s game_audio={} mic={} mic_enabled={} mic_device={} mic_noise={} mix={} record={} paused={}",
+        cfg.capture, args.base.0, args.base.1, out.0, out.1, args.fps, rec.encoder(), args.rate, args.preset, args.bitrate, args.buffer, args.desktop_audio, args.mic, args.mic_enabled, args.mic_device, args.mic_noise.name(), rec.audio_mix().name(), args.record, args.paused
     );
 
     // A24, A25: the health watch ends the engine when it can no longer record. The
@@ -651,12 +660,17 @@ fn run(args: Args) -> Result<i32, String> {
             Some("stats") => log!("[laurel] stats after {:.1}s: {}", started.elapsed().as_secs_f64(), recorder::format_stats(&obs, &rec)),
             Some("mic") => {
                 // A16: "mic retry" asks for another try; A20: "mic on", "mic off" and
-                // "mic device <id>" are the player's choices; "mic" only logs the state.
+                // "mic device <id>" are the player's choices, and so is "mic noise
+                // <off|speex|rnnoise>" (audio.mic-processing); "mic" only logs the state.
                 let result = match parts.next() {
                     Some("retry") => rec.retry_microphone(),
-                    Some("on") => rec.set_microphone(Some(true), None),
-                    Some("off") => rec.set_microphone(Some(false), None),
-                    Some("device") => rec.set_microphone(None, Some(parts.collect::<Vec<_>>().join(" "))),
+                    Some("on") => rec.set_microphone(Some(true), None, None),
+                    Some("off") => rec.set_microphone(Some(false), None, None),
+                    Some("device") => rec.set_microphone(None, Some(parts.collect::<Vec<_>>().join(" ")), None),
+                    Some("noise") => match MicNoise::parse(parts.next().unwrap_or_default()) {
+                        Some(noise) => rec.set_microphone(None, None, Some(noise)),
+                        None => Err("expected mic noise off, speex or rnnoise".into()),
+                    },
                     _ => Ok(()),
                 };
                 if let Err(e) = result {
@@ -765,10 +779,14 @@ fn serve_app(obs: &Obs, rec: &mut Recorder, args: &Args, dirs: &Dirs, events: st
                 health::simulate(problem).map(|_| json!({ "simulated": problem }))
             }
             "setMicrophone" => {
-                // Spec audio.mic: the switch and the device apply without a restart.
+                // Spec audio.mic: the switch and the device apply without a restart, and
+                // so does the noise suppression (audio.mic-processing).
                 let enabled = params.get("enabled").and_then(Value::as_bool);
                 let device = params.get("device").and_then(Value::as_str).map(str::to_string);
-                rec.set_microphone(enabled, device).map(|_| rec.microphone_choice())
+                match params.get("noise").and_then(Value::as_str).map(|n| MicNoise::parse(n).ok_or(format!("bad noise {n}"))).transpose() {
+                    Ok(noise) => rec.set_microphone(enabled, device, noise).map(|_| rec.microphone_choice()),
+                    Err(e) => Err(e),
+                }
             }
             "probeHook" => {
                 // A7: while a game is recorded by its window, try its hook on top.

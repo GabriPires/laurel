@@ -218,7 +218,10 @@
                 <label title="No re-encoding: saved in about a second"><input type="radio" name="trim-mode" value="fast" checked><span>Fast</span></label>
                 <label title="Starts exactly at the start; re-encodes the video"><input type="radio" name="trim-mode" value="exact"><span>Exact</span></label>
               </div>
-              <button id="trim-save" class="btn btn-primary">Save trimmed copy</button>
+              <div class="trim-actions">
+                <button id="trim-replace" class="btn btn-secondary" title="The original goes to Recently deleted, and the trimmed clip takes its name">Save and delete original</button>
+                <button id="trim-save" class="btn btn-primary">Save trimmed copy</button>
+              </div>
             </div>
           </section>
           <p class="key-hint"><kbd>←</kbd> <kbd>→</kbd> <span>previous or next</span> · <kbd>M</kbd> <span>mute</span> · <kbd>F</kbd> <span>full screen</span> · <kbd>Del</kbd> <span>delete</span> · <kbd>Esc</kbd> <span>back to the library</span></p>
@@ -417,6 +420,14 @@
               <div class="row-item">
                 <div class="row-text"><label for="opt-mic-device" class="row-name">Microphone</label><span id="mic-device-desc" class="row-desc"></span></div>
                 <select id="opt-mic-device" class="row-select"></select>
+              </div>
+              <div class="row-item">
+                <div class="row-text"><label for="opt-mic-noise" class="row-name">Noise suppression</label><span id="mic-noise-desc" class="row-desc"></span></div>
+                <select id="opt-mic-noise" class="row-select">
+                  <option value="off" data-i18n="Off|noise suppression">Off</option>
+                  <option value="speex">Speex (light)</option>
+                  <option value="rnnoise">RNNoise (better)</option>
+                </select>
               </div>
             </div>
             <p class="group-desc">Clips also keep the game and your microphone on separate tracks, for video editors. Changes apply to the next clips.</p>

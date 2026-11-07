@@ -9,6 +9,10 @@
 // brings them back right after a delete.
 const { convertFileSrc } = window.__TAURI__.core;
 
+// An item's file for the WebView, with its size and length: a trim saved in its
+// original's place keeps the path, and the WebView would play the cached original.
+const mediaSrc = (item) => `${convertFileSrc(item.path)}?v=${item.size}-${item.durationMs ?? 0}`;
+
 const library = { items: [], deleted: [], filter: { type: 'all' }, sort: 'new', query: '', current: null, selected: new Set(), anchor: null, confirm: null };
 
 const typeTitle = (type) => ({ all: t('All'), clip: t('Clips'), screenshot: t('Screenshots'), kept: t('Kept'), achievement: t('Achievements'), deleted: t('Recently deleted') })[type];
@@ -199,7 +203,7 @@ function startPreview(card, item) {
     video.addEventListener('loadedmetadata', play, { once: true });
     video.addEventListener('ended', play);
     video.addEventListener('playing', () => video.classList.add('shown'), { once: true });
-    video.src = convertFileSrc(item.path);
+    video.src = mediaSrc(item);
     card.querySelector('.thumb').append(video);
     card.classList.add('previewing');
   }, PREVIEW_DELAY);
@@ -721,7 +725,7 @@ function openViewer(item) {
   $('viewer-status').textContent = '';
   cancelDelete();
   const media = item.kind === 'clip' ? document.createElement('video') : document.createElement('img');
-  media.src = convertFileSrc(item.path);
+  media.src = mediaSrc(item);
   if (item.kind === 'clip') {
     media.preload = 'auto';
     media.addEventListener('click', () => playSelection());
@@ -917,6 +921,7 @@ function showTrim() {
     $('trim-mode-hint').textContent = t('Fast, no re-encoding: the copy is saved in about a second.');
   }
   $('trim-save').disabled = end - start < MIN_TRIM || (start <= 0.05 && end >= trim.total - 0.05);
+  $('trim-replace').disabled = $('trim-save').disabled;
 }
 
 // Sets the selection from a start moment and an end moment: the start snaps to
@@ -1104,10 +1109,46 @@ document.addEventListener('keydown', (e) => {
   e.stopPropagation();
 }, true);
 
+// "Save and delete original" (friends' request of 2026-11-07): the trimmed copy is
+// saved as usual while the video stays; then the viewer lets go of the original,
+// which goes to Recently deleted, and the copy takes its name, date, Keep mark and
+// achievement. Undo brings the original back next to the trimmed clip.
+$('trim-replace').onclick = async () => {
+  const item = library.current;
+  const exact = trimMode() === 'exact';
+  $('trim-save').disabled = true;
+  $('trim-replace').disabled = true;
+  $('viewer-status').textContent = exact ? t('Re-encoding the trimmed copy…') : t('Saving the trimmed copy…');
+  let copy;
+  try {
+    copy = await invoke('library_trim', { path: item.path, start: trim.start, end: trim.end, exact });
+  } catch (e) {
+    $('viewer-status').textContent = t('Trim failed: {error}', { error: e });
+    showTrim();
+    return;
+  }
+  releaseMedia();
+  try {
+    const result = await invoke('library_replace_with_trim', { original: item.path, copy: copy.path });
+    await loadLibrary();
+    openViewer(result.item);
+    $('viewer-status').textContent = t('Saved {file} ({length})', { file: fileName(result.item.path), length: fmtDuration(result.item.durationMs) });
+    activity(t('Trimmed clip saved; the original went to Recently deleted: {file}', { file: fileName(result.item.path) }), 'clip');
+    const deleted = result.deleted?.path;
+    toast(t('Trimmed clip saved; the original went to Recently deleted.'), deleted ? t('Undo') : null, deleted ? () => restoreItems([deleted]) : null);
+  } catch (e) {
+    await loadLibrary();
+    const original = library.items.find((i) => i.path === item.path);
+    openViewer(original ?? copy);
+    $('viewer-status').textContent = t('The trimmed copy was saved as {file}, but the original could not be deleted: {error}', { file: fileName(copy.path), error: e });
+  }
+};
+
 $('trim-save').onclick = async () => {
   const item = library.current;
   const exact = trimMode() === 'exact';
   $('trim-save').disabled = true;
+  $('trim-replace').disabled = true;
   $('viewer-status').textContent = exact ? t('Re-encoding the trimmed copy…') : t('Saving the trimmed copy…');
   try {
     const copy = await invoke('library_trim', { path: item.path, start: trim.start, end: trim.end, exact });

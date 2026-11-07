@@ -6,6 +6,7 @@
 //! (capture.screen, off by default per D13), the video and the clip length
 //! (quality.encoding, record.replay-buffer), and what the clips' main audio track
 //! mixes (audio.separate-tracks), the microphone switch and device (audio.mic),
+//! the microphone's noise suppression (audio.mic-processing, off by default),
 //! whether Laurel checks for updates (stage 6
 //! plan), the interface language, how long deleted items wait in Recently
 //! deleted (library.trash), and the automatic clips of Steam achievements
@@ -85,6 +86,9 @@ pub struct Settings {
     /// default communications device, else an id from the engine's listMicrophones.
     pub mic_enabled: bool,
     pub mic_device: String,
+    /// Noise suppression on the microphone (spec audio.mic-processing): off, speex
+    /// or rnnoise; off by default (owner's decision of 2026-11-07).
+    pub mic_noise: String,
     /// Ask the update channel for a new version a little after each start.
     pub check_updates: bool,
     /// system, en or pt-BR (see i18n.rs).
@@ -144,6 +148,7 @@ impl Default for Settings {
             audio_mix: "game-mic".into(),
             mic_enabled: true,
             mic_device: "default".into(),
+            mic_noise: "off".into(),
             check_updates: true,
             language: "system".into(),
             auto_clip: true,
@@ -202,6 +207,7 @@ impl Settings {
             audio_mix: choice("audioMix", &["game", "game-mic", "pc-mic"], &d.audio_mix),
             mic_enabled: flag("micEnabled", d.mic_enabled),
             mic_device: Some(text("micDevice", &d.mic_device)).filter(|s| !s.is_empty()).unwrap_or(d.mic_device),
+            mic_noise: choice("micNoise", &["off", "speex", "rnnoise"], &d.mic_noise),
             check_updates: flag("checkUpdates", d.check_updates),
             language: choice("language", crate::i18n::LANGUAGES, &d.language),
             auto_clip: flag("autoClip", d.auto_clip),
@@ -254,6 +260,7 @@ impl Settings {
             "audioMix": self.audio_mix,
             "micEnabled": self.mic_enabled,
             "micDevice": self.mic_device,
+            "micNoise": self.mic_noise,
             "checkUpdates": self.check_updates,
             "language": self.language,
             "autoClip": self.auto_clip,

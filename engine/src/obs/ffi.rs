@@ -177,6 +177,10 @@ extern "C" {
     pub fn obs_source_get_width(source: *mut obs_source_t) -> u32;
     pub fn obs_source_get_height(source: *mut obs_source_t) -> u32;
     pub fn obs_source_set_audio_mixers(source: *mut obs_source_t, mixers: u32);
+    pub fn obs_source_create_private(id: *const c_char, name: *const c_char, settings: *mut obs_data_t) -> *mut obs_source_t;
+    pub fn obs_source_filter_add(source: *mut obs_source_t, filter: *mut obs_source_t);
+    pub fn obs_source_filter_remove(source: *mut obs_source_t, filter: *mut obs_source_t);
+    pub fn obs_source_filter_count(source: *const obs_source_t) -> usize;
 
     // properties
     pub fn obs_get_source_properties(id: *const c_char) -> *mut obs_properties_t;
