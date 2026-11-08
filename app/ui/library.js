@@ -699,6 +699,7 @@ $('player-mute').onclick = toggleMute;
 // Full screen: the window goes full screen and the stage covers it.
 async function setFull(on) {
   if (document.body.classList.contains('player-full') === on) return;
+  stretchEnd(on ? 'full screen on' : 'full screen off');
   document.body.classList.toggle('player-full', on);
   $('player-full-icon').setAttribute('d', on ? 'M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5' : 'M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5');
   $('player-full').setAttribute('aria-label', on ? t('Exit full screen') : t('Full screen'));
@@ -707,6 +708,7 @@ async function setFull(on) {
   } catch {
     // The stage still covers the window.
   }
+  if (trim.video && !trim.video.paused) stretchStart(trim.video);
 }
 const toggleFull = () => setFull(!document.body.classList.contains('player-full'));
 $('player-full').onclick = toggleFull;
@@ -714,6 +716,71 @@ $('player-full').onclick = toggleFull;
 $('player-seek').addEventListener('pointerdown', () => { player.seeking = true; });
 $('player-seek').addEventListener('pointerup', () => { player.seeking = false; });
 $('player-seek').oninput = () => seek(Number($('player-seek').value));
+
+// Player diagnostics (A30: a friend's clips looked slow motion after he moved the
+// window to his 60 Hz second monitor). Each stretch of playback of 2 s or more
+// ends in one app.log line (player_stats in main.rs): the monitor, media seconds
+// per wall second, decoded and dropped frames and how often the page was drawn. A
+// stretch ends at a pause, when the viewer closes or opens another item, when the
+// window goes to another monitor, in or out of full screen, or is hidden. Per
+// frame it costs a counter and a subtraction in followPlayhead.
+const MIN_STRETCH_S = 2;
+let stretch = null;
+const screenKey = () => `${screen.availLeft},${screen.availTop},${screen.width}x${screen.height},${devicePixelRatio}`;
+
+function stretchStart(video) {
+  if (stretch || video.paused || document.hidden || trim.video !== video) return;
+  const q = video.getVideoPlaybackQuality();
+  const now = performance.now();
+  stretch = {
+    video, item: library.current, wall: now, checked: now, screen: screenKey(),
+    media: 0, last: video.currentTime, skip: false, frames: 0,
+    decoded: q.totalVideoFrames, dropped: q.droppedVideoFrames,
+    full: document.body.classList.contains('player-full'),
+  };
+  invoke('player_stats', { start: true }).catch(() => {});
+}
+
+function stretchEnd(ended) {
+  const s = stretch;
+  stretch = null;
+  if (!s?.item) return;
+  const wall = (performance.now() - s.wall) / 1000;
+  if (wall < MIN_STRETCH_S) return;
+  const q = s.video.getVideoPlaybackQuality();
+  const stats = {
+    file: s.item.path.split(/[\\/]/).pop(), width: s.video.videoWidth, height: s.video.videoHeight,
+    fps: s.item.fps ?? null, wall, media: s.media, frames: s.frames, full: s.full,
+    decoded: q.totalVideoFrames - s.decoded, dropped: q.droppedVideoFrames - s.dropped,
+    rate: s.video.playbackRate, ended,
+  };
+  invoke('player_stats', { start: false, stats }).catch(() => {});
+}
+
+// Called by followPlayhead on each frame it draws.
+function stretchFrame(video) {
+  const s = stretch;
+  if (s?.video !== video) return;
+  s.frames++;
+  const at = video.currentTime;
+  // Forward steps count; a seek or the selection's loop does not.
+  if (!s.skip && at > s.last && at - s.last < 1) s.media += at - s.last;
+  s.skip = false;
+  s.last = at;
+  const now = performance.now();
+  if (now - s.checked >= 500) {
+    s.checked = now;
+    if (screenKey() !== s.screen) {
+      stretchEnd('moved to another monitor');
+      stretchStart(video);
+    }
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stretchEnd('window hidden');
+  else if (trim.video && !trim.video.paused) stretchStart(trim.video);
+});
 
 function openViewer(item) {
   stopPreview();
@@ -745,6 +812,7 @@ function openViewer(item) {
 
 // Stops playback and lets go of the file (needed before it is deleted).
 function releaseMedia() {
+  stretchEnd('viewer closed or another item opened');
   trim.video = null;
   const media = $('viewer-media').firstElementChild;
   if (media instanceof HTMLVideoElement) {
@@ -948,6 +1016,10 @@ async function openTrim(item, video) {
       setTrim(trim.start, Math.min(trim.end, trim.total) || trim.total);
     }
   });
+  video.addEventListener('playing', () => stretchStart(video));
+  video.addEventListener('pause', () => {
+    if (stretch?.video === video) stretchEnd('paused');
+  });
   requestAnimationFrame(() => followPlayhead(video));
   try {
     const info = await invoke('library_trim_info', { path: item.path });
@@ -972,6 +1044,7 @@ async function openTrim(item, video) {
 function followPlayhead(video) {
   if (trim.video !== video) return;
   if (!video.paused && (video.currentTime >= trim.end || video.currentTime < trim.start - 0.25)) video.currentTime = trim.start;
+  stretchFrame(video);
   const now = Math.min(video.currentTime, trim.total);
   $('timeline-playhead').style.left = pct(now);
   $('trim-play').firstChild.textContent = `${video.paused ? t('Play the selection') : t('Pause')} `;
@@ -989,6 +1062,7 @@ function followPlayhead(video) {
 // Shows the frame at t; a millisecond into the frame, so rounding cannot show the
 // previous one.
 function seek(t) {
+  if (stretch) stretch.skip = true;
   if (trim.video) trim.video.currentTime = Math.max(0, Math.min(t + 0.001, trim.total));
 }
 

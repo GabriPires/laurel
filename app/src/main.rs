@@ -1151,6 +1151,56 @@ fn screenshot_now(app: AppHandle) {
     take_screenshot(&app, "the title bar button");
 }
 
+/// Player diagnostics (A30: a friend's clips looked slow motion after he moved the
+/// window to his 60 Hz second monitor). The viewer reports each stretch of playback
+/// (library.js); this keeps the monitor the main window was on when it began.
+#[derive(Default)]
+struct PlayerStretch(Mutex<Option<win::Display>>);
+
+/// `start` notes the main window's monitor; the end of a stretch logs one line with
+/// that monitor, the one the window is on now when it changed, and the viewer's
+/// numbers. A few calls per playback, none per frame.
+#[tauri::command]
+fn player_stats(app: AppHandle, start: bool, stats: Option<Value>) {
+    let display = app.get_webview_window("main").and_then(|w| w.hwnd().ok()).and_then(|h| win::window_display(h.0 as isize));
+    let state = app.state::<PlayerStretch>();
+    let began = std::mem::replace(&mut *state.0.lock().unwrap(), if start { display.clone() } else { None });
+    if start {
+        return;
+    }
+    if let (Some(stats), Some(began)) = (stats, began) {
+        log!("{}", player_line(&stats, &began, display.as_ref()));
+    }
+}
+
+/// "player: <file> <size> <fps>, <s> s on <monitor>: media seconds per wall second,
+/// decoded and dropped frames, how often the page was drawn; ended: <why>".
+fn player_line(s: &Value, began: &win::Display, now: Option<&win::Display>) -> String {
+    let num = |key: &str| s[key].as_f64().unwrap_or(0.0);
+    let wall = num("wall").max(0.001);
+    let fps = s["fps"].as_f64().map_or_else(|| "? fps".to_string(), |f| format!("{} fps", (f * 100.0).round() / 100.0));
+    let full = if s["full"].as_bool() == Some(true) { " in full screen" } else { "" };
+    let mut line = format!(
+        "player: \"{}\" {}x{} {fps}, {wall:.1} s on {began}{full}: {:.3} s of video per second, {:.1} frames decoded/s, {} dropped, page drawn {:.1} times/s",
+        s["file"].as_str().unwrap_or("?"),
+        num("width") as u32,
+        num("height") as u32,
+        num("media") / wall,
+        num("decoded") / wall,
+        num("dropped") as u64,
+        num("frames") / wall,
+    );
+    let rate = num("rate");
+    if rate > 0.0 && rate != 1.0 {
+        line += &format!(", playback rate {rate}");
+    }
+    line += &format!("; ended: {}", s["ended"].as_str().unwrap_or("?"));
+    if let Some(now) = now.filter(|now| *now != began) {
+        line += &format!("; now on {now}");
+    }
+    line
+}
+
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", t!("Open Laurel"), true, None::<&str>)?;
     let settings = app.state::<Arc<Store>>().get();
@@ -1291,6 +1341,7 @@ fn selftest(app: AppHandle) {
     let run = || -> Result<(), String> {
         wait_ready("at start")?;
         check_log_rotation()?;
+        check_player_stats(&app)?;
         check_single_instance(&app)?;
         check_language()?;
         std::thread::sleep(Duration::from_secs(8)); // let the "Recording" notice expire
@@ -1980,6 +2031,29 @@ fn check_single_instance(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Self-test of the player diagnostics (A30): every monitor has a refresh rate, the
+/// main window's monitor is found, and a stretch makes the expected line.
+fn check_player_stats(app: &AppHandle) -> Result<(), String> {
+    let displays = win::displays();
+    let window = app.get_webview_window("main").and_then(|w| w.hwnd().ok()).and_then(|h| win::window_display(h.0 as isize));
+    log!("[selftest] displays {displays:?}; main window on {window:?}");
+    if displays.is_empty() || displays.iter().any(|d| d.hz == 0 || d.width <= 0) || !displays[0].primary {
+        return Err("the monitors or their refresh rates were not read".into());
+    }
+    let Some(window) = window else {
+        return Err("the main window's monitor was not found".into());
+    };
+    let stats = json!({ "file": "Test.mp4", "width": 1920, "height": 1080, "fps": 120.0, "wall": 4.0, "media": 4.0, "decoded": 480, "dropped": 2, "frames": 576, "full": false, "rate": 1.0, "ended": "paused" });
+    let moved = win::Display { hz: window.hz + 1, ..window.clone() };
+    let line = player_line(&stats, &window, Some(&moved));
+    let want = format!("player: \"Test.mp4\" 1920x1080 120 fps, 4.0 s on {window}: 1.000 s of video per second, 120.0 frames decoded/s, 2 dropped, page drawn 144.0 times/s; ended: paused; now on {moved}");
+    log!("[selftest] player line: {line}");
+    if line != want {
+        return Err(format!("the player line is {line:?}, not {want:?}"));
+    }
+    Ok(())
+}
+
 fn check_log_rotation() -> Result<(), String> {
     let dir = std::env::temp_dir().join("laurel-selftest-logs");
     let _ = std::fs::remove_dir_all(&dir);
@@ -2656,6 +2730,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(updates::Pending::default())
+        .manage(PlayerStretch::default())
         // Tauri's own Raw Input registration would replace the hotkeys' one (one
         // registration per device type and process); the app needs no device events.
         .device_event_filter(tauri::DeviceEventFilter::Always)
@@ -2720,7 +2795,8 @@ fn main() {
             update_install,
             start_view,
             save_clip_now,
-            screenshot_now
+            screenshot_now,
+            player_stats
         ])
         .setup(move |app| {
             let work_dir = match std::env::var_os("LAUREL_WORK_DIR") {
@@ -2830,6 +2906,10 @@ fn main() {
                 }
             }
             log!("windows built in {} ms", building.elapsed().as_millis());
+            // For the player diagnostics (A30): the WebView2 that plays the clips and the
+            // monitors, with their refresh rates.
+            let displays: Vec<String> = win::displays().iter().map(ToString::to_string).collect();
+            log!("webview2 {}; displays: {}", tauri::webview_version().unwrap_or_else(|e| format!("unknown ({e})")), displays.join(", "));
             if let Err(e) = app.state::<Notifier>().init_window() {
                 log!("overlay unavailable: {e}");
             }

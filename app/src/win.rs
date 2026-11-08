@@ -35,6 +35,51 @@ struct MonitorInfo {
     flags: u32,
 }
 
+/// MONITORINFOEXW: MONITORINFO and the monitor's device name, for its display mode.
+#[repr(C)]
+struct MonitorInfoEx {
+    size: u32,
+    monitor: Rect,
+    work: Rect,
+    flags: u32,
+    device: [u16; 32],
+}
+
+/// DEVMODEW, of which only the display fields are read.
+#[repr(C)]
+struct DevMode {
+    device_name: [u16; 32],
+    spec_version: u16,
+    driver_version: u16,
+    size: u16,
+    driver_extra: u16,
+    fields: u32,
+    position: [i32; 2],
+    orientation: u32,
+    fixed_output: u32,
+    color: i16,
+    duplex: i16,
+    y_resolution: i16,
+    tt_option: i16,
+    collate: i16,
+    form_name: [u16; 32],
+    log_pixels: u16,
+    bits_per_pel: u32,
+    pels_width: u32,
+    pels_height: u32,
+    display_flags: u32,
+    display_frequency: u32,
+    icm_method: u32,
+    icm_intent: u32,
+    media_type: u32,
+    dither_type: u32,
+    reserved1: u32,
+    reserved2: u32,
+    panning_width: u32,
+    panning_height: u32,
+}
+const _: () = assert!(std::mem::size_of::<DevMode>() == 220);
+
 #[repr(C)]
 struct Guid(u32, u16, u16, [u8; 8]);
 
@@ -130,7 +175,10 @@ extern "system" {
     fn GetForegroundWindow() -> isize;
     fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
     fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
-    fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
+    /// Takes a MonitorInfo or a MonitorInfoEx, told apart by its size field.
+    fn GetMonitorInfoW(monitor: isize, info: *mut c_void) -> i32;
+    fn EnumDisplayMonitors(dc: isize, clip: *const Rect, callback: extern "system" fn(isize, isize, *mut Rect, isize) -> i32, param: isize) -> i32;
+    fn EnumDisplaySettingsW(device: *const u16, mode: u32, dev_mode: *mut DevMode) -> i32;
     fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
     fn SetWindowLongPtrW(hwnd: isize, index: i32, value: isize) -> isize;
     fn SetWindowPos(hwnd: isize, insert_after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
@@ -196,6 +244,8 @@ const DWMWA_CLOAKED: u32 = 14;
 const GW_OWNER: u32 = 4;
 const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const MDT_EFFECTIVE_DPI: u32 = 0;
+const MONITORINFOF_PRIMARY: u32 = 1;
+const ENUM_CURRENT_SETTINGS: u32 = 0xFFFF_FFFF;
 pub const WDA_EXCLUDEFROMCAPTURE: u32 = 0x11;
 const SND_ASYNC: u32 = 0x0001;
 const SND_NODEFAULT: u32 = 0x0002;
@@ -437,7 +487,7 @@ pub fn foreground_anchor() -> (Rect, f64) {
         let hwnd = GetForegroundWindow();
         let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         let mut info = MonitorInfo { size: std::mem::size_of::<MonitorInfo>() as u32, ..Default::default() };
-        GetMonitorInfoW(monitor, &mut info);
+        GetMonitorInfoW(monitor, (&mut info as *mut MonitorInfo).cast());
         let mut frame = Rect::default();
         if DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, (&mut frame as *mut Rect).cast(), std::mem::size_of::<Rect>() as u32) != 0 {
             GetWindowRect(hwnd, &mut frame);
@@ -449,6 +499,58 @@ pub fn foreground_anchor() -> (Rect, f64) {
         GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
         (anchor, dpi_x as f64 / 96.0)
     }
+}
+
+/// A monitor as the player diagnostics describe it (A30): its size in pixels, its
+/// current refresh rate, whether it is the primary one and its scale.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Display {
+    pub width: i32,
+    pub height: i32,
+    pub hz: u32,
+    pub primary: bool,
+    pub scale: u32,
+}
+
+impl std::fmt::Display for Display {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let role = if self.primary { "primary" } else { "secondary" };
+        write!(f, "{}x{} @ {} Hz ({role}, {}%)", self.width, self.height, self.hz, self.scale)
+    }
+}
+
+fn display_of(monitor: isize) -> Option<Display> {
+    unsafe {
+        let mut info = MonitorInfoEx { size: std::mem::size_of::<MonitorInfoEx>() as u32, monitor: Rect::default(), work: Rect::default(), flags: 0, device: [0; 32] };
+        if GetMonitorInfoW(monitor, (&mut info as *mut MonitorInfoEx).cast()) == 0 {
+            return None;
+        }
+        let mut mode: DevMode = std::mem::zeroed();
+        mode.size = std::mem::size_of::<DevMode>() as u16;
+        let hz = if EnumDisplaySettingsW(info.device.as_ptr(), ENUM_CURRENT_SETTINGS, &mut mode) != 0 { mode.display_frequency } else { 0 };
+        let (mut dpi_x, mut dpi_y) = (96, 96);
+        GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+        let m = info.monitor;
+        Some(Display { width: m.right - m.left, height: m.bottom - m.top, hz, primary: info.flags & MONITORINFOF_PRIMARY != 0, scale: dpi_x * 100 / 96 })
+    }
+}
+
+/// The monitor that holds most of a window.
+pub fn window_display(hwnd: isize) -> Option<Display> {
+    display_of(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) })
+}
+
+/// Every monitor of the desktop, the primary one first.
+pub fn displays() -> Vec<Display> {
+    extern "system" fn add(monitor: isize, _dc: isize, _rect: *mut Rect, list: isize) -> i32 {
+        let list = unsafe { &mut *(list as *mut Vec<Display>) };
+        list.extend(display_of(monitor));
+        1
+    }
+    let mut list: Vec<Display> = Vec::new();
+    unsafe { EnumDisplayMonitors(0, std::ptr::null(), add, &mut list as *mut Vec<Display> as isize) };
+    list.sort_by_key(|d| !d.primary);
+    list
 }
 
 /// Makes a window an overlay: no activation, no taskbar button or Alt+Tab entry

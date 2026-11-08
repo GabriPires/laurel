@@ -4,6 +4,12 @@ O Laurel guarda os últimos segundos do jogo que você está jogando e salva um 
 
 Esta é uma versão de teste. Ela pode ter erros, e é exatamente isso que queremos achar com a sua ajuda.
 
+## O que mudou na 0.1.0-rc.14
+
+Esta versão ajuda a investigar um relato: o vídeo no player do Laurel em câmera lenta depois de mover a janela para um segundo monitor. Não conseguimos repetir o problema, então o Laurel passou a anotar nos logs, a cada trecho que toca no player, em qual monitor ele tocou, a taxa de atualização desse monitor e se o vídeo andou na velocidade certa. Isso não deixa o Laurel mais pesado.
+
+- **Se o vídeo ficar lento no player:** deixe tocar uns 10 segundos, salve os logs logo depois e mande para a gente. Diga também se o som ficou lento junto ou só a imagem.
+
 ## O que mudou na 0.1.0-rc.13
 
 Esta versão traz dois pedidos de vocês. Obrigado pelas ideias!
@@ -134,7 +140,7 @@ Não precisa fazer tudo. O que você conseguir já ajuda muito.
 6. **Desempenho:** sentiu queda de FPS ou travadas, principalmente quando o jogo abriu ou quando salvou um clipe? Se quiser, ligue **Configurações > Notificações > Mostrar avisos sobre os jogos** e diga se sentiu alguma diferença ao salvar com o aviso na tela. Diga também se o seu monitor usa G-Sync ou FreeSync.
 7. **Português:** o Laurel abriu em português? Algum texto ficou estranho, cortado ou em inglês? Mande uma captura de tela.
 8. **Seleção e Excluídos:** excluir vários clipes de uma vez funcionou? O **Desfazer** trouxe de volta? **Restaurar** devolveu o clipe para a biblioteca?
-9. **Corte:** cortar um clipe na biblioteca funcionou? Teste também **Salvar e excluir o original**: o clipe cortado ficou no lugar do original, e o **Desfazer** trouxe o original de volta?
+9. **Corte:** cortar um clipe na biblioteca funcionou? Teste também **Salvar e excluir o original**: o clipe cortado ficou no lugar do original, e o **Desfazer** trouxe o original de volta? Se você tem dois monitores, toque um clipe no player e mova a janela do Laurel para o outro monitor: o vídeo continuou na velocidade normal?
 10. **Iniciar com o Windows:** depois de reiniciar o PC, o Laurel abriu sozinho na bandeja e gravou o jogo?
 11. **Atualização:** quando sair uma versão de teste nova, o Laurel vai oferecer a atualização sozinho. Diga se funcionou.
 12. **Conquistas da Steam:** jogando um jogo da Steam, desbloqueie uma conquista. Se ela for comum, ligue antes **Configurações > Clipes automáticos > Qualquer conquista**. O clipe apareceu uns 15 segundos depois, com o troféu na biblioteca? Tocou o som? Em **Clipes automáticos**, a linha de estado mostrou o jogo e as conquistas? Em jogos com anti-cheat, notou algo diferente? Mande o **app.log** se algo não sair.
