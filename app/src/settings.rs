@@ -18,19 +18,9 @@ use std::sync::Mutex;
 
 use serde_json::{json, Value};
 
-/// A program the user marked as a game, by full path.
-#[derive(Clone, Debug, PartialEq)]
-pub struct CustomGame {
-    pub path: String,
-    pub name: String,
-}
-
-/// A detected game the user does not want recorded, by game key (see games.rs).
-#[derive(Clone, Debug, PartialEq)]
-pub struct IgnoredGame {
-    pub key: String,
-    pub name: String,
-}
+pub use laurel_app_core::games::{CustomGame, IgnoredGame};
+use laurel_app_core::games::UserGames;
+use laurel_app_core::hotkeys::{self, Replaced, Stored};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
@@ -164,6 +154,12 @@ impl Default for Settings {
 
 impl Settings {
     pub fn from_json(v: &Value) -> Settings {
+        Settings::from_json_checked(v).0
+    }
+
+    /// The settings, and the stored hotkeys that are refused since an update and
+    /// went back to their default or to none (idea 14), for the notice.
+    pub fn from_json_checked(v: &Value) -> (Settings, Vec<Replaced>) {
         let d = Settings::default();
         let flag = |key: &str, default: bool| v[key].as_bool().unwrap_or(default);
         let number = |key: &str, default: u32, max: u64| v[key].as_u64().map_or(default, |n| n.min(max) as u32);
@@ -172,7 +168,9 @@ impl Settings {
         let pairs = |key: &str, a: &str, b: &str| -> Vec<(String, String)> {
             v[key].as_array().into_iter().flatten().filter_map(|e| Some((e[a].as_str()?.to_string(), e[b].as_str()?.to_string()))).collect()
         };
-        Settings {
+        let (hotkeys, replaced) = stored_hotkeys(v, &d);
+        let [hotkey_clip, hotkey_screenshot, hotkey_toggle] = hotkeys;
+        let settings = Settings {
             // Stored as "overlayNotices" since 0.1.0-rc.3; the old "overlay" key is
             // ignored, so the new default reaches the earlier installs once.
             overlay: flag("overlayNotices", d.overlay),
@@ -188,9 +186,9 @@ impl Settings {
             autostart_asked: flag("autostartAsked", d.autostart_asked),
             custom_games: pairs("customGames", "path", "name").into_iter().map(|(path, name)| CustomGame { path, name }).collect(),
             ignored_games: pairs("ignoredGames", "key", "name").into_iter().map(|(key, name)| IgnoredGame { key, name }).collect(),
-            hotkey_clip: hotkey(v, "hotkeyClip", &d.hotkey_clip),
-            hotkey_screenshot: hotkey(v, "hotkeyScreenshot", &d.hotkey_screenshot),
-            hotkey_toggle: hotkey(v, "hotkeyToggle", &d.hotkey_toggle),
+            hotkey_clip,
+            hotkey_screenshot,
+            hotkey_toggle,
             recording_enabled: flag("recordingEnabled", d.recording_enabled),
             show_cursor: flag("showCursor", d.show_cursor),
             screen_recording: flag("screenRecording", d.screen_recording),
@@ -217,7 +215,13 @@ impl Settings {
             steam_ultra: flag("steamUltra", d.steam_ultra),
             steam_excluded: pairs("steamExcluded", "key", "name").into_iter().map(|(key, name)| IgnoredGame { key, name }).collect(),
             auto_clip_sound: flag("autoClipSound", d.auto_clip_sound),
-        }
+        };
+        (settings, replaced)
+    }
+
+    /// The user's own game lists, for the game classification.
+    pub fn user_games(&self) -> UserGames<'_> {
+        UserGames { custom: &self.custom_games, ignored: &self.ignored_games }
     }
 
     /// Whether the video or the clip length differ: the engine restarts with them.
@@ -274,29 +278,37 @@ impl Settings {
     }
 }
 
-/// A stored hotkey that parses and is allowed, else the default.
-fn hotkey(v: &Value, key: &str, default: &str) -> String {
-    v[key]
-        .as_str()
-        .and_then(crate::hotkeys::Combo::parse)
-        .filter(|c| crate::hotkeys::reject_reason(c).is_none())
-        .map_or(default.to_string(), |c| c.name())
+/// The stored hotkeys of clip, screenshot and recording on/off, checked against
+/// the rules (laurel_app_core::hotkeys::load); "" for none.
+fn stored_hotkeys(v: &Value, d: &Settings) -> ([String; 3], Vec<Replaced>) {
+    let stored = |action, key: &str, default| Stored { action, text: v[key].as_str(), default };
+    let loaded = hotkeys::load(&[stored("clip", "hotkeyClip", &d.hotkey_clip), stored("screenshot", "hotkeyScreenshot", &d.hotkey_screenshot), stored("toggle", "hotkeyToggle", &d.hotkey_toggle)]);
+    let mut texts = loaded.hotkeys.into_iter().map(|c| c.map_or_else(String::new, |c| c.name()));
+    ([(); 3].map(|_| texts.next().unwrap_or_default()), loaded.replaced)
 }
 
 /// The settings file and its current content, shared by the app's parts.
 pub struct Store {
     path: PathBuf,
     current: Mutex<Settings>,
+    /// The stored hotkeys the file had that are refused since an update.
+    replaced_hotkeys: Vec<Replaced>,
 }
 
 impl Store {
     pub fn open(path: &Path) -> Store {
-        let current = std::fs::read_to_string(path)
+        let (current, replaced_hotkeys) = std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .map(|v| Settings::from_json(&v))
+            .map(|v| Settings::from_json_checked(&v))
             .unwrap_or_default();
-        Store { path: path.to_path_buf(), current: Mutex::new(current) }
+        Store { path: path.to_path_buf(), current: Mutex::new(current), replaced_hotkeys }
+    }
+
+    /// The stored hotkeys that are refused since an update and were replaced when
+    /// the file was read; the file keeps them until the settings are saved.
+    pub fn replaced_hotkeys(&self) -> &[Replaced] {
+        &self.replaced_hotkeys
     }
 
     pub fn get(&self) -> Settings {

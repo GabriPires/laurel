@@ -4,6 +4,16 @@ O Laurel guarda os últimos segundos do jogo que você está jogando e salva um 
 
 Esta é uma versão de teste. Ela pode ter erros, e é exatamente isso que queremos achar com a sua ajuda.
 
+## O que mudou na 0.1.0-rc.16
+
+Esta versão traz correções que vieram dos logs de vocês e um pedido do dono do projeto.
+
+- **Toque duplo no atalho:** apertar o atalho do clipe duas vezes seguidas salvava dois clipes iguais. Agora, um segundo toque dentro de 1 segundo é ignorado.
+- **Teclas que não podem mais ser atalho:** CapsLock, Tab, NumLock, ScrollLock, as teclas de volume, de mídia e de menu, Ctrl+C, Ctrl+V, Ctrl+X, Ctrl+Z, Ctrl+Y, Ctrl+A, Ctrl+S e Ctrl+Alt+Delete. O Laurel não tira a tecla do jogo, então um atalho no CapsLock trocava as maiúsculas a cada clipe. Se você usava uma dessas teclas, o Laurel volta o atalho para o padrão (**F8** para o clipe, **Shift+F8** para a captura de tela), ou deixa a ação sem atalho se o padrão já estiver em uso, e avisa uma vez na tela. Para escolher outro, vá em **Configurações > Atalhos**.
+- **Fortnite:** o Laurel agora reconhece o Fortnite mesmo quando não o acha pela biblioteca da Epic.
+- **Clipe que não pôde ser salvo:** se você aperta o atalho num jogo em tela cheia e o clipe não pode ser salvo, o Laurel mostra o motivo na tela, mesmo com os avisos sobre o jogo desligados. Por exemplo: o jogo não foi reconhecido (adicione-o em **Configurações > Jogos**) ou a gravação está desligada.
+- **Logs:** o Laurel passou a anotar o que achou nas bibliotecas da Steam, da Epic, da Riot e da Xbox. Se algum jogo seu não for reconhecido, **mande os logs** (**Configurações > Avançado > Salvar logs para enviar**) e diga qual jogo e por qual loja você o instalou.
+
 ## O que mudou na 0.1.0-rc.15
 
 Esta versão corrige um problema que apareceu nos logs de vocês. Quando um jogo abre a janela e demora alguns segundos para começar a desenhar, como o Fortnite durante o carregamento, o Laurel podia ficar sem conseguir entrar no jogo pelo resto da sessão. Ele passava a gravar pela janela (o aviso **Gravando {jogo} pela janela**), que pesa mais, pode perder quadros e, no Windows 10, deixa a borda amarela em volta do jogo. Agora o Laurel entra no jogo assim que ele começa a desenhar. Ele também passou a anotar nos logs quando está esperando o jogo desenhar, para a gente ver se a correção funcionou no seu PC.

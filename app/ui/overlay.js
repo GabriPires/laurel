@@ -1,6 +1,6 @@
 // In-game notices: the app emits "notice" { id, kind, title, detail, holdMs } and
 // shows this window; each notice leaves after holdMs. At most three at a time.
-const { listen } = window.__TAURI__.event;
+const { listen, emit } = window.__TAURI__.event;
 
 const MAX_VISIBLE = 3;
 const ICONS = {
@@ -19,7 +19,9 @@ function dismiss(item) {
   item.addEventListener('animationend', () => item.remove(), { once: true });
 }
 
-listen('notice', ({ payload }) => {
+// The app holds a notice that must be seen, such as a shortcut changed by an
+// update, until this window listens (main.rs, announce_replaced_hotkeys).
+const listening = listen('notice', ({ payload }) => {
   const stack = document.getElementById('stack');
   const item = document.createElement('li');
   item.className = `toast ${payload.kind}`;
@@ -31,3 +33,4 @@ listen('notice', ({ payload }) => {
   live.slice(MAX_VISIBLE).forEach(dismiss);
   setTimeout(() => dismiss(item), payload.holdMs);
 });
+listening.then(() => emit('overlay-ready'));

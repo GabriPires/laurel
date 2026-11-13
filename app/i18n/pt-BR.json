@@ -581,5 +581,17 @@
   "RNNoise (better)": "RNNoise (melhor)",
   "Removes background noise from your voice, such as fans, the keyboard and the room.": "Tira o ruído de fundo da sua voz, como ventiladores, o teclado e o ambiente.",
   "Speex is light on the CPU and removes steady noise, such as fans.": "O Speex é leve para a CPU e tira ruídos constantes, como o de ventiladores.",
-  "RNNoise gives a better result, but uses more CPU while Laurel records.": "O RNNoise dá um resultado melhor, mas usa mais CPU enquanto o Laurel grava."
+  "RNNoise gives a better result, but uses more CPU while Laurel records.": "O RNNoise dá um resultado melhor, mas usa mais CPU enquanto o Laurel grava.",
+  "Ctrl+C, Ctrl+V and the other editing shortcuts are used by every program": "Ctrl+C, Ctrl+V e os outros atalhos de edição são usados por todos os programas",
+  "Laurel can't keep this key as a shortcut": "O Laurel não consegue guardar esta tecla como atalho",
+  "Lock keys change how you type": "As teclas de trava mudam o jeito de digitar",
+  "Media, volume and other special keys belong to Windows": "As teclas de mídia, de volume e outras teclas especiais são do Windows",
+  "No game is being recorded. If this is a game, add it in Settings, Games.": "Nenhum jogo está sendo gravado. Se isto é um jogo, adicione-o em Configurações, Jogos.",
+  "Recording is off. Turn it on in Laurel to save clips.": "A gravação está desligada. Ligue-a no Laurel para salvar clipes.",
+  "Shortcut changed": "Atalho trocado",
+  "Tab is used in games and to move between fields": "O Tab é usado nos jogos e para passar de um campo a outro",
+  "The menu key opens menus in games and programs": "A tecla de menu abre menus nos jogos e nos programas",
+  "{old} can't be a shortcut anymore, and {default} is already used for {other}, so {action} has no shortcut now. Set one in Settings, Shortcuts.": "{old} não pode mais ser atalho, e {default} já é usado para {other}; por isso, {action} está sem atalho. Escolha um em Configurações, Atalhos.",
+  "{old} can't be a shortcut anymore, so {action} has no shortcut now. Set one in Settings, Shortcuts.": "{old} não pode mais ser atalho; por isso, {action} está sem atalho. Escolha um em Configurações, Atalhos.",
+  "{old} can't be a shortcut anymore. {action} now uses {new}; you can change it in Settings, Shortcuts.": "{old} não pode mais ser atalho. {action} agora usa {new}; você pode trocar em Configurações, Atalhos."
 }

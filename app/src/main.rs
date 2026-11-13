@@ -32,6 +32,7 @@ mod updates;
 mod win;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -44,6 +45,7 @@ use tauri::{AppHandle, Emitter, Listener, Manager, RunEvent, WindowEvent};
 use detect::{Detector, Mode};
 use engine::{Engine, EngineConfig};
 use hotkeys::{Combo, Hotkeys};
+use laurel_app_core::clip::{self, Admission, ClipCooldown, Refusal, Source as ClipSource};
 use i18n::t;
 use library::Library;
 use log::log;
@@ -84,7 +86,7 @@ fn bindings(settings: &Settings) -> Vec<(&'static str, Combo)> {
 
 /// The hotkey of an action as shown, with " (…)" around it, or nothing when unset.
 fn hotkey_suffix(settings: &Settings, action: &str) -> String {
-    Combo::parse(hotkey_text(settings, action)).map_or_else(String::new, |c| format!(" ({})", c.label()))
+    Combo::parse(hotkey_text(settings, action)).map_or_else(String::new, |c| format!(" ({})", hotkeys::label(&c)))
 }
 
 fn hotkeys_json(app: &AppHandle) -> Value {
@@ -92,9 +94,35 @@ fn hotkeys_json(app: &AppHandle) -> Value {
     let mut v = json!({ "available": true, "capturing": hotkeys.capturing() });
     let bound = hotkeys.bindings();
     for action in HOTKEY_ACTIONS {
-        v[action] = bound.iter().find(|(a, _)| *a == action).map_or(Value::Null, |(_, c)| json!({ "combo": c.name(), "label": c.label() }));
+        v[action] = bound.iter().find(|(a, _)| *a == action).map_or(Value::Null, |(_, c)| json!({ "combo": c.name(), "label": hotkeys::label(c) }));
     }
+    // Idea 14: the stored hotkeys this start replaced, noted on the Shortcuts page.
+    v["replaced"] = app.state::<Arc<Store>>().replaced_hotkeys().iter().map(hotkeys::replaced_text).collect();
     v
+}
+
+/// Idea 14: a stored hotkey that an update made a refused one went back to its
+/// default, or to none; the player is told once, over the screen, and the settings
+/// are saved so that the next start has nothing to tell. Called when the overlay
+/// listens for notices ("overlay-ready"): one sent before would be lost.
+fn announce_replaced_hotkeys(app: &AppHandle) {
+    let store = app.state::<Arc<Store>>();
+    let replaced = store.replaced_hotkeys();
+    if replaced.is_empty() {
+        return;
+    }
+    for r in replaced {
+        let now = match r.now {
+            hotkeys::Replacement::Default(new) => format!("now {}", new.name()),
+            hotkeys::Replacement::DefaultTaken { default, by } => format!("now none, {} is used by {by}", default.name()),
+            hotkeys::Replacement::NoDefault => "now none".into(),
+        };
+        log!("hotkeys: {} of {} is refused since this version; {now}", r.old.name(), r.action);
+        app.state::<Notifier>().notify_always(Kind::Info, &t!("Shortcut changed"), &hotkeys::replaced_text(r));
+    }
+    if let Err(e) = store.set(store.get()) {
+        log!("hotkeys: could not save the settings: {e}");
+    }
 }
 
 fn update_tray(app: &AppHandle) {
@@ -148,7 +176,7 @@ fn set_recording_enabled(app: &AppHandle, enabled: bool, notice: bool) {
 fn on_hotkey(app: &AppHandle, event: hotkeys::Event) {
     use hotkeys::Event;
     match event {
-        Event::Pressed("clip") => save_clip(app, "the hotkey"),
+        Event::Pressed("clip") => save_clip(app, ClipSource::Hotkey),
         Event::Pressed("screenshot") => take_screenshot(app, "the hotkey"),
         Event::Pressed("toggle") => {
             let app = app.clone();
@@ -168,7 +196,7 @@ fn on_hotkey(app: &AppHandle, event: hotkeys::Event) {
         }
         Event::Rejected(action, combo, reason) => {
             log!("hotkeys: {} refused for {action}: {reason}", combo.name());
-            let _ = app.emit("hotkey-rejected", json!({ "action": action, "label": combo.label(), "reason": reason }));
+            let _ = app.emit("hotkey-rejected", json!({ "action": action, "label": hotkeys::label(&combo), "reason": reason }));
         }
         Event::Cancelled(action) => {
             let _ = app.emit("hotkey-cancelled", json!({ "action": action }));
@@ -234,36 +262,80 @@ fn engine_config(work_dir: PathBuf, storage: Arc<Storage>, detector: Arc<Detecto
     EngineConfig { exe, work_dir, options: Box::new(options) }
 }
 
-/// Saves a clip and tells the windows and the player; used by the hotkey, the tray
-/// and the UI. `source` goes to the log, to tell later what asked for each clip.
-fn save_clip(app: &AppHandle, source: &str) {
-    save_clip_for(app, source, None);
+/// The user's clip requests and their cooldown (A33 of the stability tests).
+#[derive(Default)]
+struct ClipRequests {
+    cooldown: Mutex<ClipCooldown>,
+    /// Requests ignored by the cooldown since start (for the self-test).
+    ignored: AtomicU64,
 }
 
-/// save_clip for an automatic clip too: `achievement` (autoclip.steam-achievements)
-/// names the file, marks the library item and picks the auto-clip notice and sound;
-/// an automatic clip that cannot be saved is only logged.
-pub fn save_clip_for(app: &AppHandle, source: &str, achievement: Option<Value>) {
-    log!("clip requested by {source}");
+fn clip_rect(r: &win::Rect) -> clip::Rect {
+    clip::Rect { left: r.left, top: r.top, right: r.right, bottom: r.bottom }
+}
+
+/// What asked for a clip, for the log, to tell later what asked for each clip.
+fn clip_source_text(source: ClipSource) -> &'static str {
+    match source {
+        ClipSource::Hotkey => "the hotkey",
+        ClipSource::TitleBar => "the title bar button",
+        ClipSource::Tray => "the tray menu",
+        ClipSource::Automatic => "Laurel",
+    }
+}
+
+/// Saves a clip and tells the windows and the player; used by the hotkey, the tray
+/// and the UI.
+fn save_clip(app: &AppHandle, source: ClipSource) {
+    save_clip_for(app, source, clip_source_text(source), None);
+}
+
+/// An automatic clip (autoclip.steam-achievements): `achievement` names the file,
+/// marks the library item and picks the auto-clip notice and sound; a clip that
+/// cannot be saved is only logged. `what` tells the log which achievement asked.
+pub fn save_achievement_clip(app: &AppHandle, what: &str, achievement: Value) {
+    save_clip_for(app, ClipSource::Automatic, what, Some(achievement));
+}
+
+/// A clip request: the user's go through the clip cooldown (spec
+/// record.replay-buffer), and one it ignores only leaves a line in the log.
+fn save_clip_for(app: &AppHandle, source: ClipSource, what: &str, achievement: Option<Value>) {
+    let requests = app.state::<ClipRequests>();
+    if let Admission::Ignored { since } = requests.cooldown.lock().unwrap().admit(source, Instant::now()) {
+        requests.ignored.fetch_add(1, Ordering::SeqCst);
+        log!("clip request by {what} ignored: {} ms after the last one (clip cooldown)", since.as_millis());
+        return;
+    }
+    log!("clip requested by {what}");
     let app = app.clone();
     std::thread::spawn(move || {
         let engine = app.state::<Engine>();
         let notifier = app.state::<Notifier>();
-        let refused = if !app.state::<Arc<Detector>>().enabled() {
-            Some(t!("Recording is off"))
-        } else if app.state::<Arc<Storage>>().is_paused() {
-            Some(t!("Disk almost full: free up space to keep recording"))
-        } else if !app.state::<Arc<Detector>>().recording() {
-            Some(t!("No game is being recorded"))
-        } else {
-            None
-        };
-        if let Some(message) = refused {
+        let detector = app.state::<Arc<Detector>>();
+        let recording = clip::Recording { enabled: detector.enabled(), disk_paused: app.state::<Arc<Storage>>().is_paused(), buffer_runs: detector.recording(), needs_admin: detector.needs_admin_game() };
+        if let Some(refusal) = clip::refusal(&recording) {
+            // The reason as Laurel's window and an ordinary notice give it, then
+            // the notice over a fullscreen program, with what to do (A32).
+            let (message, title, detail) = match &refusal {
+                Refusal::RecordingOff => (t!("Recording is off"), t!("Clip not saved"), t!("Recording is off. Turn it on in Laurel to save clips.")),
+                Refusal::DiskAlmostFull => (t!("Disk almost full: free up space to keep recording"), t!("Clip not saved"), t!("Disk almost full: free up space to keep recording")),
+                Refusal::NeedsAdmin { game } => (t!("No game is being recorded"), t!("Can't record {game}", game = game), t!("It runs as administrator. Open Laurel and restart it as administrator.")),
+                Refusal::NoGame => (t!("No game is being recorded"), t!("Clip not saved"), t!("No game is being recorded. If this is a game, add it in Settings, Games.")),
+            };
             if achievement.is_some() {
                 log!("automatic clip not saved: {message}");
                 return;
             }
-            notifier.notify(Kind::Error, &t!("Clip not saved"), &message);
+            let foreground = win::foreground_window_info();
+            let foreground = foreground.as_ref().map(|(exe_path, client, monitor)| clip::Foreground { exe_path, client: clip_rect(client), monitor: clip_rect(monitor) });
+            if clip::refusal_over_screen(source, &refusal, foreground.as_ref(), &detector.catalog(), &app.state::<Arc<Store>>().get().user_games()) {
+                // A32: the player pressed the hotkey in a fullscreen program; with
+                // notices over games off they would only hear the error sound.
+                log!("clip refused with a fullscreen program in focus ({}): its reason shown over the screen", foreground.map_or("", |f| f.exe_path));
+                notifier.notify_critical(&title, &detail);
+            } else {
+                notifier.notify(Kind::Error, &t!("Clip not saved"), &message);
+            }
             report(&app, "clip-saved", "saveClip", Err(message));
             return;
         }
@@ -717,7 +789,7 @@ fn games_overview(detector: tauri::State<'_, Arc<Detector>>, store: tauri::State
     let catalog = detector.catalog();
     let ignored = |key: &str| settings.ignored_games.iter().any(|g| g.key == key);
     let mut installed: Vec<Value> = catalog
-        .installed()
+        .store_games()
         .iter()
         .map(|g| json!({ "key": g.id.key, "name": g.id.name, "source": g.id.source, "dir": g.dir, "ignored": ignored(&g.id.key) }))
         .collect();
@@ -737,7 +809,7 @@ fn autoclip_status(achievements: tauri::State<'_, Arc<steam::Achievements>>, det
     let excluded = store.get().steam_excluded;
     let mut games: Vec<Value> = detector
         .catalog()
-        .installed()
+        .store_games()
         .iter()
         .filter(|g| g.id.source == "steam")
         .map(|g| json!({ "key": g.id.key, "name": g.id.name, "excluded": excluded.iter().any(|e| e.key == g.id.key) }))
@@ -1143,7 +1215,7 @@ fn start_view() -> Option<String> {
 
 #[tauri::command]
 fn save_clip_now(app: AppHandle) {
-    save_clip(&app, "the title bar button");
+    save_clip(&app, ClipSource::TitleBar);
 }
 
 #[tauri::command]
@@ -1220,7 +1292,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             let app = app.clone();
             std::thread::spawn(move || set_recording_enabled(&app, !enabled, false));
         }
-        "clip" => save_clip(app, "the tray menu"),
+        "clip" => save_clip(app, ClipSource::Tray),
         "shot" => take_screenshot(app, "the tray menu"),
         "quit" => quit(app),
         _ => {}
@@ -1591,10 +1663,10 @@ fn check_language() -> Result<(), String> {
 }
 
 /// Self-test of game detection (specs game.detection, game.manual-add): a program
-/// inside an installed game's folder is that game, a crash reporter there and a
-/// system program are not, and an ignored game is ignored. Then, with detection on,
-/// a PowerShell window added as a game is found, recording runs, a clip carries the
-/// game's name, and recording pauses after the window closes.
+/// inside the first installed game's folder on this PC is that game, and an ignored
+/// game is ignored (the fixed rules are tests of laurel-app-core). Then, with
+/// detection on, a PowerShell window added as a game is found, recording runs, a
+/// clip carries the game's name, and recording pauses after the window closes.
 fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
     use games::Verdict;
     use std::os::windows::process::CommandExt;
@@ -1603,60 +1675,17 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
     let settings = store.get();
     {
         let catalog = detector.catalog();
-        log!("[selftest] installed games: {} {}", catalog.installed().len(), catalog.counts());
-        if let Some(game) = catalog.installed().first() {
-            let inside = game.dir.join(r"Game\Binaries\Win64\Game-Win64-Shipping.exe").to_string_lossy().into_owned();
+        log!("[selftest] installed games: {} {}", catalog.store_games().len(), catalog.counts());
+        if let Some(game) = catalog.store_games().first() {
+            let inside = format!(r"{}\Game\Binaries\Win64\Game-Win64-Shipping.exe", game.dir);
             let ignoring = Settings { ignored_games: vec![IgnoredGame { key: game.id.key.clone(), name: game.id.name.clone() }], ..settings.clone() };
-            let verdicts = (catalog.classify(&inside, &settings), catalog.classify(&inside, &ignoring));
+            let verdicts = (catalog.classify(&inside, &settings.user_games()), catalog.classify(&inside, &ignoring.user_games()));
             log!("[selftest] classify in {}: {:?}", game.id.name, verdicts);
             if verdicts != (Verdict::Game(game.id.clone()), Verdict::Ignored(game.id.clone())) {
                 return Err("library classification failed".into());
             }
-            // Helpers in the game's folder are not the game: a crash handler, a
-            // launcher such as HoYoPlay's next to Genshin Impact (A17 of the
-            // stability tests), and the anti-cheat bootstrappers that start the game
-            // and show a splash window (A22: Fortnite's Easy Anti-Cheat one was
-            // recorded instead of the game).
-            let helpers = [
-                "UnityCrashHandler64.exe",
-                "HYP.exe",
-                r"Game\Binaries\Win64\Game-Win64-Shipping_EAC_EOS.exe",
-                r"Game\Binaries\Win64\Game-Win64-Shipping_EAC.exe",
-                r"Game\Binaries\Win64\Game-Win64-Shipping_BE.exe",
-                "start_protected_game.exe",
-            ];
-            let counted: Vec<&str> = helpers.into_iter().filter(|h| catalog.classify(&game.dir.join(h).to_string_lossy(), &settings) != Verdict::NotGame).collect();
-            log!("[selftest] helpers in {} not counted as the game: {} of {}", game.id.name, helpers.len() - counted.len(), helpers.len());
-            if !counted.is_empty() {
-                return Err(format!("helpers counted as the game: {counted:?}"));
-            }
         } else {
             log!("[selftest] no installed games; library classification not exercised");
-        }
-        // Minecraft (Java) is found by its window and command line, from any Java
-        // runtime: vanilla (an SDL window since 26.x, GLFW before), a Prism instance (whose main class and game arguments go
-        // through stdin), an old LWJGL 2 version by its title when the command line
-        // cannot be read; not a Swing installer nor another Java game.
-        let java = r"C:\Laurel self-test\runtime\bin\javaw.exe";
-        let minecraft = |class: &str, title: &str, line: Option<&str>, settings: &Settings| catalog.classify_window(java, class, title, || line.map(String::from), settings);
-        let ignoring = Settings { ignored_games: vec![IgnoredGame { key: "minecraft:java".into(), name: "Minecraft".into() }], ..settings.clone() };
-        let cases = [
-            ("vanilla sdl", minecraft("SDL_app", "Minecraft 26.3", Some(r"C:\runtime\bin\javaw.exe -XX:HeapDumpPath=MojangTricksIntelDriversForPerformance_javaw.exe_minecraft.exe.heapdump --gameDir C:\.minecraft"), &settings), true),
-            ("vanilla", minecraft("GLFW30", "Minecraft* 26.2", Some(r#""C:\runtime\bin\javaw.exe" -Xmx2G -cp C:\libraries\client.jar net.minecraft.client.main.Main --version 26.2"#), &settings), true),
-            ("prism", minecraft("GLFW30", "Homestead", Some(r"javaw.exe -Djava.library.path=C:\instances\Homestead\natives -cp C:\libraries\NewLaunch.jar;C:\libraries\net\fabricmc\loader.jar org.prismlauncher.EntryPoint"), &settings), true),
-            ("lwjgl2 title", minecraft("LWJGL", "Minecraft 1.12.2", None, &settings), true),
-            ("swing installer", minecraft("SunAwtFrame", "Forge Installer", Some("java -jar forge-installer.jar net.minecraftforge.installer.SimpleInstaller"), &settings), false),
-            ("other java game", minecraft("GLFW30", "Mindustry", Some("javaw.exe -jar Mindustry.jar"), &settings), false),
-        ];
-        let wrong: Vec<&str> = cases.iter().filter(|(_, verdict, game)| matches!(verdict, Verdict::Game(id) if id.key == "minecraft:java") != *game).map(|(name, _, _)| *name).collect();
-        let ignored = minecraft("GLFW30", "Minecraft* 26.2", Some("net.minecraft.client.main.Main"), &ignoring);
-        log!("[selftest] minecraft windows: {} cases, wrong: {wrong:?}; ignored {:?}", cases.len(), matches!(ignored, Verdict::Ignored(_)));
-        if !wrong.is_empty() || !matches!(ignored, Verdict::Ignored(_)) {
-            return Err(format!("minecraft classification failed: {wrong:?}"));
-        }
-        let system = catalog.classify(r"C:\Windows\explorer.exe", &settings);
-        if system != Verdict::NotGame {
-            return Err(format!("explorer.exe classified as {system:?}"));
         }
     }
 
@@ -1880,31 +1909,17 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
     outcome
 }
 
-/// Self-test of the hotkeys (spec clip.hotkeys): the text form round-trips; invalid
-/// combinations are refused with a reason; a hotkey typed on the keyboard fires
-/// through Raw Input; recording a new hotkey saves it, refuses one that another
-/// action uses, and can be cancelled. The typed keys are F13 and F14, which
-/// applications do not use; they go to whatever window has the focus.
+/// Self-test of the hotkeys (spec clip.hotkeys), typed for real: a hotkey typed on
+/// the keyboard fires through Raw Input, and a second press within the clip
+/// cooldown is ignored (A33); recording a new hotkey saves it, refuses one that
+/// another action uses, and can be cancelled. The rules themselves are tests of
+/// laurel-app-core. The typed keys are F13 and F14, which applications do not use;
+/// they go to whatever window has the focus.
 fn check_hotkeys(app: &AppHandle) -> Result<(), String> {
     const VK_CONTROL: u16 = 0x11;
     const VK_F13: u16 = 0x7C;
     const VK_F14: u16 = 0x7D;
     let hotkeys = app.try_state::<Hotkeys>().ok_or("hotkeys unavailable")?;
-    for text in ["F8", "Shift+F8", "Ctrl+Alt+K", "Mouse4", "Ctrl+Mouse5", "Numpad5", "NumpadEnter", "Ctrl+Oem_BA"] {
-        let combo = Combo::parse(text).ok_or(format!("{text} does not parse"))?;
-        if combo.name() != text {
-            return Err(format!("{text} came back as {}", combo.name()));
-        }
-    }
-    let verdict = |text: &str| Combo::parse(text).map(|c| hotkeys::reject_reason(&c).is_none());
-    let refused = ["K", "Shift+K", "Space", "Up", "Win+F8", "Esc", "Alt+F4", "Alt+Tab", "Mouse1"];
-    let allowed = ["F9", "Ctrl+K", "Alt+K", "Mouse4", "Ctrl+Shift+S", "Insert", "Numpad0"];
-    let wrong: Vec<&str> = refused.iter().filter(|t| verdict(t) != Some(false)).chain(allowed.iter().filter(|t| verdict(t) != Some(true))).copied().collect();
-    log!("[selftest] hotkey rules: {} refused, {} allowed, wrong: {wrong:?}; Ctrl+Oem_BA shows as {}", refused.len(), allowed.len(), Combo::parse("Ctrl+Oem_BA").map(|c| c.label()).unwrap_or_default());
-    if !wrong.is_empty() {
-        return Err(format!("hotkey rules wrong for {wrong:?}"));
-    }
-
     let store = app.state::<Arc<Store>>().inner().clone();
     let saved = store.get();
     let wait = |what: &str, done: &dyn Fn() -> bool| -> Result<(), String> {
@@ -1923,10 +1938,18 @@ fn check_hotkeys(app: &AppHandle) -> Result<(), String> {
     });
     let outcome = (|| -> Result<(), String> {
         set_hotkeys(app, |s| s.hotkey_clip = "F14".into());
-        let before = hotkeys.presses();
-        win::send_keys(&[(VK_F14, false), (VK_F14, true)]);
-        wait("F14 to fire", &|| hotkeys.presses() == before + 1)?;
-        log!("[selftest] typed F14 fired the clip hotkey");
+        // A33: two presses in a row give one clip request; the second is ignored.
+        let requests = app.state::<ClipRequests>();
+        let (before, ignored) = (hotkeys.presses(), requests.ignored.load(Ordering::SeqCst));
+        win::send_keys(&[(VK_F14, false), (VK_F14, true), (VK_F14, false), (VK_F14, true)]);
+        // The press count goes up before the clip request is made, so the wait is
+        // for the second request to be ignored too.
+        wait("F14 to fire twice", &|| hotkeys.presses() == before + 2 && requests.ignored.load(Ordering::SeqCst) > ignored)?;
+        let ignored = requests.ignored.load(Ordering::SeqCst) - ignored;
+        log!("[selftest] typed F14 twice: the clip hotkey fired twice, {ignored} request ignored by the clip cooldown");
+        if ignored != 1 {
+            return Err(format!("two quick clip hotkey presses left {ignored} requests ignored, not 1"));
+        }
 
         hotkeys.capture("screenshot");
         win::send_keys(&[(VK_CONTROL, false), (VK_F13, false), (VK_F13, true), (VK_CONTROL, true)]);
@@ -2731,6 +2754,7 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(updates::Pending::default())
         .manage(PlayerStretch::default())
+        .manage(ClipRequests::default())
         // Tauri's own Raw Input registration would replace the hotkeys' one (one
         // registration per device type and process); the app needs no device events.
         .device_event_filter(tauri::DeviceEventFilter::Always)
@@ -2897,6 +2921,8 @@ fn main() {
                 }
                 Err(e) => log!("hotkeys unavailable: {e}"),
             }
+            let handle = app.handle().clone();
+            app.once("overlay-ready", move |_| announce_replaced_hotkeys(&handle));
             // The windows are created here, after every state they call into exists
             // (windows created from the config would load before setup runs).
             let building = Instant::now();

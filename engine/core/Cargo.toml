@@ -1,0 +1,15 @@
+[package]
+name = "laurel-engine-core"
+# An internal library built into laurel-engine; its version is not released on its own.
+version = "0.0.0"
+description = "Laurel engine's logic that needs neither Windows nor libobs, so that it can be tested on any platform."
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Tests live only in tests/ (decision D14); a code block in a doc comment is an
+# example, not a test.
+[lib]
+doctest = false
+
+[dependencies]

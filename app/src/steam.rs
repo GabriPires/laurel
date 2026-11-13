@@ -260,7 +260,7 @@ impl Achievements {
                 first["others"] = pending.achievements[1..].iter().map(|a| a["name"].clone()).collect();
             }
             let source = format!("achievement {} [{}]", first["id"].as_str().unwrap_or_default(), first["tier"].as_str().unwrap_or_default());
-            crate::save_clip_for(&me.app, &source, Some(first));
+            crate::save_achievement_clip(&me.app, &source, first);
         });
     }
 

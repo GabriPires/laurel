@@ -1,5 +1,5 @@
 {
-  "about": "Laurel's curated game list (spec game.detection). Games installed through Steam, Epic, Riot and Xbox are found from their libraries; this list only adds games from other launchers, store entries that are not games, and helper or client executables that live in game folders. Keys: <store>:<id> or exe:<lowercase file name>. windowGames are games that run in a shared program from any folder (Java), found by the program, its window class and its command line (or, when that cannot be read, its title).",
+  "about": "Laurel's curated game list (spec game.detection). Games installed through Steam, Epic, Riot and Xbox are found from their libraries; this list only adds games from other launchers, store games their store's library did not find (A32; such an entry has the store's key, so the game is the same from both), store entries that are not games, and helper or client executables that live in game folders. Keys: <store>:<id> or exe:<lowercase file name>. windowGames are games that run in a shared program from any folder (Java), found by the program, its window class and its command line (or, when that cannot be read, its title).",
   "notGames": [
     "steam:228980",
     "steam:250820",
@@ -64,6 +64,7 @@
   ],
   "games": [
     { "exe": "Diablo IV.exe", "name": "Diablo IV" },
+    { "exe": "FortniteClient-Win64-Shipping.exe", "name": "Fortnite", "key": "epic:Fortnite" },
     { "exe": "GenshinImpact.exe", "name": "Genshin Impact" },
     { "exe": "GTA5.exe", "name": "Grand Theft Auto V" },
     { "exe": "Hearthstone.exe", "name": "Hearthstone" },

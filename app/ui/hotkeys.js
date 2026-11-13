@@ -68,4 +68,8 @@ listen('hotkey-cancelled', async () => {
   hotkeyMessage(HOTKEY_HELP);
 });
 
-invoke('hotkeys_get').then(showHotkeys);
+invoke('hotkeys_get').then((h) => {
+  showHotkeys(h);
+  // Idea 14: a stored shortcut this version refuses was replaced at start.
+  if (h.replaced?.length) hotkeyMessage(h.replaced.join(' '));
+});

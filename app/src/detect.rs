@@ -20,7 +20,8 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::engine::Engine;
-use crate::games::{Catalog, GameId, Verdict};
+use crate::games::{self, Catalog, GameId, Verdict};
+use laurel_app_core::stores::{self, Report};
 use crate::i18n::t;
 use crate::log::log;
 use crate::overlay::{Kind, Notifier};
@@ -169,6 +170,9 @@ pub struct Detector {
     app: AppHandle,
     store: Arc<Store>,
     catalog: RwLock<Catalog>,
+    /// What the last scan of each store saw; a store's line is logged again only
+    /// when it changes (A32).
+    store_reports: Mutex<Vec<Report>>,
     state: Mutex<State>,
     /// Serializes the requests that bring the engine to the wanted state.
     apply_lock: Mutex<()>,
@@ -182,15 +186,19 @@ pub struct Detector {
 
 impl Detector {
     pub fn new(app: AppHandle, store: Arc<Store>, mode: Mode) -> Arc<Detector> {
-        let catalog = Catalog::scan();
+        let (catalog, reports) = games::scan();
         let settings = store.get();
         let enabled = settings.recording_enabled;
         let screen = screen_of(&settings);
-        log!("games: {} installed games found {}", catalog.installed().len(), catalog.counts());
+        log!("games: {} installed games found {}", catalog.store_games().len(), catalog.counts());
+        for report in &reports {
+            log!("games: {report}");
+        }
         Arc::new(Detector {
             app,
             store,
             catalog: RwLock::new(catalog),
+            store_reports: Mutex::new(reports),
             state: Mutex::new(State { mode, enabled, current: None, missing: 0, focus: None, disk_paused: false, applied: None, applied_pid: None, moved: None, kept: None, capture_started: None, hook_checked: None, needs_admin: None, parked: None, fallback: None, retry: None, screen }),
             apply_lock: Mutex::new(()),
             wake: (Mutex::new(false), Condvar::new()),
@@ -232,10 +240,17 @@ impl Detector {
     }
 
     pub fn rescan(&self) {
-        let catalog = Catalog::scan();
+        let (catalog, reports) = games::scan();
+        {
+            let mut before = self.store_reports.lock().unwrap();
+            for report in stores::changed(&before, &reports) {
+                log!("games: {report}");
+            }
+            *before = reports;
+        }
         let mut current = self.catalog.write().unwrap();
-        if catalog.installed().len() != current.installed().len() {
-            log!("games: {} installed games found {}", catalog.installed().len(), catalog.counts());
+        if catalog.store_games().len() != current.store_games().len() {
+            log!("games: {} installed games found {}", catalog.store_games().len(), catalog.counts());
         }
         *current = catalog;
     }
@@ -302,6 +317,13 @@ impl Detector {
             self.apply();
             let _ = self.app.emit("game-state", self.snapshot());
         }
+    }
+
+    /// The name of the current game when it runs as administrator and Laurel does
+    /// not, so that it is not recorded.
+    pub fn needs_admin_game(&self) -> Option<String> {
+        let s = self.state.lock().unwrap();
+        s.current.as_ref().filter(|g| s.needs_admin.as_deref() == Some(g.id.key.as_str())).map(|g| g.id.name.clone())
     }
 
     /// Whether the replay buffer should be running.
@@ -374,7 +396,7 @@ impl Detector {
                 continue;
             }
             let Some(path) = paths.entry(pid).or_insert_with(|| win::process_path(pid)).clone() else { continue };
-            let Verdict::Game(id) = catalog.classify_window(&path, &class, &title, || win::process_command_line(pid), &settings) else { continue };
+            let Verdict::Game(id) = catalog.classify_window(&path, &class, &title, || win::process_command_line(pid), &settings.user_games()) else { continue };
             let active = Active { id, path, pid, hwnd, title, class };
             match found.iter_mut().find(|a| a.id.key == active.id.key) {
                 Some(existing) if hwnd == foreground => *existing = active,
@@ -814,7 +836,7 @@ pub fn running_programs(detector: &Detector) -> Vec<Value> {
             continue;
         }
         let Some(path) = win::process_path(w.pid) else { continue };
-        if !seen.insert(path.to_lowercase()) || catalog.classify_window(&path, &w.class, &w.title, || win::process_command_line(w.pid), &settings) != Verdict::NotGame {
+        if !seen.insert(path.to_lowercase()) || catalog.classify_window(&path, &w.class, &w.title, || win::process_command_line(w.pid), &settings.user_games()) != Verdict::NotGame {
             continue;
         }
         let lower = path.to_lowercase();

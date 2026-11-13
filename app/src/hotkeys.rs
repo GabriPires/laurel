@@ -4,24 +4,21 @@
 //! the key) and without sitting in the input path, as a low-level hook would, so
 //! it adds no input latency and also works with games in exclusive fullscreen.
 //!
-//! A hotkey is modifiers plus one key or mouse button, stored as text such as
-//! "Shift+F8", "Ctrl+Alt+K", "Mouse4" or "Ctrl+Oem_BA" (punctuation keys by their
-//! virtual-key code, shown with the character of the current keyboard layout).
-//! While the user records a new hotkey, the hotkeys are suspended.
+//! A hotkey's rules and text form live in laurel_app_core::hotkeys; this module
+//! reads the keyboard and the mouse and shows the hotkeys in the current keyboard
+//! layout and language. While the user records a new hotkey, the hotkeys are
+//! suspended.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+pub use laurel_app_core::hotkeys::{Combo, Key, Refused, Replaced, Replacement, ALT, CTRL, SHIFT, WIN};
+
 use crate::i18n::{t, t_later};
 use crate::log::log;
 use crate::win;
-
-pub const CTRL: u8 = 1;
-pub const SHIFT: u8 = 2;
-pub const ALT: u8 = 4;
-pub const WIN: u8 = 8;
 
 /// How long recording a new hotkey waits for keys.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -29,28 +26,6 @@ const CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
 /// held: its key-up may have gone to another desktop (Ctrl+Alt+Del) or an elevated
 /// window, which Raw Input does not report.
 const STALE_MODIFIER: Duration = Duration::from_secs(1);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Key {
-    /// A Windows virtual-key code (numpad keys keep their numpad codes).
-    Vk(u16),
-    /// Mouse button 1 to 5 (left, right, middle, back, forward).
-    Mouse(u8),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Combo {
-    pub mods: u8,
-    pub key: Key,
-}
-
-const NAMED: &[(u16, &str)] = &[
-    (0x08, "Backspace"), (0x09, "Tab"), (0x0D, "Enter"), (0x13, "Pause"), (0x14, "CapsLock"), (0x1B, "Esc"),
-    (0x20, "Space"), (0x21, "PageUp"), (0x22, "PageDown"), (0x23, "End"), (0x24, "Home"), (0x25, "Left"),
-    (0x26, "Up"), (0x27, "Right"), (0x28, "Down"), (0x2C, "PrintScreen"), (0x2D, "Insert"), (0x2E, "Delete"),
-    (0x5D, "Menu"), (0x6A, "NumpadMultiply"), (0x6B, "NumpadAdd"), (0x6D, "NumpadSubtract"), (0x6E, "NumpadDecimal"),
-    (0x6F, "NumpadDivide"), (0x90, "NumLock"), (0x91, "ScrollLock"), (0x0E, "NumpadEnter"),
-];
 
 const VK_SHIFT: u16 = 0x10;
 const VK_CONTROL: u16 = 0x11;
@@ -83,96 +58,28 @@ fn modifier_vk(bit: u8) -> u16 {
     }
 }
 
-fn vk_name(vk: u16) -> Option<String> {
-    match vk {
-        0x30..=0x39 | 0x41..=0x5A => Some((vk as u8 as char).to_string()),
-        0x60..=0x69 => Some(format!("Numpad{}", vk - 0x60)),
-        0x70..=0x87 => Some(format!("F{}", vk - 0x6F)),
-        _ => NAMED.iter().find(|(v, _)| *v == vk).map(|(_, n)| n.to_string()).or_else(|| (0xBA..=0xE2).contains(&vk).then(|| format!("Oem_{vk:02X}"))),
-    }
+/// The text shown to the user: punctuation keys with the character of the current
+/// keyboard layout.
+pub fn label(c: &Combo) -> String {
+    c.label(win::key_char)
 }
 
-fn vk_from_name(name: &str) -> Option<u16> {
-    let upper = name.to_ascii_uppercase();
-    if upper.len() == 1 {
-        let c = upper.as_bytes()[0];
-        return (c.is_ascii_digit() || c.is_ascii_uppercase()).then_some(c as u16);
-    }
-    if let Some(n) = upper.strip_prefix("NUMPAD").and_then(|d| d.parse::<u16>().ok()).filter(|n| *n <= 9) {
-        return Some(0x60 + n);
-    }
-    if let Some(n) = upper.strip_prefix('F').and_then(|d| d.parse::<u16>().ok()).filter(|n| (1..=24).contains(n)) {
-        return Some(0x6F + n);
-    }
-    if let Some(hex) = upper.strip_prefix("OEM_") {
-        return u16::from_str_radix(hex, 16).ok().filter(|v| (0xBA..=0xE2).contains(v));
-    }
-    NAMED.iter().find(|(_, n)| n.eq_ignore_ascii_case(name)).map(|(v, _)| *v)
-}
-
-impl Combo {
-    pub fn parse(text: &str) -> Option<Combo> {
-        let mut mods = 0;
-        let mut key = None;
-        for part in text.split('+').map(str::trim) {
-            match part.to_ascii_lowercase().as_str() {
-                "ctrl" => mods |= CTRL,
-                "shift" => mods |= SHIFT,
-                "alt" => mods |= ALT,
-                "win" => mods |= WIN,
-                p if p.starts_with("mouse") => key = Some(Key::Mouse(p[5..].parse().ok().filter(|n| (1..=5).contains(n))?)),
-                _ => key = Some(Key::Vk(vk_from_name(part)?)),
-            }
-        }
-        key.map(|key| Combo { mods, key })
-    }
-
-    fn mod_prefix(&self) -> String {
-        let mut s = String::new();
-        for (bit, name) in [(CTRL, "Ctrl+"), (SHIFT, "Shift+"), (ALT, "Alt+"), (WIN, "Win+")] {
-            if self.mods & bit != 0 {
-                s.push_str(name);
-            }
-        }
-        s
-    }
-
-    /// The stored text, for settings.json.
-    pub fn name(&self) -> String {
-        let key = match self.key {
-            Key::Vk(vk) => vk_name(vk).unwrap_or_else(|| format!("Oem_{vk:02X}")),
-            Key::Mouse(n) => format!("Mouse{n}"),
-        };
-        format!("{}{key}", self.mod_prefix())
-    }
-
-    /// The text shown to the user: punctuation keys with the character of the
-    /// current keyboard layout, mouse buttons spaced.
-    pub fn label(&self) -> String {
-        let key = match self.key {
-            Key::Vk(vk @ 0xBA..=0xE2) => win::key_char(vk).map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| format!("Key {vk:02X}")),
-            Key::Mouse(n) => format!("Mouse {n}"),
-            Key::Vk(_) => self.name().rsplit('+').next().unwrap_or_default().to_string(),
-        };
-        format!("{}{key}", self.mod_prefix())
-    }
-}
-
-/// Why a combination cannot be a hotkey (spec clip.hotkeys), if it cannot, in
-/// English (translated where it is shown).
-pub fn reject_reason(c: &Combo) -> Option<&'static str> {
-    let typing = |vk: u16| matches!(vk, 0x08 | 0x09 | 0x0D | 0x20 | 0x25..=0x28 | 0x30..=0x39 | 0x41..=0x5A | 0xBA..=0xE2);
-    match c.key {
-        Key::Mouse(1 | 2) => Some(t_later!("The left and right mouse buttons are needed in games")),
-        _ if c.mods & WIN != 0 => Some(t_later!("Shortcuts with the Windows key belong to Windows")),
-        Key::Vk(VK_ESCAPE) => Some(t_later!("Esc is used to cancel; choose another key")),
-        Key::Vk(0x73) if c.mods == ALT => Some(t_later!("Alt+F4 closes the game")),
-        Key::Vk(0x09 | 0x20) if c.mods == ALT => Some(t_later!("Windows uses this shortcut")),
-        Key::Vk(0x0D) if c.mods == ALT => Some(t_later!("Alt+Enter switches fullscreen in many games")),
-        Key::Vk(vk) if typing(vk) && c.mods & (CTRL | ALT) == 0 => {
-            Some(t_later!("Letters, digits, arrows and typing keys need Ctrl or Alt, or they would fire while you play or chat"))
-        }
-        _ => None,
+/// Why a combination cannot be a hotkey, in English (translated where it is shown).
+pub fn refusal_text(r: Refused) -> &'static str {
+    match r {
+        Refused::MouseButton => t_later!("The left and right mouse buttons are needed in games"),
+        Refused::WindowsKey => t_later!("Shortcuts with the Windows key belong to Windows"),
+        Refused::Escape => t_later!("Esc is used to cancel; choose another key"),
+        Refused::AltF4 => t_later!("Alt+F4 closes the game"),
+        Refused::WindowsShortcut => t_later!("Windows uses this shortcut"),
+        Refused::AltEnter => t_later!("Alt+Enter switches fullscreen in many games"),
+        Refused::TypingKey => t_later!("Letters, digits, arrows and typing keys need Ctrl or Alt, or they would fire while you play or chat"),
+        Refused::LockKey => t_later!("Lock keys change how you type"),
+        Refused::Tab => t_later!("Tab is used in games and to move between fields"),
+        Refused::SystemKey => t_later!("Media, volume and other special keys belong to Windows"),
+        Refused::MenuKey => t_later!("The menu key opens menus in games and programs"),
+        Refused::EditingShortcut => t_later!("Ctrl+C, Ctrl+V and the other editing shortcuts are used by every program"),
+        Refused::NoName => t_later!("Laurel can't keep this key as a shortcut"),
     }
 }
 
@@ -385,7 +292,7 @@ fn on_raw_input(input: win::RawInput) {
             return;
         }
         let taken = shared.bindings.lock().unwrap().iter().find(|(a, c)| *a != action && *c == combo).map(|(a, _)| *a);
-        let reason = reject_reason(&combo).map(crate::i18n::tr).or_else(|| taken.map(|a| t!("Already used for {action}", action = action_label(a))));
+        let reason = laurel_app_core::hotkeys::refusal(&combo).map(|r| crate::i18n::tr(refusal_text(r))).or_else(|| taken.map(|a| t!("Already used for {action}", action = action_label(a))));
         match reason {
             Some(reason) => (shared.handler)(Event::Rejected(action, combo, reason)),
             None => {
@@ -400,6 +307,23 @@ fn on_raw_input(input: win::RawInput) {
         shared.presses.fetch_add(1, Ordering::SeqCst);
         log!("hotkeys: {} pressed for {action}, {}", combo.name(), input_source(device));
         (shared.handler)(Event::Pressed(action));
+    }
+}
+
+/// What became of a stored hotkey that is refused since an update (idea 14), for
+/// the notice at the first start and the note on the Shortcuts page.
+pub fn replaced_text(r: &Replaced) -> String {
+    let (old, action) = (label(&r.old), action_label(r.action));
+    match r.now {
+        Replacement::Default(new) => t!("{old} can't be a shortcut anymore. {action} now uses {new}; you can change it in Settings, Shortcuts.", old = old, action = action, new = label(&new)),
+        Replacement::DefaultTaken { default, by } => t!(
+            "{old} can't be a shortcut anymore, and {default} is already used for {other}, so {action} has no shortcut now. Set one in Settings, Shortcuts.",
+            old = old,
+            default = label(&default),
+            other = action_label(by),
+            action = action
+        ),
+        Replacement::NoDefault => t!("{old} can't be a shortcut anymore, so {action} has no shortcut now. Set one in Settings, Shortcuts.", old = old, action = action),
     }
 }
 

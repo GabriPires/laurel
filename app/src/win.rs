@@ -26,6 +26,14 @@ pub struct Rect {
     pub bottom: i32,
 }
 
+/// POINT.
+#[repr(C)]
+#[derive(Default)]
+struct Point {
+    x: i32,
+    y: i32,
+}
+
 #[repr(C)]
 #[derive(Default)]
 struct MonitorInfo {
@@ -174,6 +182,8 @@ extern "system" {
     fn GetDpiForSystem() -> u32;
     fn GetForegroundWindow() -> isize;
     fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
+    fn GetClientRect(hwnd: isize, rect: *mut Rect) -> i32;
+    fn ClientToScreen(hwnd: isize, point: *mut Point) -> i32;
     fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
     /// Takes a MonitorInfo or a MonitorInfoEx, told apart by its size field.
     fn GetMonitorInfoW(monitor: isize, info: *mut c_void) -> i32;
@@ -498,6 +508,32 @@ pub fn foreground_anchor() -> (Rect, f64) {
         let (mut dpi_x, mut dpi_y) = (96, 96);
         GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
         (anchor, dpi_x as f64 / 96.0)
+    }
+}
+
+/// The window in focus, for a refused clip's notice (A32): its program, its client
+/// area (without frame and title bar) and its monitor, in screen pixels; None
+/// when there is none or its program cannot be read.
+pub fn foreground_window_info() -> Option<(String, Rect, Rect)> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd == 0 {
+            return None;
+        }
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        let path = process_path(pid)?;
+        let mut client = Rect::default();
+        let mut origin = Point::default();
+        if GetClientRect(hwnd, &mut client) == 0 || ClientToScreen(hwnd, &mut origin) == 0 {
+            return None;
+        }
+        let client = Rect { left: origin.x, top: origin.y, right: origin.x + client.right, bottom: origin.y + client.bottom };
+        let mut info = MonitorInfo { size: std::mem::size_of::<MonitorInfo>() as u32, ..Default::default() };
+        if GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), (&mut info as *mut MonitorInfo).cast()) == 0 {
+            return None;
+        }
+        Some((path, client, info.monitor))
     }
 }
 

@@ -1,313 +1,118 @@
-//! Which programs are games (spec game.detection, decision of 2026-10-23): the games
-//! installed through the Steam, Epic, Riot and Xbox libraries, found from their
-//! install folders; the curated list in `app/games.json` (games from other
-//! launchers, store entries that are not games, helper and client executables); and
-//! the user's own choices (game.manual-add), which always win.
-//!
-//! A game is identified by its store and its ID there (`steam:1808500`,
-//! `riot:valorant`), by `exe:<file name>` for the curated list, by the curated key
-//! of a game found by its window (`minecraft:java`), and by `user:<path>` for games
-//! the user added.
+//! Reads the store libraries from the PC (spec game.detection): where each store
+//! keeps its files, from the registry and the usual folders, and their text. Which
+//! programs are games, and what those files say, is decided in
+//! laurel_app_core::games and laurel_app_core::stores.
 
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Value};
+pub use laurel_app_core::games::{Catalog, GameId, Verdict};
+use laurel_app_core::games::Curated;
+use laurel_app_core::stores::{self, Listing, Report, Store, StoreFile};
 
-use crate::settings::Settings;
 use crate::win;
 
-const CURATED: &str = include_str!("../games.json");
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct GameId {
-    pub key: String,
-    pub name: String,
-    /// steam, epic, riot, xbox, list (curated) or user.
-    pub source: &'static str,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum Verdict {
-    Game(GameId),
-    /// A game the user chose not to record.
-    Ignored(GameId),
-    NotGame,
-}
-
-/// A game found in a store library.
-#[derive(Clone, Debug)]
-pub struct Installed {
-    pub id: GameId,
-    pub dir: PathBuf,
-    /// Lowercase, backslashes, ending with a backslash, for prefix matching.
-    prefix: String,
-}
-
-/// A game that runs in a shared program from any folder, such as Minecraft (Java)
-/// in the javaw.exe of whichever Java runtime its launcher brought (app/games.json,
-/// windowGames).
-struct WindowGame {
-    id: GameId,
-    /// Lowercase program file names.
-    exes: Vec<String>,
-    /// Window classes, compared without case.
-    classes: Vec<String>,
-    /// Lowercase parts of the command line, any one of which marks the game.
-    command_line: Vec<String>,
-    /// Lowercase title prefixes, used when the command line cannot be read.
-    titles: Vec<String>,
-}
-
-struct Curated {
-    window_games: Vec<WindowGame>,
-    not_games: Vec<String>,
-    blocked_exes: Vec<String>,
-    blocked_patterns: Vec<String>,
-    /// (lowercase file name, name)
-    games: Vec<(String, String)>,
-}
-
-impl Curated {
-    fn load() -> Curated {
-        let v: Value = serde_json::from_str(CURATED).expect("app/games.json is valid JSON");
-        let strings = |key: &str| -> Vec<String> { v[key].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_lowercase).collect() };
-        let games = v["games"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|g| Some((g["exe"].as_str()?.to_lowercase(), g["name"].as_str()?.to_string())))
-            .collect();
-        let list = |g: &Value, key: &str| -> Vec<String> { g[key].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_lowercase).collect() };
-        let window_games = v["windowGames"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|g| {
-                let id = GameId { key: g["key"].as_str()?.to_string(), name: g["name"].as_str()?.to_string(), source: "list" };
-                Some(WindowGame { id, exes: list(g, "exes"), classes: list(g, "classes"), command_line: list(g, "commandLine"), titles: list(g, "titles") })
-            })
-            .collect();
-        Curated { window_games, not_games: strings("notGames"), blocked_exes: strings("blockedExes"), blocked_patterns: strings("blockedPatterns"), games }
+/// Reads the store libraries (a few small files each), with what the scan of each
+/// store saw, for the log (A32).
+pub fn scan() -> (Catalog, Vec<Report>) {
+    let curated = Curated::shipped();
+    let mut installed = Vec::new();
+    let mut reports = Vec::new();
+    for listing in [steam_files(), epic_files(), riot_files(), xbox_files()] {
+        let (games, report) = stores::read(&listing, &curated, |dir| Path::new(dir).is_dir());
+        installed.extend(games);
+        reports.push(report);
     }
-
-    fn blocks(&self, file: &str) -> bool {
-        self.blocked_exes.iter().any(|b| b == file) || self.blocked_patterns.iter().any(|p| file.contains(p.as_str()))
-    }
+    (Catalog::new(curated, installed), reports)
 }
 
-pub struct Catalog {
-    installed: Vec<Installed>,
-    curated: Curated,
+fn listing(store: Store) -> Listing {
+    Listing { store, files: Vec::new(), notes: Vec::new() }
 }
 
-/// `C:/Riot Games/VALORANT/live` and `C:\Games\` both become `c:\riot games\valorant\live\`.
-fn normalize_dir(dir: &Path) -> String {
-    let mut s = dir.to_string_lossy().replace('/', "\\").to_lowercase();
-    if !s.ends_with('\\') {
-        s.push('\\');
-    }
-    s
+/// The entries of a store's folder; one that cannot be listed gets a note in the
+/// scan's line: `<what> (<folder>: <error>)`.
+fn list(dir: &Path, what: &str, listing: &mut Listing) -> Option<std::fs::ReadDir> {
+    std::fs::read_dir(dir).map_err(|e| listing.notes.push(format!("{what} ({}: {e})", dir.display()))).ok()
 }
 
-fn file_name_lower(path: &str) -> String {
-    path.rsplit(['\\', '/']).next().unwrap_or(path).to_lowercase()
+fn file(path: &Path) -> StoreFile {
+    StoreFile { path: path.to_string_lossy().into_owned(), text: std::fs::read_to_string(path).map_err(|e| e.to_string()) }
 }
 
-impl Catalog {
-    /// Reads the store libraries (a few small files each).
-    pub fn scan() -> Catalog {
-        let curated = Curated::load();
-        let mut installed = Vec::new();
-        for (store, found) in [("steam", steam_games()), ("epic", epic_games()), ("riot", riot_games()), ("xbox", xbox_games())] {
-            for (id, name, dir) in found {
-                let key = format!("{store}:{id}");
-                if curated.not_games.contains(&key.to_lowercase()) || !dir.is_dir() {
-                    continue;
-                }
-                let prefix = normalize_dir(&dir);
-                installed.push(Installed { id: GameId { key, name, source: store }, dir, prefix });
-            }
-        }
-        // Longest folder first, so a game inside another game's folder wins.
-        installed.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
-        Catalog { installed, curated }
-    }
-
-    pub fn installed(&self) -> &[Installed] {
-        &self.installed
-    }
-
-    /// Games found per store, for the UI and the log.
-    pub fn counts(&self) -> Value {
-        let mut counts = serde_json::Map::new();
-        for g in &self.installed {
-            let n = counts.get(g.id.source).and_then(Value::as_u64).unwrap_or(0);
-            counts.insert(g.id.source.to_string(), json!(n + 1));
-        }
-        Value::Object(counts)
-    }
-
-    /// Decides whether the program at `exe_path` is a game. The user's added games
-    /// come first, then the store libraries, then the curated list; the user's
-    /// ignored games and the blocklist exclude the rest.
-    pub fn classify(&self, exe_path: &str, settings: &Settings) -> Verdict {
-        let lower = exe_path.replace('/', "\\").to_lowercase();
-        if let Some(custom) = settings.custom_games.iter().find(|g| g.path.to_lowercase() == lower) {
-            return Verdict::Game(GameId { key: format!("user:{lower}"), name: custom.name.clone(), source: "user" });
-        }
-        let file = file_name_lower(&lower);
-        let found = self
-            .installed
-            .iter()
-            .find(|g| lower.starts_with(&g.prefix))
-            .map(|g| g.id.clone())
-            .or_else(|| self.curated.games.iter().find(|(exe, _)| *exe == file).map(|(exe, name)| GameId { key: format!("exe:{exe}"), name: name.clone(), source: "list" }));
-        match found {
-            None => Verdict::NotGame,
-            Some(_) if self.curated.blocks(&file) => Verdict::NotGame,
-            Some(id) if settings.ignored_games.iter().any(|g| g.key == id.key) => Verdict::Ignored(id),
-            Some(id) => Verdict::Game(id),
-        }
-    }
-
-    /// Decides whether a window is a game's: by its program as `classify` does, and
-    /// for the games of `windowGames`, by the program's file name, the window class
-    /// and the command line (read only for those candidates), or the title when the
-    /// command line cannot be read. Minecraft (Java) runs in the javaw.exe of the
-    /// Java runtime its launcher brought, a different one for each launcher and
-    /// often for each modpack, so its path says nothing.
-    pub fn classify_window(&self, exe_path: &str, class: &str, title: &str, command_line: impl FnOnce() -> Option<String>, settings: &Settings) -> Verdict {
-        let verdict = self.classify(exe_path, settings);
-        if verdict != Verdict::NotGame {
-            return verdict;
-        }
-        let file = file_name_lower(exe_path);
-        let class = class.to_lowercase();
-        let Some(game) = self.curated.window_games.iter().find(|g| g.exes.contains(&file) && g.classes.contains(&class)) else {
-            return Verdict::NotGame;
-        };
-        let matches = match command_line() {
-            Some(line) => {
-                let line = line.to_lowercase();
-                game.command_line.iter().any(|m| line.contains(m.as_str()))
-            }
-            None => {
-                let title = title.trim().to_lowercase();
-                game.titles.iter().any(|t| title.starts_with(t.as_str()))
-            }
-        };
-        match matches {
-            false => Verdict::NotGame,
-            true if settings.ignored_games.iter().any(|g| g.key == game.id.key) => Verdict::Ignored(game.id.clone()),
-            true => Verdict::Game(game.id.clone()),
-        }
-    }
-}
-
-/// Values of `"key" "value"` pairs in a Valve KeyValues text file, unescaped.
-fn vdf_values(text: &str, key: &str) -> Vec<String> {
-    let quoted = format!("\"{key}\"");
-    text.lines()
-        .filter_map(|line| {
-            let rest = line.trim().strip_prefix(&quoted)?.trim();
-            let value = rest.strip_prefix('"')?.strip_suffix('"')?;
-            Some(value.replace("\\\\", "\\"))
-        })
-        .collect()
-}
-
-fn steam_games() -> Vec<(String, String, PathBuf)> {
+fn steam_files() -> Listing {
+    let mut listing = listing(Store::Steam);
     let Some(steam) = win::reg_string(win::HKEY_CURRENT_USER, r"Software\Valve\Steam", "SteamPath")
         .or_else(|| win::reg_string(win::HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath"))
     else {
-        return vec![];
+        listing.notes.push("no Steam folder in the registry".into());
+        return listing;
     };
     let steam = PathBuf::from(steam.replace('/', "\\"));
-    let mut libraries = std::fs::read_to_string(steam.join(r"steamapps\libraryfolders.vdf")).map(|t| vdf_values(&t, "path")).unwrap_or_default();
+    let folders = steam.join(r"steamapps\libraryfolders.vdf");
+    let mut libraries = match std::fs::read_to_string(&folders) {
+        Ok(text) => stores::steam_libraries(&text),
+        Err(e) => {
+            listing.notes.push(format!("no library list ({}: {e})", folders.display()));
+            Vec::new()
+        }
+    };
     if libraries.is_empty() {
         libraries.push(steam.to_string_lossy().into_owned());
     }
-    let mut games = Vec::new();
     for library in libraries {
         let apps = Path::new(&library).join("steamapps");
-        let Ok(entries) = std::fs::read_dir(&apps) else { continue };
+        let Some(entries) = list(&apps, "a library cannot be listed", &mut listing) else { continue };
         for entry in entries.flatten() {
-            let file = entry.file_name().to_string_lossy().into_owned();
-            if !(file.starts_with("appmanifest_") && file.ends_with(".acf")) {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
-            let first = |key: &str| vdf_values(&text, key).into_iter().next();
-            if let (Some(id), Some(name), Some(dir)) = (first("appid"), first("name"), first("installdir")) {
-                games.push((id, name, apps.join("common").join(dir)));
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("appmanifest_") && name.ends_with(".acf") {
+                listing.files.push(file(&entry.path()));
             }
         }
     }
-    games
+    listing
 }
 
 fn program_data() -> PathBuf {
     PathBuf::from(std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into()))
 }
 
-fn epic_games() -> Vec<(String, String, PathBuf)> {
-    let dir = program_data().join(r"Epic\EpicGamesLauncher\Data\Manifests");
-    let Ok(entries) = std::fs::read_dir(dir) else { return vec![] };
-    entries
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "item"))
-        .filter_map(|e| serde_json::from_str::<Value>(&std::fs::read_to_string(e.path()).ok()?).ok())
-        .filter(|m| m["AppCategories"].as_array().is_some_and(|c| c.iter().any(|v| v == "games")))
-        .filter_map(|m| Some((m["AppName"].as_str()?.to_string(), m["DisplayName"].as_str()?.to_string(), PathBuf::from(m["InstallLocation"].as_str()?))))
-        .collect()
+fn epic_files() -> Listing {
+    let mut listing = listing(Store::Epic);
+    let manifests = program_data().join(r"Epic\EpicGamesLauncher\Data\Manifests");
+    let Some(entries) = list(&manifests, "no manifest folder", &mut listing) else { return listing };
+    for entry in entries.flatten() {
+        if entry.path().extension().is_some_and(|x| x == "item") {
+            listing.files.push(file(&entry.path()));
+        }
+    }
+    listing
 }
 
-/// Riot products: `<ProgramData>\Riot Games\Metadata\<product>.<patchline>\*.product_settings.yaml`.
-fn riot_games() -> Vec<(String, String, PathBuf)> {
-    let Ok(entries) = std::fs::read_dir(program_data().join(r"Riot Games\Metadata")) else { return vec![] };
-    let mut games = Vec::new();
+/// Riot products: `<ProgramData>\Riot Games\Metadata\<product>.<patchline>\<product>.<patchline>.product_settings.yaml`.
+fn riot_files() -> Listing {
+    let mut listing = listing(Store::Riot);
+    let metadata = program_data().join(r"Riot Games\Metadata");
+    let Some(entries) = list(&metadata, "no Metadata folder", &mut listing) else { return listing };
     for entry in entries.flatten() {
         let folder = entry.file_name().to_string_lossy().into_owned();
-        let Some((product, patchline)) = folder.split_once('.') else { continue };
-        let settings = entry.path().join(format!("{folder}.product_settings.yaml"));
-        let Ok(text) = std::fs::read_to_string(settings) else { continue };
-        let Some(dir) = text.lines().find_map(|l| l.trim().strip_prefix("product_install_full_path:")) else { continue };
-        let dir = dir.trim().trim_matches('"');
-        let name = match product {
-            "league_of_legends" => "League of Legends".to_string(),
-            "valorant" => "VALORANT".to_string(),
-            "bacon" => "Legends of Runeterra".to_string(),
-            "teamfighttactics" => "Teamfight Tactics".to_string(),
-            other => other.replace('_', " "),
-        };
-        let id = if patchline == "live" { product.to_string() } else { folder.clone() };
-        games.push((id, name, PathBuf::from(dir)));
+        listing.files.push(file(&entry.path().join(format!("{folder}.product_settings.yaml"))));
     }
-    games
-}
-
-/// The value of `attr="..."` after `element` in a MicrosoftGame.config.
-fn xml_attr(text: &str, element: &str, attr: &str) -> Option<String> {
-    let start = text.find(element)?;
-    let rest = &text[start..];
-    let at = rest.find(&format!("{attr}=\""))? + attr.len() + 2;
-    Some(rest[at..].split('"').next()?.to_string())
+    listing
 }
 
 /// Microsoft Store (GDK) games in `<drive>:\XboxGames\<game>\Content`.
-fn xbox_games() -> Vec<(String, String, PathBuf)> {
-    let mut games = Vec::new();
+fn xbox_files() -> Listing {
+    let mut listing = listing(Store::Xbox);
+    let mut folders = 0;
     for drive in 'C'..='Z' {
         let Ok(entries) = std::fs::read_dir(format!(r"{drive}:\XboxGames")) else { continue };
+        folders += 1;
         for entry in entries.flatten() {
-            let content = entry.path().join("Content");
-            let Ok(text) = std::fs::read_to_string(content.join("MicrosoftGame.config")) else { continue };
-            let id = xml_attr(&text, "<Identity", "Name");
-            let name = xml_attr(&text, "<ShellVisuals", "DefaultDisplayName");
-            if let (Some(id), Some(name)) = (id, name) {
-                games.push((id, name, content));
-            }
+            listing.files.push(file(&entry.path().join(r"Content\MicrosoftGame.config")));
         }
     }
-    games
+    if folders == 0 {
+        listing.notes.push(r"no XboxGames folder on any drive".into());
+    }
+    listing
 }

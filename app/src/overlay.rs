@@ -156,6 +156,13 @@ impl Notifier {
         self.show(Kind::Error, title, detail, true);
     }
 
+    /// A notice shown over the foreground window even with notices over games
+    /// turned off, for what the player must see once, such as a hotkey that an
+    /// update changed (idea 14). Errors go through notify_critical.
+    pub fn notify_always(&self, kind: Kind, title: &str, detail: &str) {
+        self.show(kind, title, detail, true);
+    }
+
     fn show(&self, kind: Kind, title: &str, detail: &str, critical: bool) {
         let settings = self.settings();
         let sound = settings.sounds && settings.volume > 0 && (kind != Kind::AutoClip || settings.auto_clip_sound);
@@ -171,7 +178,8 @@ impl Notifier {
             return;
         }
         if critical {
-            log!("critical notice shown: {title}");
+            let what = if kind == Kind::Error { "critical notice" } else { "notice over the screen" };
+            log!("{what} shown: {title}");
         }
         let id = self.0.next_id.fetch_add(1, Ordering::SeqCst);
         let _ = self.0.app.emit_to("overlay", "notice", json!({ "id": id, "kind": kind.name(), "title": title, "detail": detail, "holdMs": kind.hold().as_millis() as u64 }));
