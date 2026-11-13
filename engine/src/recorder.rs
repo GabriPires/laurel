@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::hook_stop;
 use crate::obs::{
     clear_output_channel, cstr, ffi, list_source_property, opt_string, watch_audio_events, watch_shared_texture_failures, AudioEvent, Data, Encoder, Obs, Output,
     Scene, SharedSource, Source, WeakOutput, take_nvenc_texture_failure,
@@ -61,10 +62,10 @@ struct GameWatch {
     audio_bound: Mutex<Option<String>>,
 }
 
-/// Game capture sources by name ("capture", "game-try"), for the thread that moves
-/// one to shared-memory capture when OBS cannot open its shared texture: the game
-/// renders on another GPU than the engine (A13 of the stability tests). The hook
-/// then copies each frame through system memory (OBS's multi-adapter
+/// Game capture sources by name ("capture", "capture-2", "game-try"), for the thread
+/// that moves one to shared-memory capture when OBS cannot open its shared texture:
+/// the game renders on another GPU than the engine (A13 of the stability tests).
+/// The hook then copies each frame through system memory (OBS's multi-adapter
 /// compatibility); Direct3D 12 has no such path in OBS, and the app falls back to
 /// the game's window as before.
 #[derive(Default)]
@@ -565,8 +566,9 @@ pub struct Recorder {
     mix: AudioMix,
     desktop_audio: bool,
     capture: Option<Source>,
-    /// What `capture` records.
+    /// What `capture` records, and its source's name (see switch_capture).
     target: Capture,
+    capture_name: &'static str,
     /// While a game is recorded by its window (the fallback), a game capture of the
     /// same window tried on top of it, with that window's spec (see set_probe).
     probe: Option<(String, Source)>,
@@ -579,6 +581,8 @@ pub struct Recorder {
     /// Game captures that may move to shared memory (A13), and the thread doing it.
     textures: Arc<TextureWatch>,
     texture_thread: Option<JoinHandle<()>>,
+    /// Clears the stop signals the engine leaves in game hooks (A34).
+    hook_stop: hook_stop::Watch,
     /// The microphone's state for the app (A16), the way to give its thread orders
     /// (see Mic), and that thread.
     mic_state: Arc<Mutex<Value>>,
@@ -615,13 +619,17 @@ impl Recorder {
         let game = Arc::new(GameWatch::default());
         let textures = Arc::new(TextureWatch::default());
         let texture_thread = Some(spawn_texture_watch(textures.clone()));
-        let capture = create_capture(obs, &cfg.capture, cfg.cursor)?;
+        let capture = create_capture(obs, &cfg.capture, cfg.cursor, "capture")?;
         let watching_game = capture.as_ref().is_some_and(|c| connect_game_signals(c, &cfg.capture, &game));
         if let (Capture::Game(_), Some(source)) = (&cfg.capture, &capture) {
             textures.register("capture", source);
         }
         let mut scene = Scene::new("laurel-canvas", cfg.canvas)?;
         scene.set(capture.as_ref());
+        // Before the scene shows the capture, which starts its hook attempts; if the
+        // start fails, it is dropped before the scene and the capture, so that nothing
+        // is cleared at the end.
+        let hook_stop = hook_stop::Watch::start();
         scene.set_output_channel(VIDEO_CHANNEL);
         let (tx, saved_rx) = channel();
         let saved_tx = Box::into_raw(Box::new(tx));
@@ -636,6 +644,7 @@ impl Recorder {
                 desktop_audio: false,
                 capture,
                 target: cfg.capture.clone(),
+                capture_name: "capture",
                 probe: None,
                 scene,
                 game,
@@ -643,6 +652,7 @@ impl Recorder {
                 binder_thread: None,
                 textures,
                 texture_thread,
+                hook_stop,
                 mic_state: Arc::new(Mutex::new(json!({ "state": "off" }))),
                 mic_tx: None,
                 mic_thread: None,
@@ -722,6 +732,7 @@ impl Recorder {
             desktop_audio: cfg.desktop_audio,
             capture,
             target: cfg.capture.clone(),
+            capture_name: "capture",
             probe: None,
             scene,
             game,
@@ -729,6 +740,7 @@ impl Recorder {
             binder_thread,
             textures,
             texture_thread,
+            hook_stop,
             mic_state,
             mic_tx,
             mic_thread,
@@ -936,19 +948,27 @@ impl Recorder {
         if self.promote_probe(capture) {
             return Ok(());
         }
-        let next = create_capture(obs, capture, self.cursor)?;
+        // A game capture that replaces another one gets another name: OBS names the
+        // source in each line, and the old one's last lines can come after the new
+        // one's first (A34: hook_stop.rs counts each line for the process of that name).
+        let name = match (&self.target, capture) {
+            (Capture::Game(_), Capture::Game(_)) if self.capture_name == "capture" => "capture-2",
+            _ => "capture",
+        };
+        let next = create_capture(obs, capture, self.cursor, name)?;
         self.drop_probe();
         self.unwatch_game();
         self.textures.clear();
         if let Some(source) = &next {
             self.watching_game = connect_game_signals(source, capture, &self.game);
             if matches!(capture, Capture::Game(_)) {
-                self.textures.register("capture", source);
+                self.textures.register(name, source);
             }
         }
         self.scene.set(next.as_ref());
         self.capture = next; // drops our reference to the previous source
         self.target = capture.clone();
+        self.capture_name = name;
         if let Some(audio) = &self.game_audio {
             if let Some(spec) = named_window(capture) {
                 audio.update(&follow_settings(spec));
@@ -1011,6 +1031,7 @@ impl Recorder {
         self.capture = Some(probe); // drops the window capture
         self.watching_game = true; // set_probe connected its signals
         self.target = capture.clone();
+        self.capture_name = "game-try";
         log!("[laurel] the game capture took over from the window capture");
         true
     }
@@ -1141,6 +1162,9 @@ impl Recorder {
 
 impl Drop for Recorder {
     fn drop(&mut self) {
+        // The engine's orderly end clears no stop signal (the owner's decision of
+        // 2026-11-11 leaves that open): the sources below stop without the watch.
+        self.hook_stop.stop();
         self.drop_probe();
         self.unwatch_game();
         // Closing the channel ends the binder, which releases its source reference.
@@ -1276,7 +1300,8 @@ pub fn format_stats(obs: &Obs, rec: &Recorder) -> String {
     )
 }
 
-fn create_capture(obs: &Obs, capture: &Capture, cursor: bool) -> Result<Option<Source>, String> {
+/// The capture source for `capture`, named `name`.
+fn create_capture(obs: &Obs, capture: &Capture, cursor: bool, name: &str) -> Result<Option<Source>, String> {
     let source = match capture {
         Capture::None => return Ok(None),
         Capture::Monitor { index, method } => {
@@ -1287,7 +1312,7 @@ fn create_capture(obs: &Obs, capture: &Capture, cursor: bool) -> Result<Option<S
             log!("[laurel] capturing monitor {index}: {label}");
             Source::new(
                 "monitor_capture",
-                "capture",
+                name,
                 &Data::new().str("monitor_id", id).int("method", *method).bool("capture_cursor", cursor),
             )?
         }
@@ -1301,17 +1326,17 @@ fn create_capture(obs: &Obs, capture: &Capture, cursor: bool) -> Result<Option<S
                 .cloned()
                 .ok_or_else(|| format!("monitor {id} not found ({} available)", monitors.len()))?;
             log!("[laurel] capturing monitor {label}");
-            Source::new("monitor_capture", "capture", &Data::new().str("monitor_id", &id).int("method", 0).bool("capture_cursor", cursor))?
+            Source::new("monitor_capture", name, &Data::new().str("monitor_id", &id).int("method", 0).bool("capture_cursor", cursor))?
         }
         // Windows Graphics Capture (method 2) also captures Direct3D windows, which
         // the BitBlt method shows black; the window is found by executable when its
         // title changes.
         Capture::Window(spec) => Source::new(
             "window_capture",
-            "capture",
+            name,
             &Data::new().str("window", spec).int("priority", MATCH_TITLE_THEN_EXE).bool("cursor", cursor).int("method", 2).bool("client_area", true),
         )?,
-        Capture::Game(window) => game_capture("capture", window.as_deref(), cursor)?,
+        Capture::Game(window) => game_capture(name, window.as_deref(), cursor)?,
     };
     Ok(Some(source))
 }

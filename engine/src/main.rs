@@ -63,6 +63,7 @@ macro_rules! log {
 mod crash;
 mod gpu;
 mod health;
+mod hook_stop;
 mod obs;
 mod recorder;
 mod rpc;

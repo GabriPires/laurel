@@ -4,6 +4,12 @@ O Laurel guarda os últimos segundos do jogo que você está jogando e salva um 
 
 Esta é uma versão de teste. Ela pode ter erros, e é exatamente isso que queremos achar com a sua ajuda.
 
+## O que mudou na 0.1.0-rc.15
+
+Esta versão corrige um problema que apareceu nos logs de vocês. Quando um jogo abre a janela e demora alguns segundos para começar a desenhar, como o Fortnite durante o carregamento, o Laurel podia ficar sem conseguir entrar no jogo pelo resto da sessão. Ele passava a gravar pela janela (o aviso **Gravando {jogo} pela janela**), que pesa mais, pode perder quadros e, no Windows 10, deixa a borda amarela em volta do jogo. Agora o Laurel entra no jogo assim que ele começa a desenhar. Ele também passou a anotar nos logs quando está esperando o jogo desenhar, para a gente ver se a correção funcionou no seu PC.
+
+- **Jogue normalmente, inclusive jogos que demoram para carregar, e mande os logs depois** (**Configurações > Avançado > Salvar logs para enviar**). Diga se o aviso **Gravando {jogo} pela janela** ou a borda amarela apareceram em algum jogo.
+
 ## O que mudou na 0.1.0-rc.14
 
 Esta versão ajuda a investigar um relato: o vídeo no player do Laurel em câmera lenta depois de mover a janela para um segundo monitor. Não conseguimos repetir o problema, então o Laurel passou a anotar nos logs, a cada trecho que toca no player, em qual monitor ele tocou, a taxa de atualização desse monitor e se o vídeo andou na velocidade certa. Isso não deixa o Laurel mais pesado.

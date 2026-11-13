@@ -32,11 +32,15 @@ pub fn watch_shared_texture_failures(tx: Option<Sender<String>>) {
     }
 }
 
-/// The source in a game capture line such as
+/// The source's name and OBS's message in a game capture line such as
 /// "[game-capture: 'capture'] init_shtex_capture: failed to open shared handle".
+fn game_capture_line(line: &str) -> Option<(&str, &str)> {
+    line.strip_prefix("[game-capture: '")?.split_once("'] ")
+}
+
+/// The source in a game capture line that says OBS cannot open the shared texture.
 fn shared_texture_failure(line: &str) -> Option<&str> {
-    let rest = line.strip_prefix("[game-capture: '")?;
-    let (name, message) = rest.split_once("'] ")?;
+    let (name, message) = game_capture_line(line)?;
     message.starts_with("init_shtex_capture: failed to open shared handle").then_some(name)
 }
 
@@ -163,6 +167,11 @@ unsafe extern "C" fn on_log(level: i32, msg: *const c_char, args: *mut c_void, _
         if let Some(tx) = SHARED_TEXTURE_FAILURES.lock().ok().as_ref().and_then(|slot| slot.as_ref()) {
             let _ = tx.send(name.to_string());
         }
+    }
+    // A34: right here, in the thread that stopped the game capture, so that the
+    // engine clears the hook's stop signal after OBS set it.
+    if let Some((name, message)) = game_capture_line(&line) {
+        crate::hook_stop::on_game_capture_line(name, message);
     }
 }
 
