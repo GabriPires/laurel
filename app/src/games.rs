@@ -5,16 +5,15 @@
 
 use std::path::{Path, PathBuf};
 
-pub use laurel_app_core::games::{Catalog, GameId, Verdict};
-use laurel_app_core::games::Curated;
-use laurel_app_core::stores::{self, Listing, Report, Store, StoreFile};
+pub use laurel_app_core::games::{Capture, Catalog, Curated, GameId, Verdict, SHIPPED};
+use laurel_app_core::stores::{self, Listing, ReadError, Report, Store, StoreFile};
 
 use crate::win;
 
 /// Reads the store libraries (a few small files each), with what the scan of each
-/// store saw, for the log (A32).
-pub fn scan() -> (Catalog, Vec<Report>) {
-    let curated = Curated::shipped();
+/// store saw, for the log (A32). `curated` is the shipped list, except in the
+/// self-test.
+pub fn scan(curated: Curated) -> (Catalog, Vec<Report>) {
     let mut installed = Vec::new();
     let mut reports = Vec::new();
     for listing in [steam_files(), epic_files(), riot_files(), xbox_files()] {
@@ -36,7 +35,11 @@ fn list(dir: &Path, what: &str, listing: &mut Listing) -> Option<std::fs::ReadDi
 }
 
 fn file(path: &Path) -> StoreFile {
-    StoreFile { path: path.to_string_lossy().into_owned(), text: std::fs::read_to_string(path).map_err(|e| e.to_string()) }
+    let text = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => ReadError::NotFound,
+        _ => ReadError::Failed(e.to_string()),
+    });
+    StoreFile { path: path.to_string_lossy().into_owned(), text }
 }
 
 fn steam_files() -> Listing {

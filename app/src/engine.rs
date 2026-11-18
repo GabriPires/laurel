@@ -14,6 +14,7 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use laurel_app_core::clip::{EngineRequests, RequestError};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 
@@ -33,11 +34,12 @@ const EXIT_LINE_WAIT: Duration = Duration::from_secs(2);
 /// killed.
 const QUIT_WAIT: Duration = Duration::from_secs(5);
 /// A26 of the stability tests: the least wait before starting a new engine after
-/// one that ended on its own (a crash, a kill, the health watch). An engine that
-/// ends without stopping its game capture leaves OBS's hook in the game capturing
-/// for it; the hook notices only when it next checks the capture's keepalive
-/// mutex, every 5 s, and a new engine creates a mutex of the same name, so one
-/// that starts before that check finds the hook busy and never gets the game.
+/// one that ended on its own (a crash, a kill, the health watch), or one a restart
+/// had to kill. An engine that ends without stopping its game capture leaves OBS's
+/// hook in the game capturing for it; the hook notices only when it next checks
+/// the capture's keepalive mutex, every 5 s, and a new engine creates a mutex of
+/// the same name, so one that starts before that check finds the hook busy and
+/// never gets the game.
 const HOOK_RELEASE_WAIT: Duration = Duration::from_secs(6);
 
 /// "exit code 0xC0000005 (STATUS_ACCESS_VIOLATION)": codes past 0xFFFF in hex, as
@@ -96,6 +98,12 @@ struct Inner {
     quitting: AtomicBool,
     /// Set by `restart`: the next exit is asked for, not a failure.
     restarting: AtomicBool,
+    /// Set by `restart_stuck` until the next engine starts, so that the clip
+    /// requests sent to the same stuck engine restart it once (A38).
+    restarting_stuck: AtomicBool,
+    /// Set when the running engine was killed: after a restart that had to kill
+    /// it, the next one waits HOOK_RELEASE_WAIT (A26). Cleared at each start.
+    killed: AtomicBool,
     /// Whether a supervisor thread runs (see `resume`).
     supervising: AtomicBool,
     /// Engines whose end engine.log has told, and a signal for each (A21).
@@ -124,6 +132,8 @@ impl Engine {
             microphone: Mutex::new(json!({ "state": "starting" })),
             quitting: AtomicBool::new(false),
             restarting: AtomicBool::new(false),
+            restarting_stuck: AtomicBool::new(false),
+            killed: AtomicBool::new(false),
             supervising: AtomicBool::new(false),
             exits_logged: (Mutex::new(0), Condvar::new()),
         }));
@@ -152,6 +162,12 @@ impl Engine {
 
     /// Sends a request and waits for its response.
     pub fn request(&self, method: &str, params: Value, timeout: Duration) -> Reply {
+        self.send(method, params, timeout).map_err(|e| error_text(method, e))
+    }
+
+    /// `request`, telling a request the engine did not answer in its time from
+    /// one that failed.
+    fn send(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, RequestError> {
         let id = self.0.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = channel();
         self.0.pending.lock().unwrap().insert(id, tx);
@@ -164,12 +180,15 @@ impl Engine {
         };
         if let Err(e) = sent {
             self.0.pending.lock().unwrap().remove(&id);
-            return Err(e);
+            return Err(RequestError::Failed(e));
         }
-        rx.recv_timeout(timeout).unwrap_or_else(|_| {
-            self.0.pending.lock().unwrap().remove(&id);
-            Err(format!("the engine did not answer {method} in time"))
-        })
+        match rx.recv_timeout(timeout) {
+            Ok(reply) => reply.map_err(RequestError::Failed),
+            Err(_) => {
+                self.0.pending.lock().unwrap().remove(&id);
+                Err(RequestError::Expired)
+            }
+        }
     }
 
     /// Asks the engine to quit and stops supervising it; kills it if it hangs.
@@ -213,6 +232,7 @@ impl Engine {
     /// Terminates the engine process; the supervisor restarts it unless quitting.
     pub fn kill(&self) {
         if let Some(child) = self.0.child.lock().unwrap().as_mut() {
+            self.0.killed.store(true, Ordering::SeqCst);
             let _ = child.kill();
         }
     }
@@ -234,6 +254,7 @@ impl Engine {
             if Instant::now() >= deadline {
                 log!("engine did not exit after shutdown; killing it");
                 if let Some(child) = self.0.child.lock().unwrap().as_mut().filter(|c| c.id() == pid) {
+                    self.0.killed.store(true, Ordering::SeqCst);
                     let _ = child.kill();
                 }
                 return;
@@ -263,6 +284,27 @@ impl Engine {
         }
     }
 
+    /// A38 of the stability tests: restarts an engine whose request thread is
+    /// stuck (a clip request expired and a ping got no answer either), in order
+    /// like `restart`; it cannot answer the shutdown request, so it is killed after
+    /// QUIT_WAIT twice. Once per stuck engine: until the next engine starts, the
+    /// clip requests that expire were sent to the same one. Why it was not
+    /// restarted by this call, if it was not.
+    pub fn restart_stuck(&self) -> Result<(), &'static str> {
+        if self.running_pid().is_none() {
+            return Err("no engine is running, and the supervisor starts one");
+        }
+        if self.0.restarting_stuck.swap(true, Ordering::SeqCst) {
+            return Err("it is already being restarted");
+        }
+        self.0.restarting.store(true, Ordering::SeqCst);
+        let engine = self.clone();
+        if std::thread::Builder::new().name("engine-restart".into()).spawn(move || engine.end_in_order()).is_err() {
+            self.kill();
+        }
+        Ok(())
+    }
+
     fn set_state(&self, state: Value) {
         log!("engine state: {state}");
         *self.0.state.lock().unwrap() = state.clone();
@@ -274,8 +316,15 @@ impl Engine {
         let _supervising = Supervising(&self.0.supervising);
         let mut quick_failures = 0;
         let mut restarted = false;
+        let mut wait = None;
         while !self.0.quitting.load(Ordering::SeqCst) {
             self.set_state(if restarted { json!({ "state": "starting", "restart": true }) } else { json!({ "state": "starting" }) });
+            if let Some(wait) = wait.take() {
+                std::thread::sleep(wait);
+                if self.0.quitting.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
             let started = Instant::now();
             let message = match self.run_once() {
                 Ok(status) => format!("the engine exited ({status})"),
@@ -285,8 +334,17 @@ impl Engine {
                 break;
             }
             restarted = self.0.restarting.swap(false, Ordering::SeqCst);
+            let killed = self.0.killed.swap(false, Ordering::SeqCst);
             if restarted {
-                log!("engine restarted to apply new settings");
+                if self.0.restarting_stuck.load(Ordering::SeqCst) {
+                    log!("engine restarted: it had stopped answering");
+                } else {
+                    log!("engine restarted to apply new settings");
+                }
+                if killed {
+                    log!("the engine was killed: the next one starts after {} s, once the hook in a game can see it gone", HOOK_RELEASE_WAIT.as_secs());
+                    wait = Some(HOOK_RELEASE_WAIT);
+                }
                 continue;
             }
             // A5: while Windows ends the session it also ends the engine (a console
@@ -319,6 +377,8 @@ impl Engine {
 
     /// Runs one engine process until it exits.
     fn run_once(&self) -> Result<String, String> {
+        self.0.restarting_stuck.store(false, Ordering::SeqCst);
+        self.0.killed.store(false, Ordering::SeqCst);
         let cfg = &self.0.cfg;
         let options = (cfg.options)();
         self.set_microphone(json!({ "state": "starting" }));
@@ -445,5 +505,20 @@ impl Engine {
             }
             _ => log!("engine notification: {msg}"),
         }
+    }
+}
+
+/// A clip request goes through the rule of laurel_app_core::clip (A38).
+impl EngineRequests for Engine {
+    fn request(&self, method: &str, timeout: Duration) -> Result<Value, RequestError> {
+        self.send(method, Value::Null, timeout)
+    }
+}
+
+/// What the log and the windows say about a request that gave no result.
+pub fn error_text(method: &str, error: RequestError) -> String {
+    match error {
+        RequestError::Expired => format!("the engine did not answer {method} in time"),
+        RequestError::Failed(e) => e,
     }
 }

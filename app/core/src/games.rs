@@ -7,15 +7,20 @@
 //! A game is identified by its store and its ID there (`steam:1808500`,
 //! `riot:valorant`), also when the curated list finds a store game its library did
 //! not (A32: `epic:Fortnite`); by `exe:<file name>` for the other games of the
-//! curated list; by the curated key of a game found by its window
+//! curated list; by the curated key of a game in a shared program
 //! (`minecraft:java`); and by `user:<path>` for games the user added.
+//!
+//! A found game is captured by its hook, unless the curated list marks its program
+//! window-only (A39: Roblox), and then by its window from the start.
 //!
 //! Paths come from Windows and are handled as text, the same on every platform:
 //! `/` counts as `\`, and case does not matter.
 
 use serde_json::{json, Value};
 
-const SHIPPED: &str = include_str!("../games.json");
+/// The curated list shipped with Laurel, as text (the app's self-test adds a
+/// window-only game of its own to it).
+pub const SHIPPED: &str = include_str!("../games.json");
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GameId {
@@ -31,6 +36,16 @@ pub enum Verdict {
     /// A game the user chose not to record.
     Ignored(GameId),
     NotGame,
+}
+
+/// How a found game is captured (spec capture.game-hook, capture.window).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Capture {
+    /// By its game hook, and by its window while the hook does not come (the
+    /// window fallback, with hook retries).
+    Hook,
+    /// By its window from the start, with no game hook: a window-only game (A39).
+    Window,
 }
 
 /// A program the user marked as a game, by full path.
@@ -79,9 +94,9 @@ impl StoreGame {
 
 /// A game that runs in a shared program from any folder, such as Minecraft (Java)
 /// in the javaw.exe of whichever Java runtime its launcher brought (games.json,
-/// windowGames).
+/// sharedProgramGames).
 #[derive(Clone, Debug)]
-struct WindowGame {
+struct SharedProgramGame {
     id: GameId,
     /// Lowercase program file names.
     exes: Vec<String>,
@@ -96,13 +111,15 @@ struct WindowGame {
 /// The curated list (games.json).
 #[derive(Clone, Debug)]
 pub struct Curated {
-    window_games: Vec<WindowGame>,
+    shared_program_games: Vec<SharedProgramGame>,
     not_games: Vec<String>,
     blocked_exes: Vec<String>,
     blocked_patterns: Vec<String>,
     /// (lowercase file name, game): a store game's entry has its store key
     /// (`epic:Fortnite`), any other `exe:<lowercase file name>`.
     games: Vec<(String, GameId)>,
+    /// Lowercase file names of the window-only games (`"windowOnly": true`).
+    window_only: Vec<String>,
 }
 
 impl Curated {
@@ -115,26 +132,25 @@ impl Curated {
     pub fn parse(text: &str) -> Result<Curated, String> {
         let v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
         let list = |g: &Value, key: &str| -> Vec<String> { g[key].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_lowercase).collect() };
-        let games = v["games"]
-            .as_array()
-            .into_iter()
-            .flatten()
+        let entries = || v["games"].as_array().into_iter().flatten();
+        let window_only = entries().filter(|g| g["windowOnly"] == true).filter_map(|g| g["exe"].as_str()).map(str::to_lowercase).collect();
+        let games = entries()
             .filter_map(|g| {
                 let exe = g["exe"].as_str()?.to_lowercase();
                 let key = g["key"].as_str().map_or_else(|| format!("exe:{exe}"), String::from);
                 Some((exe, GameId { key, name: g["name"].as_str()?.to_string(), source: "list" }))
             })
             .collect();
-        let window_games = v["windowGames"]
+        let shared_program_games = v["sharedProgramGames"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|g| {
                 let id = GameId { key: g["key"].as_str()?.to_string(), name: g["name"].as_str()?.to_string(), source: "list" };
-                Some(WindowGame { id, exes: list(g, "exes"), classes: list(g, "classes"), command_line: list(g, "commandLine"), titles: list(g, "titles") })
+                Some(SharedProgramGame { id, exes: list(g, "exes"), classes: list(g, "classes"), command_line: list(g, "commandLine"), titles: list(g, "titles") })
             })
             .collect();
-        Ok(Curated { window_games, not_games: list(&v, "notGames"), blocked_exes: list(&v, "blockedExes"), blocked_patterns: list(&v, "blockedPatterns"), games })
+        Ok(Curated { shared_program_games, not_games: list(&v, "notGames"), blocked_exes: list(&v, "blockedExes"), blocked_patterns: list(&v, "blockedPatterns"), games, window_only })
     }
 
     /// Whether a store entry (`steam:228980`) is listed as not a game.
@@ -182,6 +198,17 @@ impl Catalog {
         &self.store_games
     }
 
+    /// How the game whose program is at `exe_path` is captured: by its window when
+    /// the curated list marks the program window-only, however the game was found
+    /// (only the curated list decides, so adding it by hand does not force its
+    /// hook), else by its hook.
+    pub fn capture(&self, exe_path: &str) -> Capture {
+        match self.curated.window_only.contains(&file_name_lower(exe_path)) {
+            true => Capture::Window,
+            false => Capture::Hook,
+        }
+    }
+
     /// Whether the program at `exe_path` is on the blocklist: never a game.
     pub fn blocks(&self, exe_path: &str) -> bool {
         self.curated.blocks(&file_name_lower(exe_path))
@@ -221,7 +248,7 @@ impl Catalog {
     }
 
     /// Decides whether a window is a game's: by its program as `classify` does, and
-    /// for the games of `windowGames`, by the program's file name, the window class
+    /// for the games of `sharedProgramGames`, by the program's file name, the window class
     /// and the command line (read only for those candidates), or the title when the
     /// command line cannot be read. Minecraft (Java) runs in the javaw.exe of the
     /// Java runtime its launcher brought, a different one for each launcher and
@@ -233,7 +260,7 @@ impl Catalog {
         }
         let file = file_name_lower(exe_path);
         let class = class.to_lowercase();
-        let Some(game) = self.curated.window_games.iter().find(|g| g.exes.contains(&file) && g.classes.contains(&class)) else {
+        let Some(game) = self.curated.shared_program_games.iter().find(|g| g.exes.contains(&file) && g.classes.contains(&class)) else {
             return Verdict::NotGame;
         };
         let matches = match command_line() {

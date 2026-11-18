@@ -14,10 +14,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::frames;
 use crate::hook_stop;
 use crate::obs::{
-    clear_output_channel, cstr, ffi, list_source_property, opt_string, watch_audio_events, watch_shared_texture_failures, AudioEvent, Data, Encoder, Obs, Output,
-    Scene, SharedSource, Source, WeakOutput, take_nvenc_texture_failure,
+    clear_output_channel, cstr, encoder_takes_textures, ffi, list_source_property, opt_string, watch_audio_events, watch_shared_texture_failures, AudioEvent, Data,
+    Encoder, Obs, Output, Scene, SharedSource, Source, WeakOutput, take_nvenc_texture_failure,
 };
 
 const VIDEO_CHANNEL: u32 = 0;
@@ -605,6 +606,8 @@ pub struct Recorder {
     fallbacks: Vec<(String, String)>,
     /// A28: the NVENC encoder OBS rerouted the texture encoder to, and why.
     encoder_copy: Option<(String, String)>,
+    /// A37: the watch on the frames the encoder skips, with the replay buffer.
+    frames: Option<frames::Watch>,
 }
 
 unsafe extern "C" fn on_replay_saved(data: *mut c_void, _cd: *mut ffi::calldata_t) {
@@ -668,6 +671,7 @@ impl Recorder {
                 video_index: 0,
                 fallbacks: vec![],
                 encoder_copy: None,
+                frames: None,
             });
         }
 
@@ -721,6 +725,7 @@ impl Recorder {
             encoders.push(aenc);
         }
         output.connect("saved", on_replay_saved, saved_tx.cast());
+        let frames = Some(frames::start(output.weak()));
 
         let mut rec = Recorder {
             output: Some(output),
@@ -756,6 +761,7 @@ impl Recorder {
             video_index: 0,
             fallbacks: vec![],
             encoder_copy: None,
+            frames,
         };
         rec.set_mix(cfg.mix)?;
         rec.first_video_encoder()?;
@@ -882,12 +888,37 @@ impl Recorder {
 
     /// Tells the microphone's thread whether the recorder records a game or the
     /// screen: the microphone is open only then (A20 of the stability tests).
+    /// Also keeps the frame watch's description of what is recorded (A37): every
+    /// change of the capture or of the encoder ends here.
     fn follow_recording(&mut self) {
         let now = self.active() && !matches!(self.target, Capture::None);
         if now != self.mic_recording {
             self.mic_recording = now;
             self.send_mic(AudioEvent::Recording(now));
         }
+        if let Some(frames) = &self.frames {
+            frames.set_description(self.recording_description());
+        }
+    }
+
+    /// What the recorder records and with which encoder, as the A37 lines say it:
+    /// the game's program and how it is captured, the encoder in use (OBS's copy
+    /// in place of the NVENC texture encoder, A28) and its kind. A reroute of
+    /// another texture encoder to its copy is not seen: OBS's caps stay the
+    /// requested encoder's.
+    fn recording_description(&self) -> String {
+        let what = match &self.target {
+            Capture::Game(Some(spec)) => format!("{} by game capture", spec_exe(spec)),
+            Capture::Game(None) => "any fullscreen game by game capture".to_string(),
+            Capture::Window(spec) => format!("{} by its window", spec_exe(spec)),
+            Capture::Monitor { .. } | Capture::MonitorId(_) => "the screen".to_string(),
+            Capture::None => "no game".to_string(),
+        };
+        let (encoder, texture) = match &self.encoder_copy {
+            Some((copy, _)) => (copy.as_str(), false),
+            None => (self.encoder(), encoder_takes_textures(self.encoder())),
+        };
+        format!("{what}, encoder {encoder} ({} encoder)", if texture { "texture" } else { "copy" })
     }
 
     fn send_mic(&self, event: AudioEvent) {
@@ -1033,6 +1064,7 @@ impl Recorder {
         self.target = capture.clone();
         self.capture_name = "game-try";
         log!("[laurel] the game capture took over from the window capture");
+        self.follow_recording();
         true
     }
 
@@ -1111,10 +1143,10 @@ impl Recorder {
         while self.saved_rx.try_recv().is_ok() {}
         output.call("save", None)?;
         self.saved_rx.recv_timeout(timeout).map_err(|_| "timed out waiting for the replay to be saved".to_string())?;
-        output
-            .call("get_last_replay", Some("path"))?
-            .map(PathBuf::from)
-            .ok_or_else(|| "replay saved but no path reported".to_string())
+        let path = output.call("get_last_replay", Some("path"))?.map(PathBuf::from).ok_or_else(|| "replay saved but no path reported".to_string())?;
+        // A38: the first step of a save after OBS's "Wrote replay buffer" line.
+        log!("[laurel] clip: path from OBS: {}", path.display());
+        Ok(path)
     }
 
     pub fn output_size(&self) -> (u32, u32) {
@@ -1162,6 +1194,9 @@ impl Recorder {
 
 impl Drop for Recorder {
     fn drop(&mut self) {
+        if let Some(frames) = self.frames.take() {
+            frames.stop();
+        }
         // The engine's orderly end clears no stop signal (the owner's decision of
         // 2026-11-11 leaves that open): the sources below stop without the watch.
         self.hook_stop.stop();
@@ -1286,7 +1321,7 @@ pub fn format_stats(obs: &Obs, rec: &Recorder) -> String {
     let s = obs.stats();
     let (cw, ch) = rec.capture_size();
     format!(
-        "capture={cw}x{ch} active_fps={:.2} avg_frame_ms={:.3} lagged={} skipped={}/{} output_dropped={} output_active={} encoder={}{}",
+        "capture={cw}x{ch} active_fps={:.2} avg_frame_ms={:.3} lagged={} skipped={}/{} output_dropped={} output_active={} encoder={}{} recording=\"{}\"",
         s.active_fps,
         s.average_frame_time_ms,
         s.lagged_frames,
@@ -1296,7 +1331,9 @@ pub fn format_stats(obs: &Obs, rec: &Recorder) -> String {
         rec.active(),
         rec.encoder(),
         // A28: the encoder OBS uses in place of a texture encoder that could not start.
-        rec.encoder_copy.as_ref().map_or(String::new(), |(soft, _)| format!(" (as {soft})"))
+        rec.encoder_copy.as_ref().map_or(String::new(), |(copy, _)| format!(" (as {copy})")),
+        // A37: what the frame watch's lines would say is recorded.
+        rec.recording_description()
     )
 }
 

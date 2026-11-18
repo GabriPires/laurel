@@ -42,6 +42,9 @@ pub const OBS_SCALE_BICUBIC: i32 = 2;
 pub const SPEAKERS_STEREO: i32 = 2;
 // enum obs_combo_format
 pub const OBS_COMBO_FORMAT_INT: i32 = 1;
+
+/// The encoder takes each frame as a texture on the GPU (obs-encoder.h).
+pub const OBS_ENCODER_CAP_PASS_TEXTURE: u32 = 1 << 1;
 // enum obs_encoder_type
 pub const OBS_ENCODER_AUDIO: i32 = 0;
 pub const OBS_ENCODER_VIDEO: i32 = 1;
@@ -158,6 +161,7 @@ extern "C" {
     pub fn obs_enum_encoder_types(idx: usize, id: *mut *const c_char) -> bool;
     pub fn obs_get_encoder_type(encoder_id: *const c_char) -> i32;
     pub fn obs_get_encoder_codec(id: *const c_char) -> *const c_char;
+    pub fn obs_get_encoder_caps(encoder_id: *const c_char) -> u32;
     pub fn obs_encoder_get_display_name(id: *const c_char) -> *const c_char;
 
     // settings

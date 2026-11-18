@@ -45,7 +45,7 @@ use tauri::{AppHandle, Emitter, Listener, Manager, RunEvent, WindowEvent};
 use detect::{Detector, Mode};
 use engine::{Engine, EngineConfig};
 use hotkeys::{Combo, Hotkeys};
-use laurel_app_core::clip::{self, Admission, ClipCooldown, Refusal, Source as ClipSource};
+use laurel_app_core::clip::{self, Admission, ClipCooldown, ClipOutcome, Refusal, RequestError, Source as ClipSource, CLIP_TIMEOUT, PING_TIMEOUT};
 use i18n::t;
 use library::Library;
 use log::log;
@@ -53,7 +53,6 @@ use overlay::{Kind, Notifier};
 use settings::{CustomGame, IgnoredGame, Settings, Store};
 use storage::Storage;
 
-const CLIP_TIMEOUT: Duration = Duration::from_secs(40);
 const SHOT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the free space of the capture drive is checked.
 const DISK_CHECK: Duration = Duration::from_secs(15);
@@ -309,58 +308,88 @@ fn save_clip_for(app: &AppHandle, source: ClipSource, what: &str, achievement: O
     log!("clip requested by {what}");
     let app = app.clone();
     std::thread::spawn(move || {
-        let engine = app.state::<Engine>();
-        let notifier = app.state::<Notifier>();
-        let detector = app.state::<Arc<Detector>>();
-        let recording = clip::Recording { enabled: detector.enabled(), disk_paused: app.state::<Arc<Storage>>().is_paused(), buffer_runs: detector.recording(), needs_admin: detector.needs_admin_game() };
-        if let Some(refusal) = clip::refusal(&recording) {
-            // The reason as Laurel's window and an ordinary notice give it, then
-            // the notice over a fullscreen program, with what to do (A32).
-            let (message, title, detail) = match &refusal {
-                Refusal::RecordingOff => (t!("Recording is off"), t!("Clip not saved"), t!("Recording is off. Turn it on in Laurel to save clips.")),
-                Refusal::DiskAlmostFull => (t!("Disk almost full: free up space to keep recording"), t!("Clip not saved"), t!("Disk almost full: free up space to keep recording")),
-                Refusal::NeedsAdmin { game } => (t!("No game is being recorded"), t!("Can't record {game}", game = game), t!("It runs as administrator. Open Laurel and restart it as administrator.")),
-                Refusal::NoGame => (t!("No game is being recorded"), t!("Clip not saved"), t!("No game is being recorded. If this is a game, add it in Settings, Games.")),
-            };
-            if achievement.is_some() {
-                log!("automatic clip not saved: {message}");
-                return;
-            }
-            let foreground = win::foreground_window_info();
-            let foreground = foreground.as_ref().map(|(exe_path, client, monitor)| clip::Foreground { exe_path, client: clip_rect(client), monitor: clip_rect(monitor) });
-            if clip::refusal_over_screen(source, &refusal, foreground.as_ref(), &detector.catalog(), &app.state::<Arc<Store>>().get().user_games()) {
-                // A32: the player pressed the hotkey in a fullscreen program; with
-                // notices over games off they would only hear the error sound.
-                log!("clip refused with a fullscreen program in focus ({}): its reason shown over the screen", foreground.map_or("", |f| f.exe_path));
-                notifier.notify_critical(&title, &detail);
-            } else {
-                notifier.notify(Kind::Error, &t!("Clip not saved"), &message);
-            }
-            report(&app, "clip-saved", "saveClip", Err(message));
-            return;
-        }
-        let mut result = engine.request("saveClip", Value::Null, CLIP_TIMEOUT);
-        match &mut result {
-            Ok(saved) => {
-                attach_game(&app, saved);
-                let secs = engine.state()["info"]["bufferSecs"].as_u64().unwrap_or_default();
-                match &achievement {
-                    Some(a) => notifier.notify(Kind::AutoClip, &t!("Achievement clip saved"), a["name"].as_str().unwrap_or_default()),
-                    None => {
-                        let detail = match library::game_name(&saved["game"]) {
-                            Some(game) => t!("Last {secs} s · {game}", secs = secs, game = game),
-                            None => t!("Last {secs} s", secs = secs),
-                        };
-                        notifier.notify(Kind::Clip, &t!("Clip saved"), &detail);
-                    }
-                }
-                finish_saved_for(&app, saved, achievement.as_ref());
-            }
-            Err(e) if achievement.is_some() => log!("automatic clip not saved: {e}"),
-            Err(e) => notifier.notify(Kind::Error, &t!("Clip not saved"), e),
-        }
-        report(&app, "clip-saved", "saveClip", result);
+        let _ = request_clip_now(&app, source, achievement);
     });
+}
+
+/// The rest of a clip request, on a thread of its own: refused, or sent to the
+/// engine, which is restarted when it is stuck (A38); the windows and the player
+/// are told. Returns what the windows got.
+fn request_clip_now(app: &AppHandle, source: ClipSource, achievement: Option<Value>) -> Result<Value, String> {
+    let engine = app.state::<Engine>();
+    let notifier = app.state::<Notifier>();
+    let detector = app.state::<Arc<Detector>>();
+    let recording = clip::Recording { enabled: detector.enabled(), disk_paused: app.state::<Arc<Storage>>().is_paused(), buffer_runs: detector.recording(), needs_admin: detector.needs_admin_game() };
+    if let Some(refusal) = clip::refusal(&recording) {
+        // The reason as Laurel's window and an ordinary notice give it, then
+        // the notice over a fullscreen program, with what to do (A32).
+        let (message, title, detail) = match &refusal {
+            Refusal::RecordingOff => (t!("Recording is off"), t!("Clip not saved"), t!("Recording is off. Turn it on in Laurel to save clips.")),
+            Refusal::DiskAlmostFull => (t!("Disk almost full: free up space to keep recording"), t!("Clip not saved"), t!("Disk almost full: free up space to keep recording")),
+            Refusal::NeedsAdmin { game } => (t!("No game is being recorded"), t!("Can't record {game}", game = game), t!("It runs as administrator. Open Laurel and restart it as administrator.")),
+            Refusal::NoGame => (t!("No game is being recorded"), t!("Clip not saved"), t!("No game is being recorded. If this is a game, add it in Settings, Games.")),
+        };
+        if achievement.is_some() {
+            log!("automatic clip not saved: {message}");
+            return Err(message);
+        }
+        let foreground = win::foreground_window_info();
+        let foreground = foreground.as_ref().map(|(exe_path, client, monitor)| clip::Foreground { exe_path, client: clip_rect(client), monitor: clip_rect(monitor) });
+        if clip::refusal_over_screen(source, &refusal, foreground.as_ref(), &detector.catalog(), &app.state::<Arc<Store>>().get().user_games()) {
+            // A32: the player pressed the hotkey in a fullscreen program; with
+            // notices over games off they would only hear the error sound.
+            log!("clip refused with a fullscreen program in focus ({}): its reason shown over the screen", foreground.map_or("", |f| f.exe_path));
+            notifier.notify_critical(&title, &detail);
+        } else {
+            notifier.notify(Kind::Error, &t!("Clip not saved"), &message);
+        }
+        report(app, "clip-saved", "saveClip", Err(message.clone()));
+        return Err(message);
+    }
+    let outcome = clip::request_clip(engine.inner());
+    let stuck = outcome == ClipOutcome::EngineStuck;
+    let mut result = match outcome {
+        ClipOutcome::Saved(saved) => Ok(saved),
+        ClipOutcome::Failed(RequestError::Expired) => {
+            log!("the clip request expired, but the engine answered a ping: a slow save, not a stuck engine");
+            Err(engine::error_text("saveClip", RequestError::Expired))
+        }
+        ClipOutcome::Failed(e) => Err(engine::error_text("saveClip", e)),
+        ClipOutcome::EngineStuck => {
+            let restart = engine.restart_stuck();
+            let what = restart.err().map_or_else(|| "restarting it".to_string(), |why| format!("not restarted: {why}"));
+            log!("engine stuck: no answer to a clip request in {} s, nor to a ping in {} s; {what}", CLIP_TIMEOUT.as_secs(), PING_TIMEOUT.as_secs());
+            let message = t!("The recorder froze and was restarted; the last minutes were lost.");
+            if restart.is_ok() {
+                // A15: shown over the game whoever asked for the clip, since the
+                // recorder lost its buffer; once per stuck engine.
+                notifier.notify_critical(&t!("Clip not saved"), &message);
+            }
+            Err(message)
+        }
+    };
+    match &mut result {
+        Ok(saved) => {
+            attach_game(app, saved);
+            let secs = engine.state()["info"]["bufferSecs"].as_u64().unwrap_or_default();
+            match &achievement {
+                Some(a) => notifier.notify(Kind::AutoClip, &t!("Achievement clip saved"), a["name"].as_str().unwrap_or_default()),
+                None => {
+                    let detail = match library::game_name(&saved["game"]) {
+                        Some(game) => t!("Last {secs} s · {game}", secs = secs, game = game),
+                        None => t!("Last {secs} s", secs = secs),
+                    };
+                    notifier.notify(Kind::Clip, &t!("Clip saved"), &detail);
+                }
+            }
+            finish_saved_for(app, saved, achievement.as_ref());
+        }
+        Err(e) if achievement.is_some() => log!("automatic clip not saved: {e}"),
+        Err(_) if stuck => {}
+        Err(e) => notifier.notify(Kind::Error, &t!("Clip not saved"), e),
+    }
+    report(app, "clip-saved", "saveClip", result.clone());
+    result
 }
 
 fn take_screenshot(app: &AppHandle, source: &str) {
@@ -1451,9 +1480,11 @@ fn selftest(app: AppHandle) {
         check_session_end(&engine, &wait_ready)?;
         check_engine_quit(&engine, &wait_ready)?;
         check_health(&engine, &wait_ready)?;
+        check_stuck_engine(&app, &engine, &wait_ready)?;
         std::thread::sleep(Duration::from_secs(4));
         clip()?;
         check_games(&app, &engine)?;
+        check_window_only(&app, &engine)?;
         check_hotkeys(&app)?;
         check_toggle_and_cursor(&app, &engine)
     };
@@ -1480,24 +1511,131 @@ fn selftest(app: AppHandle) {
 
 /// Size of engine.log now, to read what is written after.
 fn engine_log_len() -> u64 {
-    log::dir().and_then(|d| std::fs::metadata(d.join("engine.log")).ok()).map_or(0, |m| m.len())
+    log_len("engine")
 }
 
 /// What engine.log got since it was `start` bytes long, with the part in
 /// engine.old.log if it rotated meanwhile.
 fn engine_log_since(start: u64) -> String {
+    log_since("engine", start)
+}
+
+/// Size of the log `<name>.log` now.
+fn log_len(name: &str) -> u64 {
+    log::dir().and_then(|d| std::fs::metadata(d.join(format!("{name}.log"))).ok()).map_or(0, |m| m.len())
+}
+
+/// What `<name>.log` got since it was `start` bytes long, with the part in
+/// `<name>.old.log` if it rotated meanwhile.
+fn log_since(name: &str, start: u64) -> String {
     let Some(dir) = log::dir() else {
         return String::new();
     };
-    let current = std::fs::read(dir.join("engine.log")).unwrap_or_default();
+    let current = std::fs::read(dir.join(format!("{name}.log"))).unwrap_or_default();
     let bytes = match current.get(start as usize..) {
         Some(tail) => tail.to_vec(),
         None => {
-            let old = std::fs::read(dir.join("engine.old.log")).unwrap_or_default();
+            let old = std::fs::read(dir.join(format!("{name}.old.log"))).unwrap_or_default();
             [old.get(start as usize..).unwrap_or_default(), &current].concat()
         }
     };
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Self-test of A38: with the engine's request thread held (the "simulateHang"
+/// request, as the stuck save of package 10), a clip request through the app's own
+/// path expires after 40 s and the ping after 5 s more. The engine writes the
+/// stack of each of its threads once, at 40 s; the app writes its line, shows the
+/// notice and restarts the engine, which cannot quit in order and is killed; the
+/// new engine records and saves a clip, whose save leaves its steps in engine.log.
+fn check_stuck_engine(app: &AppHandle, engine: &Engine, wait_ready: &dyn Fn(&str) -> Result<(), String>) -> Result<(), String> {
+    let (engine_start, app_start) = (engine_log_len(), log_len("app"));
+    let holder = engine.clone();
+    let hang = std::thread::spawn(move || holder.request("simulateHang", json!({ "secs": 90 }), Duration::from_secs(100)));
+    std::thread::sleep(Duration::from_secs(1));
+    let asked = Instant::now();
+    let result = request_clip_now(app, ClipSource::Hotkey, None);
+    let expired = asked.elapsed();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while engine.state()["state"] == "ready" {
+        if Instant::now() > deadline {
+            return Err("the stuck engine was not restarted".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let ended = asked.elapsed();
+    let held = hang.join().map_err(|_| "the simulateHang thread panicked")?;
+    wait_ready("after the stuck engine was restarted")?;
+    let restarted = asked.elapsed();
+    let engine_lines = engine_log_since(engine_start);
+    let app_lines = log_since("app", app_start);
+    let hang_lines: Vec<&str> = engine_lines.lines().filter(|l| l.contains("[laurel] hang:")).collect();
+    let main = hang_lines.iter().find(|l| l.contains(" \"main\": ")).copied().unwrap_or_default();
+    log!(
+        "[selftest] stuck engine: the clip request ended after {:.1} s ({result:?}), the engine after {:.1} s, a new one ready after {:.1} s; the held request: {held:?}; {} lines of stacks; the main thread: {main}",
+        expired.as_secs_f64(),
+        ended.as_secs_f64(),
+        restarted.as_secs_f64(),
+        hang_lines.len()
+    );
+    if result != Err("The recorder froze and was restarted; the last minutes were lost.".into()) {
+        return Err(format!("the clip request to the stuck engine gave {result:?}"));
+    }
+    if !(Duration::from_secs(44)..Duration::from_secs(50)).contains(&expired) {
+        return Err(format!("the clip request to the stuck engine ended after {:.1} s, not 45", expired.as_secs_f64()));
+    }
+    // Once, when the watch, which looks every second, first saw it past 40 s.
+    let headers: Vec<&str> = hang_lines.iter().filter(|l| l.contains("the stacks of the engine's threads follow")).copied().collect();
+    let ran = headers
+        .first()
+        .and_then(|l| l.split_once("[laurel] hang: the request \"simulateHang\" has run for "))
+        .and_then(|(_, rest)| rest.split_once(" s;"))
+        .and_then(|(secs, _)| secs.parse::<f64>().ok());
+    if headers.len() != 1 || !ran.is_some_and(|secs| (40.0..42.0).contains(&secs)) {
+        return Err(format!("engine.log has not the stacks of the held request once, at 40 s: {headers:?}"));
+    }
+    for needed in ["[laurel] simulating a stuck request: holding the request thread for 90 s", "[laurel] hang: end of the stacks", "==== engine exited: exit code 1"] {
+        if !engine_lines.contains(needed) {
+            return Err(format!("engine.log has no \"{needed}\""));
+        }
+    }
+    // The request thread, asleep in simulateHang: its stack goes through the engine.
+    if main.matches("laurel-engine.exe+0x").count() < 2 {
+        return Err("engine.log has no stack of the engine's main thread through laurel-engine.exe".into());
+    }
+    if !hang_lines.iter().any(|l| l.contains(" \"libobs: graphics thread\": ") && l.contains("obs.dll+0x")) {
+        return Err("engine.log has no stack of libobs' graphics thread".into());
+    }
+    for needed in [
+        "engine stuck: no answer to a clip request in 40 s, nor to a ping in 5 s; restarting it",
+        "critical notice shown: Clip not saved",
+        "engine did not exit after shutdown; killing it",
+        "engine restarted: it had stopped answering",
+        "the engine was killed: the next one starts after 6 s",
+    ] {
+        if !app_lines.contains(needed) {
+            return Err(format!("app.log has no \"{needed}\""));
+        }
+    }
+    // The new engine records and saves a clip, through the same path.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !engine.request("status", Value::Null, SHOT_TIMEOUT).is_ok_and(|s| s["recording"] == true) {
+        if Instant::now() > deadline {
+            return Err("the replay buffer did not run after the stuck engine was restarted".into());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    std::thread::sleep(Duration::from_secs(4));
+    let before = engine_log_len();
+    let saved = request_clip_now(app, ClipSource::Hotkey, None)?;
+    let text = engine_log_since(before);
+    let steps: Vec<&str> = text.lines().filter(|l| l.contains("[laurel] clip") || l.contains("thumbnail") || l.contains("[laurel] hang:")).collect();
+    log!("[selftest] stuck engine: the new engine saved {}; the steps: {steps:?}", saved["path"]);
+    let wanted = ["[laurel] clip: path from OBS: ", "[laurel] clip: thumbnail started", "[laurel] clip: thumbnail done in ", "[laurel] clip saved in "];
+    if steps.len() != wanted.len() || steps.iter().zip(wanted).any(|(line, want)| !line.contains(want)) {
+        return Err("a clip's save did not leave its steps in engine.log, in order and alone".into());
+    }
+    Ok(())
 }
 
 /// Self-test of A19: engine.log tells how each engine ended (the one the self-test
@@ -1669,7 +1807,6 @@ fn check_language() -> Result<(), String> {
 /// clip carries the game's name, and recording pauses after the window closes.
 fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
     use games::Verdict;
-    use std::os::windows::process::CommandExt;
     let detector = app.state::<Arc<Detector>>().inner().clone();
     let store = app.state::<Arc<Store>>().inner().clone();
     let settings = store.get();
@@ -1694,8 +1831,7 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
     // the title. A hooked game keeps the capture longer when another one has focus.
     {
         let own = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-        let root = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
-        let shell = root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe").to_string_lossy().into_owned();
+        let shell = powershell().to_string_lossy().into_owned();
         let title = "A song title";
         let described = win::file_description(&own);
         let own_name = default_game_name(&own, Some(title));
@@ -1713,50 +1849,29 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
         log!("[selftest] games open ({open:?}): live detection check skipped");
         return Ok(());
     }
-    let root = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
-    let shell = root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    let shell = powershell();
     let name = "Laurel self-test game";
     let mut custom = settings.custom_games.clone();
     custom.push(CustomGame { path: shell.to_string_lossy().into_owned(), name: name.into() });
     store.set(Settings { custom_games: custom, ..settings.clone() }).map_err(|e| e.to_string())?;
     detector.set_mode(Mode::Detect);
-    // A window off every monitor that does not take the focus, so the test does not
-    // disturb whoever uses the PC.
-    let form = |title: &str| "Add-Type -AssemblyName System.Windows.Forms, System.Drawing; \
-        Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition 'public class QuietForm : System.Windows.Forms.Form { protected override bool ShowWithoutActivation { get { return true; } } }'; \
-        $f = New-Object QuietForm; $f.Text = 'TITLE'; $f.StartPosition = 'Manual'; \
-        $f.Location = New-Object System.Drawing.Point(-6000, -6000); $f.Size = New-Object System.Drawing.Size(960, 600); \
-        $t = New-Object System.Windows.Forms.Timer; $t.Interval = 120000; $t.Add_Tick({ $f.Close() }); $t.Start(); \
-        [System.Windows.Forms.Application]::Run($f)"
-        .replace("TITLE", title);
     let outcome = (|| -> Result<(), String> {
         let status = |key: &str| engine.request("status", Value::Null, SHOT_TIMEOUT).map(|s| s[key].clone());
-        let until = |what: &str, done: &dyn Fn() -> bool| -> Result<(), String> {
-            let deadline = Instant::now() + Duration::from_secs(25);
-            while !done() {
-                if Instant::now() > deadline {
-                    return Err(format!("timed out waiting for {what}"));
-                }
-                std::thread::sleep(Duration::from_millis(250));
-            }
-            Ok(())
-        };
         // Stopping the replay buffer completes asynchronously.
-        until("recording to stop without a game", &|| status("recording").is_ok_and(|r| r == false))?;
-        let spawn = |title: &str| std::process::Command::new(&shell).args(["-NoProfile", "-Command", &form(title)]).creation_flags(0x0800_0000).spawn().map_err(|e| e.to_string());
-        let mut child = spawn(name)?;
-        let found = until("the game", &|| detector.current().is_some_and(|g| g.id.name == name));
+        wait_until("recording to stop without a game", &|| status("recording").is_ok_and(|r| r == false))?;
+        let mut child = quiet_window(&shell, name)?;
+        let found = wait_until("the game", &|| detector.current().is_some_and(|g| g.id.name == name));
         let result = found.and_then(|_| {
-            until("recording", &|| status("recording").is_ok_and(|r| r == true))?;
+            wait_until("recording", &|| status("recording").is_ok_and(|r| r == true))?;
             log!("[selftest] game detected: {}", detector.snapshot());
             // A27: a game added by hand can be renamed, and the detected game follows.
             let path = shell.to_string_lossy().into_owned();
             let renamed = "Laurel renamed test game";
             games_rename(app.clone(), path.clone(), format!("  {renamed} "))?;
-            until("the renamed game", &|| detector.current().is_some_and(|g| g.id.name == renamed))?;
+            wait_until("the renamed game", &|| detector.current().is_some_and(|g| g.id.name == renamed))?;
             let empty = games_rename(app.clone(), path.clone(), "   ".into());
             games_rename(app.clone(), path.clone(), name.into())?;
-            until("the game's name back", &|| detector.current().is_some_and(|g| g.id.name == name))?;
+            wait_until("the game's name back", &|| detector.current().is_some_and(|g| g.id.name == name))?;
             log!("[selftest] renamed the game to {renamed:?} and back; an empty name: {empty:?}");
             if empty.is_ok() {
                 return Err("an empty game name was accepted".into());
@@ -1779,7 +1894,7 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
             while engine.state()["state"] == "ready" && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(25));
             }
-            until("the engine to restart", &|| engine.state()["state"] == "ready")?;
+            wait_until("the engine to restart", &|| engine.state()["state"] == "ready")?;
             let restarted = Instant::now();
             // A26: a restart for new settings stops the engine in order (its game
             // capture stops, and the hook in the game is free), not by a kill.
@@ -1794,7 +1909,7 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
             // The PowerShell window has no swap chain, so it is never hooked; it is
             // not elevated either, so no restart as administrator may be offered,
             // and after 15 s its window is recorded instead (spec capture.game-hook).
-            until("the hook check", &|| detector.hook_checked())?;
+            wait_until("the hook check", &|| detector.hook_checked())?;
             let waited = restarted.elapsed();
             log!("[selftest] hook check {:.1} s after the engine restart", waited.as_secs_f64());
             if waited < Duration::from_secs(14) {
@@ -1808,6 +1923,13 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
             }
             if snapshot["capture"] != "window" || !target.as_str().unwrap_or_default().starts_with("window:") {
                 return Err("the window capture fallback did not start".into());
+            }
+            // OBS logs each try of its game capture to hook the game; the
+            // window-only game's check (check_window_only) counts on that line.
+            let attempts = engine_log_since(log_start).lines().filter(|l| l.contains("attempting to hook")).count();
+            log!("[selftest] hook attempts by OBS before the window fallback: {attempts}");
+            if attempts == 0 {
+                return Err("no \"attempting to hook\" line from OBS's game capture".into());
             }
             // No hook reports a game recorded by its window, and the game audio
             // still has to follow its process (spec audio.per-app).
@@ -1832,9 +1954,9 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
             // game capture goes over the window capture for a while, then comes off
             // when it does not hook (the PowerShell window never is).
             detector.retry_hook_now();
-            until("a hook try", &|| status("probing").is_ok_and(|p| p == true))?;
+            wait_until("a hook try", &|| status("probing").is_ok_and(|p| p == true))?;
             let during = status("target")?;
-            until("the hook try to end", &|| status("probing").is_ok_and(|p| p == false))?;
+            wait_until("the hook try to end", &|| status("probing").is_ok_and(|p| p == false))?;
             let snapshot = detector.snapshot();
             log!("[selftest] hook try over {during}, then {snapshot}");
             if !during.as_str().unwrap_or_default().starts_with("window:") || snapshot["capture"] != "window" {
@@ -1849,9 +1971,9 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
             let other = "Laurel self-test game window 2";
             let second = format!("window:{other}:");
             win::minimize_no_activate(hwnd);
-            let mut child2 = spawn(other)?;
+            let mut child2 = quiet_window(&shell, other)?;
             let pid2 = child2.id();
-            let moved = until("the capture to follow the second window", &|| {
+            let moved = wait_until("the capture to follow the second window", &|| {
                 detector.current().is_some_and(|g| g.pid == pid2) && status("target").is_ok_and(|t| t.as_str().unwrap_or_default().starts_with(&second))
             });
             let after = (detector.snapshot(), status("probing"));
@@ -1863,15 +1985,15 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
             if after.0["capture"] != "window" || after.1 != Ok(Value::Bool(false)) {
                 return Err("the capture did not stay on the moved window".into());
             }
-            until("the capture to go back to the first window", &|| status("target").is_ok_and(|t| t.as_str().unwrap_or_default().starts_with(&first)))?;
+            wait_until("the capture to go back to the first window", &|| status("target").is_ok_and(|t| t.as_str().unwrap_or_default().starts_with(&first)))?;
             log!("[selftest] game back to its first window: {}", detector.snapshot());
             Ok(())
         });
         let _ = child.kill();
         let _ = child.wait();
         result?;
-        until("the game to close", &|| detector.current().is_none())?;
-        until("recording to pause", &|| status("recording").is_ok_and(|r| r == false))?;
+        wait_until("the game to close", &|| detector.current().is_none())?;
+        wait_until("recording to pause", &|| status("recording").is_ok_and(|r| r == false))?;
         // With no game, the game audio follows nothing, so it stops trying again.
         let follows = status("audio")?["follows"].clone();
         log!("[selftest] game closed: {}; game audio follows {follows}", detector.snapshot());
@@ -1882,7 +2004,7 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
         // Screen recording (spec capture.screen): with no game open, the primary
         // monitor is recorded; turned off, nothing is captured again.
         detector.set_screen(Some(detect::Screen { monitor: String::new(), switch_to_games: true }));
-        until("screen recording", &|| status("recording").is_ok_and(|r| r == true) && status("target").is_ok_and(|t| t.as_str().unwrap_or_default().starts_with("monitor-id:")))?;
+        wait_until("screen recording", &|| status("recording").is_ok_and(|r| r == true) && status("target").is_ok_and(|t| t.as_str().unwrap_or_default().starts_with("monitor-id:")))?;
         std::thread::sleep(Duration::from_secs(2));
         let size = status("captureSize")?;
         log!("[selftest] screen recording: {}; capture {size}", detector.snapshot());
@@ -1897,7 +2019,7 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
             return Err(format!("the screen clip is not named Screen: {path}"));
         }
         detector.set_screen(None);
-        until("screen recording to stop", &|| status("recording").is_ok_and(|r| r == false))?;
+        wait_until("screen recording to stop", &|| status("recording").is_ok_and(|r| r == false))?;
         if size[0].as_u64().unwrap_or_default() == 0 {
             return Err("screen recording captured nothing".into());
         }
@@ -1906,6 +2028,111 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
     detector.set_screen(detect::screen_of(&settings));
     store.set(settings).map_err(|e| e.to_string())?;
     detector.set_mode(Mode::Fixed("none".into()));
+    outcome
+}
+
+/// Windows PowerShell, whose windows the self-test opens as games.
+fn powershell() -> PathBuf {
+    let root = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+    root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
+}
+
+/// A PowerShell window off every monitor that does not take the focus, so the test
+/// does not disturb whoever uses the PC; it closes by itself after 2 min.
+fn quiet_window(shell: &std::path::Path, title: &str) -> Result<std::process::Child, String> {
+    use std::os::windows::process::CommandExt;
+    let form = "Add-Type -AssemblyName System.Windows.Forms, System.Drawing; \
+        Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition 'public class QuietForm : System.Windows.Forms.Form { protected override bool ShowWithoutActivation { get { return true; } } }'; \
+        $f = New-Object QuietForm; $f.Text = 'TITLE'; $f.StartPosition = 'Manual'; \
+        $f.Location = New-Object System.Drawing.Point(-6000, -6000); $f.Size = New-Object System.Drawing.Size(960, 600); \
+        $t = New-Object System.Windows.Forms.Timer; $t.Interval = 120000; $t.Add_Tick({ $f.Close() }); $t.Start(); \
+        [System.Windows.Forms.Application]::Run($f)"
+        .replace("TITLE", title);
+    std::process::Command::new(shell).args(["-NoProfile", "-Command", &form]).creation_flags(0x0800_0000).spawn().map_err(|e| e.to_string())
+}
+
+/// Waits up to 25 s for `done`.
+fn wait_until(what: &str, done: &dyn Fn() -> bool) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while !done() {
+        if Instant::now() > deadline {
+            return Err(format!("timed out waiting for {what}"));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Ok(())
+}
+
+/// Self-test of A39: a window-only game of the curated list is recorded by its
+/// window from the start, with no game capture, so OBS never tries its hook, no
+/// hook check after 15 s and no hook retries, while its sound follows its process.
+/// Roblox cannot be opened here, so the shipped curated list gets a window-only
+/// entry for powershell.exe for this check, and comes back as shipped at the end.
+fn check_window_only(app: &AppHandle, engine: &Engine) -> Result<(), String> {
+    let detector = app.state::<Arc<Detector>>().inner().clone();
+    let store = app.state::<Arc<Store>>().inner().clone();
+    let shell = powershell();
+    let name = "Laurel self-test window-only game";
+    let open = detector.games_open();
+    if !open.is_empty() {
+        log!("[selftest] games open ({open:?}): window-only game check skipped");
+        return Ok(());
+    }
+    let mut list: Value = serde_json::from_str(games::SHIPPED).map_err(|e| e.to_string())?;
+    let entries = list["games"].as_array_mut().ok_or("the shipped curated list has no games")?;
+    entries.push(json!({ "exe": "powershell.exe", "name": name, "windowOnly": true }));
+    detector.set_curated(games::Curated::parse(&list.to_string())?);
+    let screen = detect::screen_of(&store.get());
+    let outcome = (|| -> Result<(), String> {
+        // Any PowerShell window open on the PC is now this game.
+        let open = detector.games_open();
+        if !open.is_empty() {
+            log!("[selftest] PowerShell windows open ({open:?}): window-only game check skipped");
+            return Ok(());
+        }
+        detector.set_screen(None);
+        detector.set_mode(Mode::Detect);
+        let status = |key: &str| engine.request("status", Value::Null, SHOT_TIMEOUT).map(|s| s[key].clone());
+        wait_until("recording to stop without a game", &|| status("recording").is_ok_and(|r| r == false))?;
+        let log_start = engine_log_len();
+        let mut child = quiet_window(&shell, name)?;
+        let result = (|| -> Result<(), String> {
+            wait_until("the window-only game", &|| detector.current().is_some_and(|g| g.id.name == name))?;
+            wait_until("recording", &|| status("recording").is_ok_and(|r| r == true))?;
+            // The first capture the game gets is its window's.
+            let target = status("target")?;
+            let follows = status("audio")?["follows"].clone();
+            log!("[selftest] window-only game: {}; engine target {target}; game audio follows {follows}", detector.snapshot());
+            if detector.snapshot()["capture"] != "window" || !target.as_str().unwrap_or_default().starts_with("window:") {
+                return Err("the window-only game was not recorded by its window from the start".into());
+            }
+            if !follows.as_str().is_some_and(|exe| exe.eq_ignore_ascii_case("powershell.exe")) {
+                return Err(format!("the game audio does not follow the window-only game: {follows}"));
+            }
+            // Past the hook check and the window fallback's 15 s, and a hook retry
+            // asked for now: still the window, and no hook tried.
+            std::thread::sleep(Duration::from_secs(17));
+            detector.retry_hook_now();
+            std::thread::sleep(Duration::from_secs(3));
+            let (after, retrying) = (status("target")?, status("probing")?);
+            let text = engine_log_since(log_start);
+            let attempts = text.lines().filter(|l| l.contains("attempting to hook")).count();
+            let retries = text.lines().filter(|l| l.contains("trying the game hook over the window capture")).count();
+            log!("[selftest] window-only game 20 s later: same target {}, hook retry running {retrying}, hook checked {}; engine.log: {attempts} hook attempts, {retries} hook retries", after == target, detector.hook_checked());
+            if after != target || retrying != false || detector.hook_checked() || attempts > 0 || retries > 0 {
+                return Err("the window-only game's hook was tried".into());
+            }
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        result?;
+        wait_until("the window-only game to close", &|| detector.current().is_none())?;
+        wait_until("recording to pause", &|| status("recording").is_ok_and(|r| r == false))
+    })();
+    detector.set_mode(Mode::Fixed("none".into()));
+    detector.set_curated(games::Curated::shipped());
+    detector.set_screen(screen);
     outcome
 }
 

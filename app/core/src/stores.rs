@@ -38,12 +38,21 @@ pub struct Listed {
     pub dir: String,
 }
 
+/// Why the app could not read a store's file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadError {
+    /// The file is not there, or the folder that should hold it is not.
+    NotFound,
+    /// Any other error, in the system's words.
+    Failed(String),
+}
+
 /// One file of a store, as the app found it: its path, and its text or why it
 /// could not be read.
 #[derive(Clone, Debug)]
 pub struct StoreFile {
     pub path: String,
-    pub text: Result<String, String>,
+    pub text: Result<String, ReadError>,
 }
 
 /// What the app found of one store: its files, and notes on what it could not
@@ -60,6 +69,9 @@ pub struct Listing {
 pub enum Rejected {
     /// The file could not be read.
     Unreadable(String),
+    /// The file is not there: the folder is not a game's (the Xbox app's GameSave
+    /// folder in XboxGames has no MicrosoftGame.config). Its file name.
+    NoFile(String),
     /// The file lacks what the store's format has: what is missing or wrong.
     Invalid(&'static str),
     /// An Epic entry outside the games category (an engine, a plugin).
@@ -86,6 +98,7 @@ impl std::fmt::Display for Rejected {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Rejected::Unreadable(e) => write!(f, "unreadable: {e}"),
+            Rejected::NoFile(name) => write!(f, "no {name}"),
             Rejected::Invalid(what) => f.write_str(what),
             Rejected::NotAGame => f.write_str("not in the games category"),
             Rejected::ListedAsNotGame => f.write_str("listed as not a game"),
@@ -213,7 +226,10 @@ fn read_file(store: Store, file: &StoreFile, curated: &Curated, dir_exists: &imp
     if store == Store::Riot {
         riot_folder(&file.path)?;
     }
-    let text = file.text.as_ref().map_err(|e| Rejected::Unreadable(e.clone()))?;
+    let text = file.text.as_ref().map_err(|e| match e {
+        ReadError::NotFound => Rejected::NoFile(last(&file.path).to_string()),
+        ReadError::Failed(e) => Rejected::Unreadable(e.clone()),
+    })?;
     let listed = match store {
         Store::Steam => steam_manifest(&file.path, text),
         Store::Epic => epic_manifest(text),

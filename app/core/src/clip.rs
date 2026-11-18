@@ -1,7 +1,10 @@
-//! A clip request (spec record.replay-buffer): what asked for it, and the clip
-//! cooldown that turns a repeated press into one clip (A33 of the stability tests).
+//! A clip request (spec record.replay-buffer): what asked for it, the clip
+//! cooldown that turns a repeated press into one clip (A33 of the stability tests),
+//! and what an engine that stops answering it means (A38).
 
 use std::time::{Duration, Instant};
+
+use serde_json::Value;
 
 use crate::games::{Catalog, UserGames, Verdict};
 
@@ -128,4 +131,55 @@ pub fn refusal_over_screen(source: Source, refusal: &Refusal, foreground: Option
     let Some(f) = foreground.filter(|_| source == Source::Hotkey) else { return false };
     let ignored = *refusal == Refusal::NoGame && matches!(catalog.classify(f.exe_path, user), Verdict::Ignored(_));
     f.client.covers(&f.monitor) && !catalog.blocks(f.exe_path) && !ignored
+}
+
+/// How long a clip request waits for the engine.
+pub const CLIP_TIMEOUT: Duration = Duration::from_secs(40);
+/// How long the light request ("ping") after an expired clip request waits.
+pub const PING_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Why a request to the engine did not give a result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestError {
+    /// No answer within the request's time; the engine may still be working on it.
+    Expired,
+    /// The engine answered with an error, was not running, or ended meanwhile.
+    Failed(String),
+}
+
+/// The engine as a clip request sees it.
+pub trait EngineRequests {
+    fn request(&self, method: &str, timeout: Duration) -> Result<Value, RequestError>;
+}
+
+/// How a clip request to the engine ended.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ClipOutcome {
+    Saved(Value),
+    /// No clip. `Expired` only when the engine then answered the ping: a slow
+    /// save, and the engine goes on. An engine that ended meanwhile gives the
+    /// ping's failure.
+    Failed(RequestError),
+    /// A38 of the stability tests: the clip request expired and the engine did not
+    /// answer the ping in its time either, so the thread that answers its requests
+    /// is stuck and no clip can be saved until the engine is restarted.
+    EngineStuck,
+}
+
+/// Sends a clip request to the engine and, when it expires, a light request
+/// ("ping") that the engine answers at once when its request thread is free. The
+/// engine answers its requests one at a time and in order, so the ping comes
+/// after the clip request: a save that is only slow answers it once done, and a
+/// stuck one never does (A38).
+pub fn request_clip(engine: &impl EngineRequests) -> ClipOutcome {
+    match engine.request("saveClip", CLIP_TIMEOUT) {
+        Ok(saved) => ClipOutcome::Saved(saved),
+        Err(RequestError::Expired) => match engine.request("ping", PING_TIMEOUT) {
+            Ok(_) => ClipOutcome::Failed(RequestError::Expired),
+            Err(RequestError::Expired) => ClipOutcome::EngineStuck,
+            // The engine is gone; the supervisor starts a new one.
+            Err(gone) => ClipOutcome::Failed(gone),
+        },
+        Err(e) => ClipOutcome::Failed(e),
+    }
 }

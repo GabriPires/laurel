@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, SyncSender};
 use std::sync::{Mutex, OnceLock};
 
+use laurel_engine_core::frames::FrameCounts;
+
 pub fn cstr(s: &str) -> CString {
     CString::new(s).expect("string without NUL")
 }
@@ -391,17 +393,40 @@ impl Obs {
     }
 
     pub fn stats(&self) -> CoreStats {
-        unsafe {
-            let video = ffi::obs_get_video();
-            CoreStats {
-                active_fps: ffi::obs_get_active_fps(),
-                average_frame_time_ms: ffi::obs_get_average_frame_time_ns() as f64 / 1e6,
-                lagged_frames: ffi::obs_get_lagged_frames(),
-                skipped_frames: ffi::video_output_get_skipped_frames(video),
-                total_frames: ffi::video_output_get_total_frames(video),
-            }
+        let frames = frame_counts();
+        CoreStats {
+            active_fps: unsafe { ffi::obs_get_active_fps() },
+            average_frame_time_ms: unsafe { ffi::obs_get_average_frame_time_ns() } as f64 / 1e6,
+            lagged_frames: frames.lagged,
+            skipped_frames: frames.skipped,
+            total_frames: frames.total,
         }
     }
+}
+
+/// OBS's frame counters now: the frames the encoder skipped and the video
+/// output's frames, both since the encoder last started, and the frames lagged by
+/// rendering, since libobs started. The frame watch (frames.rs) reads them on its
+/// own thread: the first two are atomic loads; the lagged one is a 32-bit field
+/// that OBS's graphics thread writes, read whole on x64; and the video output
+/// they come from is replaced only by obs_reset_video, which runs once, before
+/// the recorder (see wiki/projeto/runtime-obs.md).
+pub fn frame_counts() -> FrameCounts {
+    unsafe {
+        let video = ffi::obs_get_video();
+        FrameCounts {
+            skipped: ffi::video_output_get_skipped_frames(video),
+            total: ffi::video_output_get_total_frames(video),
+            lagged: ffi::obs_get_lagged_frames(),
+        }
+    }
+}
+
+/// Whether an encoder type takes each frame as a texture on the GPU (a texture
+/// encoder) rather than through a copy in system memory.
+pub fn encoder_takes_textures(encoder_id: &str) -> bool {
+    let id = cstr(encoder_id);
+    unsafe { ffi::obs_get_encoder_caps(id.as_ptr()) & ffi::OBS_ENCODER_CAP_PASS_TEXTURE != 0 }
 }
 
 /// A list property: its name, the default value and the (label, value) items.

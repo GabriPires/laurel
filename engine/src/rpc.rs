@@ -49,8 +49,9 @@ pub fn read_stdin<T: Send + 'static>(tx: Sender<Event<T>>) {
 
 /// Answers requests until stdin closes or `handle` asks to quit (None), or until a
 /// `Stop` arrives (its reason). Requests without an id are treated as notifications
-/// and get no response.
-pub fn serve<T>(events: Receiver<Event<T>>, mut handle: impl FnMut(&str, &Value) -> (Result<Value, String>, Flow)) -> Option<T> {
+/// and get no response. `request_watch` sees each request begin and end (A38,
+/// hang.rs).
+pub fn serve<T>(events: Receiver<Event<T>>, request_watch: &crate::hang::Watch, mut handle: impl FnMut(&str, &Value) -> (Result<Value, String>, Flow)) -> Option<T> {
     for event in events {
         let line = match event {
             Event::Line(line) => line,
@@ -70,7 +71,9 @@ pub fn serve<T>(events: Receiver<Event<T>>, mut handle: impl FnMut(&str, &Value)
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         let method = req.get("method").and_then(Value::as_str).unwrap_or_default();
         let params = req.get("params").cloned().unwrap_or(Value::Null);
+        request_watch.started(method);
         let (result, flow) = handle(method, &params);
+        request_watch.finished();
         if !id.is_null() {
             send(match result {
                 Ok(r) => json!({ "jsonrpc": "2.0", "id": id, "result": r }),

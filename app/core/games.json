@@ -1,5 +1,5 @@
 {
-  "about": "Laurel's curated game list (spec game.detection). Games installed through Steam, Epic, Riot and Xbox are found from their libraries; this list only adds games from other launchers, store games their store's library did not find (A32; such an entry has the store's key, so the game is the same from both), store entries that are not games, and helper or client executables that live in game folders. Keys: <store>:<id> or exe:<lowercase file name>. windowGames are games that run in a shared program from any folder (Java), found by the program, its window class and its command line (or, when that cannot be read, its title).",
+  "about": "Laurel's curated game list (spec game.detection). Games installed through Steam, Epic, Riot and Xbox are found from their libraries; this list only adds games from other launchers, store games their store's library did not find (A32; such an entry has the store's key, so the game is the same from both), store entries that are not games, and helper or client executables that live in game folders. Keys: <store>:<id> or exe:<lowercase file name>. sharedProgramGames are games that run in a shared program from any folder (Java), found by the program, its window class and its command line (or, when that cannot be read, its title). A games entry with windowOnly set to true is a window-only game (A39): recorded by its window from the start, with no game hook, however it was found.",
   "notGames": [
     "steam:228980",
     "steam:250820",
@@ -52,7 +52,7 @@
     "updater",
     "upload"
   ],
-  "windowGames": [
+  "sharedProgramGames": [
     {
       "key": "minecraft:java",
       "name": "Minecraft",
@@ -70,7 +70,7 @@
     { "exe": "Hearthstone.exe", "name": "Hearthstone" },
     { "exe": "osu!.exe", "name": "osu!" },
     { "exe": "Overwatch.exe", "name": "Overwatch" },
-    { "exe": "RobloxPlayerBeta.exe", "name": "Roblox" },
+    { "exe": "RobloxPlayerBeta.exe", "name": "Roblox", "windowOnly": true },
     { "exe": "StarRail.exe", "name": "Honkai: Star Rail" },
     { "exe": "Wow.exe", "name": "World of Warcraft" },
     { "exe": "ZenlessZoneZero.exe", "name": "Zenless Zone Zero" }

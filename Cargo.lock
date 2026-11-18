@@ -1899,7 +1899,7 @@ dependencies = [
 
 [[package]]
 name = "laurel-app"
-version = "0.1.0-rc.16"
+version = "0.1.0-rc.17"
 dependencies = [
  "crc32fast",
  "flate2",
@@ -1922,7 +1922,7 @@ dependencies = [
 
 [[package]]
 name = "laurel-engine"
-version = "0.1.0-rc.16"
+version = "0.1.0-rc.17"
 dependencies = [
  "laurel-engine-core",
  "png 0.17.16",
@@ -1936,7 +1936,7 @@ version = "0.0.0"
 
 [[package]]
 name = "laurel-steam"
-version = "0.1.0-rc.16"
+version = "0.1.0-rc.17"
 dependencies = [
  "serde_json",
  "windows",

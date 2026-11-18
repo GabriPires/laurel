@@ -44,7 +44,12 @@
 //! The health watch (health.rs) ends the engine with its own exit code when the
 //! graphics device is lost (60), the replay buffer gets no video (61) or the GPU to
 //! render on changed (62); `simulate` and the `simulateHealth` request fake the first
-//! two, for tests.
+//! two, for tests. The request watch (hang.rs) writes the stack of every thread when
+//! a request of the app runs for 40 s; the `simulateHang` request holds the request
+//! thread for a given time, for tests, and `ping` is the light request the app
+//! sends after a clip request expired (A38). While the replay buffer records, the
+//! frame watch (frames.rs) writes a line for each minute in which the encoder
+//! skipped more than 5% of the frames, and one when it is back at 5% or less (A37).
 //!
 //! libobs and its plugins come from Laurel's own OBS runtime, staged by
 //! tools/obs-runtime.py: the engine runs from `<runtime>\bin\64bit`, next to obs.dll.
@@ -61,7 +66,9 @@ macro_rules! log {
 }
 
 mod crash;
+mod frames;
 mod gpu;
+mod hang;
 mod health;
 mod hook_stop;
 mod obs;
@@ -590,7 +597,9 @@ fn run(args: Args) -> Result<i32, String> {
                 "screenshotsDir": dirs.screenshots,
             }),
         );
-        let problem = serve_app(&obs, &mut rec, &args, &dirs, events);
+        let request_watch = hang::start();
+        let problem = serve_app(&obs, &mut rec, &args, &dirs, events, &request_watch);
+        request_watch.stop();
         return Ok(finish(watch, rec, problem));
     }
 
@@ -728,9 +737,9 @@ struct Dirs {
 
 /// Answers the app's requests (see rpc.rs) until it disconnects or asks to quit, or
 /// until the health watch finds a problem, which it returns.
-fn serve_app(obs: &Obs, rec: &mut Recorder, args: &Args, dirs: &Dirs, events: std::sync::mpsc::Receiver<rpc::Event<health::Problem>>) -> Option<health::Problem> {
+fn serve_app(obs: &Obs, rec: &mut Recorder, args: &Args, dirs: &Dirs, events: std::sync::mpsc::Receiver<rpc::Event<health::Problem>>, request_watch: &hang::Watch) -> Option<health::Problem> {
     let mut target = args.capture_spec.clone();
-    rpc::serve(events, |method, params| {
+    rpc::serve(events, request_watch, |method, params| {
         let result = match method {
             "status" => {
                 let s = obs.stats();
@@ -779,6 +788,18 @@ fn serve_app(obs: &Obs, rec: &mut Recorder, args: &Args, dirs: &Dirs, events: st
                 let problem = params.get("problem").and_then(Value::as_str).unwrap_or_default();
                 health::simulate(problem).map(|_| json!({ "simulated": problem }))
             }
+            // A38: the app's light request after a clip request expired, answered as
+            // soon as the request thread is free.
+            "ping" => Ok(json!({})),
+            // A38: the self-test holds the request thread, as the stuck save did:
+            // 60 s unless told, and never past 10 min, so that a test cannot leave
+            // an engine that no longer answers for longer.
+            "simulateHang" => {
+                let secs = params.get("secs").and_then(Value::as_u64).unwrap_or(60).min(600);
+                log!("[laurel] simulating a stuck request: holding the request thread for {secs} s");
+                std::thread::sleep(Duration::from_secs(secs));
+                Ok(json!({ "held": secs }))
+            }
             "setMicrophone" => {
                 // Spec audio.mic: the switch and the device apply without a restart, and
                 // so does the noise suppression (audio.mic-processing).
@@ -808,8 +829,14 @@ fn serve_app(obs: &Obs, rec: &mut Recorder, args: &Args, dirs: &Dirs, events: st
                     let save_ms = t.elapsed().as_millis() as u64;
                     let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
                     let thumb = dirs.thumbnails.join(format!("{stem}.png"));
+                    // A38: the steps of a save, to see where a stuck one stopped.
+                    log!("[laurel] clip: thumbnail started");
+                    let started = Instant::now();
                     let thumbnail = match rec.screenshot(&thumb, thumbnail_size(rec.output_size()), Duration::from_secs(5)) {
-                        Ok(_) => Some(thumb),
+                        Ok(_) => {
+                            log!("[laurel] clip: thumbnail done in {} ms", started.elapsed().as_millis());
+                            Some(thumb)
+                        }
                         Err(e) => {
                             log!("[laurel] thumbnail failed: {e}");
                             None

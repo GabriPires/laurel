@@ -6,7 +6,8 @@
 //! game and enough disk space are all needed; with recording off nothing is
 //! captured or hooked.
 //! A game is captured by its hook, or by its window when the hook does not start
-//! (spec capture.game-hook). With the screen recording option (capture.screen, off
+//! (spec capture.game-hook); a window-only game of the curated list (A39: Roblox)
+//! by its window from the start, with no hook check and no hook retries. With the screen recording option (capture.screen, off
 //! by default per D13), a monitor is recorded while no game is open, or always when
 //! the switch to games is off.
 //!
@@ -20,7 +21,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::engine::Engine;
-use crate::games::{self, Catalog, GameId, Verdict};
+use crate::games::{self, Capture, Catalog, Curated, GameId, Verdict};
 use laurel_app_core::stores::{self, Report};
 use crate::i18n::t;
 use crate::log::log;
@@ -112,6 +113,9 @@ pub struct Active {
     pub hwnd: isize,
     pub title: String,
     pub class: String,
+    /// By its hook (with the window fallback) or, for a window-only game, by its
+    /// window.
+    pub capture: Capture,
 }
 
 impl Active {
@@ -159,7 +163,8 @@ struct State {
     /// to open the process every 2 s, until Laurel runs as administrator, the game
     /// closes or its window moves to another process.
     parked: Option<u32>,
-    /// The game recorded through its window because its hook did not start.
+    /// The game recorded through its window because its hook did not start (a
+    /// window-only game never is: see Active::capture).
     fallback: Option<String>,
     /// The tries of the fallback game's hook.
     retry: Option<Retry>,
@@ -169,6 +174,9 @@ struct State {
 pub struct Detector {
     app: AppHandle,
     store: Arc<Store>,
+    /// The curated list the catalog is built from: the shipped one, except while
+    /// the self-test uses its own.
+    curated: Mutex<Curated>,
     catalog: RwLock<Catalog>,
     /// What the last scan of each store saw; a store's line is logged again only
     /// when it changes (A32).
@@ -186,7 +194,8 @@ pub struct Detector {
 
 impl Detector {
     pub fn new(app: AppHandle, store: Arc<Store>, mode: Mode) -> Arc<Detector> {
-        let (catalog, reports) = games::scan();
+        let curated = Curated::shipped();
+        let (catalog, reports) = games::scan(curated.clone());
         let settings = store.get();
         let enabled = settings.recording_enabled;
         let screen = screen_of(&settings);
@@ -197,6 +206,7 @@ impl Detector {
         Arc::new(Detector {
             app,
             store,
+            curated: Mutex::new(curated),
             catalog: RwLock::new(catalog),
             store_reports: Mutex::new(reports),
             state: Mutex::new(State { mode, enabled, current: None, missing: 0, focus: None, disk_paused: false, applied: None, applied_pid: None, moved: None, kept: None, capture_started: None, hook_checked: None, needs_admin: None, parked: None, fallback: None, retry: None, screen }),
@@ -240,7 +250,8 @@ impl Detector {
     }
 
     pub fn rescan(&self) {
-        let (catalog, reports) = games::scan();
+        let curated = self.curated.lock().unwrap().clone();
+        let (catalog, reports) = games::scan(curated);
         {
             let mut before = self.store_reports.lock().unwrap();
             for report in stores::changed(&before, &reports) {
@@ -257,6 +268,13 @@ impl Detector {
 
     pub fn catalog(&self) -> std::sync::RwLockReadGuard<'_, Catalog> {
         self.catalog.read().unwrap()
+    }
+
+    /// Builds the catalog from another curated list (self-test: a window-only game
+    /// it can open), or from the shipped one again.
+    pub fn set_curated(&self, curated: Curated) {
+        *self.curated.lock().unwrap() = curated;
+        self.rescan();
     }
 
     pub fn mode(&self) -> Mode {
@@ -397,7 +415,8 @@ impl Detector {
             }
             let Some(path) = paths.entry(pid).or_insert_with(|| win::process_path(pid)).clone() else { continue };
             let Verdict::Game(id) = catalog.classify_window(&path, &class, &title, || win::process_command_line(pid), &settings.user_games()) else { continue };
-            let active = Active { id, path, pid, hwnd, title, class };
+            let capture = catalog.capture(&path);
+            let active = Active { id, path, pid, hwnd, title, class, capture };
             match found.iter_mut().find(|a| a.id.key == active.id.key) {
                 Some(existing) if hwnd == foreground => *existing = active,
                 Some(_) => {}
@@ -517,7 +536,7 @@ impl Detector {
                 s.moved = None;
                 s.kept = None;
             }
-            if let Some(game) = started.as_ref().filter(|_| self.test_fallback) {
+            if let Some(game) = started.as_ref().filter(|g| self.test_fallback && g.capture == Capture::Hook) {
                 s.hook_checked = Some(game.id.key.clone());
                 s.fallback = Some(game.id.key.clone());
                 s.retry = Some(Retry::after_fallback());
@@ -532,6 +551,9 @@ impl Detector {
         }
         if let Some(game) = &started {
             log!("game found: {} [{}] {} pid {} window {:?}", game.id.name, game.id.key, game.path, game.pid, game.title);
+            if game.capture == Capture::Window {
+                log!("capture: {} is a window-only game: recorded by its window, with no game hook", game.id.name);
+            }
         }
         if renamed && started.is_none() && ended.is_none() {
             let _ = self.app.emit("game-state", self.snapshot());
@@ -586,7 +608,10 @@ impl Detector {
             log!("capture: {} moved to {} (pid {}) after its hook started; capture kept", game.id.name, game.exe(), game.pid);
             return;
         }
-        log!("capture: {} moved to {} (pid {}) before its hook started; the capture follows it", game.id.name, game.exe(), game.pid);
+        match game.capture {
+            Capture::Hook => log!("capture: {} moved to {} (pid {}) before its hook started; the capture follows it", game.id.name, game.exe(), game.pid),
+            Capture::Window => log!("capture: {} moved to {} (pid {}); its window capture follows it", game.id.name, game.exe(), game.pid),
+        }
         self.apply();
         let _ = self.app.emit("game-state", self.snapshot());
     }
@@ -800,7 +825,7 @@ fn wanted(s: &State) -> (String, bool) {
                 // player records it without a game.
                 (Some(game), Some(screen)) if s.parked == Some(game.pid) => (screen.target(), !s.disk_paused),
                 (Some(game), None) if s.parked == Some(game.pid) => ("none".into(), false),
-                (Some(game), _) if s.fallback.as_deref() == Some(game.id.key.as_str()) => (format!("window:{}", game.spec()), !s.disk_paused),
+                (Some(game), _) if game.capture == Capture::Window || s.fallback.as_deref() == Some(game.id.key.as_str()) => (format!("window:{}", game.spec()), !s.disk_paused),
                 (Some(game), _) => (format!("game:{}", game.spec()), !s.disk_paused),
                 (None, Some(screen)) => (screen.target(), !s.disk_paused),
                 (None, None) => ("none".into(), false),

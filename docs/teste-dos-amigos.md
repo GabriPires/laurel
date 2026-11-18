@@ -4,6 +4,14 @@ O Laurel guarda os últimos segundos do jogo que você está jogando e salva um 
 
 Esta é uma versão de teste. Ela pode ter erros, e é exatamente isso que queremos achar com a sua ajuda.
 
+## O que mudou na 0.1.0-rc.17
+
+Esta versão corrige o que o último pacote de logs mostrou. Obrigado a quem mandou!
+
+- **Roblox:** o Laurel agora grava o Roblox pela janela desde o começo. Antes, cada vez que você abria o Roblox ou voltava para ele, os primeiros 16 segundos ficavam sem imagem, enquanto o Laurel tentava entrar no jogo sem conseguir. No Windows 10, a borda amarela em volta do Roblox continua, como antes.
+- **Gravador travado:** nos logs de um de vocês, o gravador parou de responder logo depois de salvar um clipe, e nenhum clipe saiu por 6 minutos. Agora, se um clipe não sai em 40 segundos e o gravador não responde, o Laurel reinicia o gravador sozinho e avisa na tela: **O gravador travou e foi reiniciado; os últimos minutos se perderam.** Se esse aviso aparecer, **mande os logs**: eles agora dizem onde o gravador travou.
+- **Quadros perdidos:** o Laurel passou a anotar nos logs, minuto a minuto, quando o gravador perde muitos quadros enquanto grava, como aconteceu no Minecraft de um de vocês. Se algum clipe sair travado ou picotado, **mande os logs** (**Configurações > Avançado > Salvar logs para enviar**) e diga de qual jogo era.
+
 ## O que mudou na 0.1.0-rc.16
 
 Esta versão traz correções que vieram dos logs de vocês e um pedido do dono do projeto.
