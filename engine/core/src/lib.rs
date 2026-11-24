@@ -6,5 +6,8 @@
 //! The tests live in `tests/` and never in `src/`: the public repository gets this
 //! crate without them.
 
+pub mod encoders;
 pub mod frames;
+pub mod hook_stop;
+pub mod obs_lines;
 pub mod requests;

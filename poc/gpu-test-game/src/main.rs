@@ -6,7 +6,7 @@
 //!
 //! Usage: gpu-test-game [--adapter hardware|warp|N] [--seconds S] [--color RRGGBB]
 //!                      [--size WxH] [--title TEXT] [--first-frame-after S]
-//!                      [--pause-at S --pause-for D] [--busy-for S]
+//!                      [--pause-at S --pause-for D [--drop-swap-chain]] [--busy-for S]
 //!   --adapter   hardware: the default GPU (default); warp: the software renderer;
 //!               N: the DXGI adapter with that index (IDXGIFactory1::EnumAdapters1)
 //!   --seconds   how long to run (default 60); closing the window also ends it
@@ -25,6 +25,12 @@
 //!               visible and answering its messages, as a minimized game during an
 //!               engine restart (A26 and A34 of the stability tests); the pause
 //!               counts toward --seconds
+//!   --drop-swap-chain
+//!               with --pause-at: release the swap chain when the pause starts and
+//!               create a new one when drawing resumes; OBS's hook frees its capture
+//!               when the swap chain it captures is destroyed ("d3d11 capture
+//!               freed"), as a game that leaves fullscreen or recreates its swap
+//!               chain (A36 of the stability tests); takes no value
 //!   --busy-for  show the window, then read none of its messages for S seconds
 //!               (fractions allowed; default 0), as a game busy loading: the
 //!               helper of OBS's compatibility hook gets the hook in only through
@@ -44,7 +50,7 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, CreateDXGIFactory2, IDXGIDevice, IDXGIFactory1, IDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_PRESENT, DXGI_SWAP_CHAIN_DESC1,
-    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGISwapChain1,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -65,6 +71,8 @@ struct Options {
     first_frame_after: Duration,
     /// When drawing stops, from the window being shown, and for how long.
     pause: Option<(Duration, Duration)>,
+    /// The pause releases the swap chain, and drawing again creates a new one.
+    drop_swap_chain: bool,
     busy_for: Duration,
 }
 
@@ -82,11 +90,16 @@ fn options() -> Options {
         title: "Laurel GPU test game".into(),
         first_frame_after: Duration::ZERO,
         pause: None,
+        drop_swap_chain: false,
         busy_for: Duration::ZERO,
     };
     let (mut pause_at, mut pause_for) = (None, None);
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
+        if flag == "--drop-swap-chain" {
+            o.drop_swap_chain = true;
+            continue;
+        }
         let value = args.next().unwrap_or_else(|| panic!("{flag} needs a value"));
         match flag.as_str() {
             "--adapter" => o.adapter = value,
@@ -113,6 +126,9 @@ fn options() -> Options {
         (Some(_), Some(_)) => panic!("--pause-at must come after the first frame (--first-frame-after)"),
         _ => panic!("--pause-at and --pause-for go together"),
     };
+    if o.drop_swap_chain && o.pause.is_none() {
+        panic!("--drop-swap-chain needs --pause-at and --pause-for");
+    }
     o
 }
 
@@ -255,11 +271,15 @@ fn main() -> Result<()> {
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
         ..Default::default()
     };
-    let swapchain = unsafe { factory.CreateSwapChainForHwnd(&device, hwnd, &chain_desc, None, None)? };
-    let buffer: ID3D11Texture2D = unsafe { swapchain.GetBuffer(0)? };
-    let mut target: Option<ID3D11RenderTargetView> = None;
-    unsafe { device.CreateRenderTargetView(&buffer, None, Some(&mut target))? };
-    let target = target.expect("no render target");
+    // A swap chain on the window and the render target on its back buffer.
+    let new_chain = || -> Result<(IDXGISwapChain1, ID3D11RenderTargetView)> {
+        let swapchain = unsafe { factory.CreateSwapChainForHwnd(&device, hwnd, &chain_desc, None, None)? };
+        let buffer: ID3D11Texture2D = unsafe { swapchain.GetBuffer(0)? };
+        let mut target: Option<ID3D11RenderTargetView> = None;
+        unsafe { device.CreateRenderTargetView(&buffer, None, Some(&mut target))? };
+        Ok((swapchain, target.expect("no render target")))
+    };
+    let mut chain = Some(new_chain()?);
 
     // With a late first frame or a busy start the run time counts from the window, so that the wait is part of it.
     let end = if late || busy { shown } else { Instant::now() } + run;
@@ -272,14 +292,30 @@ fn main() -> Result<()> {
             println!("{} [gpu-test-game] drawing paused for {} s after {frames} frames", clock(), length.as_secs_f64());
             // Counted from the moment drawing stopped, which a first frame later than --pause-at delays.
             let resume = Instant::now() + length;
+            if o.drop_swap_chain {
+                // The context still holds the render target, and Direct3D 11 destroys
+                // objects only once it flushes: unbind, then flush, so that the swap
+                // chain is gone and OBS's hook frees its capture now.
+                chain = None;
+                unsafe {
+                    context.ClearState();
+                    context.Flush();
+                }
+                println!("{} [gpu-test-game] swap chain released", clock());
+            }
             if !idle(resume.min(end)) {
                 break 'run;
             }
             if resume < end {
+                if chain.is_none() {
+                    chain = Some(new_chain()?);
+                    println!("{} [gpu-test-game] swap chain created", clock());
+                }
                 println!("{} [gpu-test-game] drawing resumed", clock());
             }
             continue;
         }
+        let Some((swapchain, target)) = chain.as_ref() else { break 'run };
         unsafe {
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                 if msg.message == WM_QUIT {
@@ -289,7 +325,7 @@ fn main() -> Result<()> {
                 DispatchMessageW(&msg);
             }
             context.OMSetRenderTargets(Some(&[Some(target.clone())]), None);
-            context.ClearRenderTargetView(&target, &o.color);
+            context.ClearRenderTargetView(target, &o.color);
             swapchain.Present(1, DXGI_PRESENT(0)).ok()?;
         }
         frames += 1;

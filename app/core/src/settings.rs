@@ -18,9 +18,9 @@ use std::sync::Mutex;
 
 use serde_json::{json, Value};
 
-pub use laurel_app_core::games::{CustomGame, IgnoredGame};
-use laurel_app_core::games::UserGames;
-use laurel_app_core::hotkeys::{self, Replaced, Stored};
+pub use crate::games::{CustomGame, IgnoredGame};
+use crate::games::UserGames;
+use crate::hotkeys::{self, Replaced, Stored};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
@@ -100,6 +100,8 @@ pub const DEFAULT_HOTKEY_CLIP: &str = "F8";
 pub const DEFAULT_HOTKEY_SCREENSHOT: &str = "Shift+F8";
 /// The choices for `deleted_days`, decided by the owner on 2026-10-25.
 pub const DELETED_DAYS: [u32; 4] = [1, 7, 15, 30];
+/// The values of the language setting; "system" follows Windows (the app's i18n.rs).
+pub const LANGUAGES: &[&str] = &["system", "en", "pt-BR"];
 
 impl Default for Settings {
     fn default() -> Settings {
@@ -207,7 +209,7 @@ impl Settings {
             mic_device: Some(text("micDevice", &d.mic_device)).filter(|s| !s.is_empty()).unwrap_or(d.mic_device),
             mic_noise: choice("micNoise", &["off", "speex", "rnnoise"], &d.mic_noise),
             check_updates: flag("checkUpdates", d.check_updates),
-            language: choice("language", crate::i18n::LANGUAGES, &d.language),
+            language: choice("language", LANGUAGES, &d.language),
             auto_clip: flag("autoClip", d.auto_clip),
             steam_achievements: flag("steamAchievements", d.steam_achievements),
             steam_any: flag("steamAny", d.steam_any),

@@ -4,6 +4,18 @@ O Laurel guarda os últimos segundos do jogo que você está jogando e salva um 
 
 Esta é uma versão de teste. Ela pode ter erros, e é exatamente isso que queremos achar com a sua ajuda.
 
+## O que mudou na 0.1.0-rc.18
+
+- **Etiquetas:** agora dá para pôr etiquetas nos clipes e nas capturas de tela, para achá-los depois. São 12 prontas (MVP, Clutch, Kill, Multikill, Vitória, Sorte, Engraçado, Vacilo, Susto, Bug, Paisagem e Pra montagem), e você cria as suas digitando um nome novo.
+  - No visualizador, use **+ Etiqueta** ou a tecla **T**.
+  - Para vários itens de uma vez, selecione-os e use **Etiquetas** na barra de seleção.
+  - O painel lateral da biblioteca filtra por etiqueta, e a busca acha um clipe pelo nome da etiqueta.
+  - As suas etiquetas são renomeadas e apagadas em **Configurações > Biblioteca > Etiquetas**.
+  - O corte leva as etiquetas para a cópia.
+- **Voltar a um jogo:** quando você trocava de um jogo para outro e voltava ao primeiro, o Laurel às vezes passava quase um minuto sem entrar no jogo de novo, com uns segundos sem imagem e depois gravando pela janela. Agora ele volta a gravar o jogo direto.
+- **Clipe danificado:** um vídeo danificado na pasta do Laurel podia travar ou fechar a leitura da biblioteca. Agora ele é lido só até onde dá.
+- **Logs:** em alguns logs com certas letras, como o İ turco, o nome do seu usuário do Windows ficava à mostra no pacote de logs. Agora ele é sempre escondido.
+
 ## O que mudou na 0.1.0-rc.17
 
 Esta versão corrige o que o último pacote de logs mostrou. Obrigado a quem mandou!
@@ -168,6 +180,7 @@ Não precisa fazer tudo. O que você conseguir já ajuda muito.
 10. **Iniciar com o Windows:** depois de reiniciar o PC, o Laurel abriu sozinho na bandeja e gravou o jogo?
 11. **Atualização:** quando sair uma versão de teste nova, o Laurel vai oferecer a atualização sozinho. Diga se funcionou.
 12. **Conquistas da Steam:** jogando um jogo da Steam, desbloqueie uma conquista. Se ela for comum, ligue antes **Configurações > Clipes automáticos > Qualquer conquista**. O clipe apareceu uns 15 segundos depois, com o troféu na biblioteca? Tocou o som? Em **Clipes automáticos**, a linha de estado mostrou o jogo e as conquistas? Em jogos com anti-cheat, notou algo diferente? Mande o **app.log** se algo não sair.
+13. **Etiquetas:** ponha etiquetas em alguns clipes, no visualizador e em vários de uma vez pela barra de seleção. O filtro do painel lateral e a busca acharam os clipes? Crie uma etiqueta sua, renomeie e apague em **Configurações > Biblioteca > Etiquetas**: o nome novo apareceu em todo lugar? Algum nome ficou cortado de um jeito estranho no cartão?
 
 ## Como relatar um problema
 

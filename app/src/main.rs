@@ -9,8 +9,6 @@
 //! LAUREL_CAPTURE (a fixed target instead of game detection), LAUREL_OVERLAY_CAPTURABLE=1 (overlay visible to capture),
 //! LAUREL_FFMPEG (ffmpeg.exe), LAUREL_START_VIEW (library | clips | screenshots | settings[:<page>]).
 #![windows_subsystem = "windows"]
-// The settings JSON (settings.rs) has more fields than json! expands by default.
-#![recursion_limit = "256"]
 
 mod detect;
 mod engine;
@@ -20,16 +18,16 @@ mod i18n;
 mod library;
 mod log;
 mod media;
-mod mp4;
 mod overlay;
-mod settings;
 mod share;
 mod sound;
 mod steam;
 mod storage;
 mod tray_icons;
 mod updates;
-mod win;
+
+use laurel_app_win as win;
+use laurel_app_core::{mp4, settings};
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -942,9 +940,9 @@ async fn change_folder(app: AppHandle, folder: String, move_items: bool) -> Resu
         if !new.is_absolute() {
             return Err(t!("Choose a full folder path"));
         }
-        Storage::check_writable(&new)?;
+        storage::check_writable(&new)?;
         let old = storage.folder();
-        let (moved, failed) = if move_items && old != new { Storage::move_items(&library, &old, &new) } else { (0, Vec::new()) };
+        let (moved, failed) = if move_items && old != new { storage::move_items(&library, &old, &new) } else { (0, Vec::new()) };
         let mut settings = store.get();
         settings.folder = new.display().to_string();
         store.set(settings).map_err(|e| e.to_string())?;
@@ -973,28 +971,31 @@ fn library_changed(app: &AppHandle) {
     let _ = app.emit("storage-state", app.state::<Arc<Storage>>().state(&app.state::<Arc<Library>>()));
 }
 
-/// Runs `action` on each path off the main thread: the results that worked, and
-/// the paths that failed with why.
+/// Runs `action` on each path off the main thread, as [`item_results`] gives them.
 async fn for_each_item(paths: Vec<String>, action: impl Fn(&str) -> Result<Value, String> + Send + 'static) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let (mut items, mut failed) = (Vec::new(), Vec::new());
-        for path in paths {
-            match action(&path) {
-                Ok(item) => items.push(item),
-                Err(e) => {
-                    // Some errors already start with the path; the player sees the file name.
-                    let full = share::windows_path(&path);
-                    let reason = e.strip_prefix(&format!("{full}: ")).unwrap_or(&e);
-                    log!("{full}: {reason}");
-                    let name = std::path::Path::new(&full).file_name().map_or(full.clone(), |n| n.to_string_lossy().into_owned());
-                    failed.push(format!("{name}: {reason}"));
-                }
+    tauri::async_runtime::spawn_blocking(move || item_results(paths.into_iter().map(|path| (action(&path), path))))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// An action's result on each path: the items it gave, and the paths that failed
+/// with why.
+fn item_results(results: impl IntoIterator<Item = (Result<Value, String>, String)>) -> Value {
+    let (mut items, mut failed) = (Vec::new(), Vec::new());
+    for (result, path) in results {
+        match result {
+            Ok(item) => items.push(item),
+            Err(e) => {
+                // Some errors already start with the path; the player sees the file name.
+                let full = laurel_app_core::library::native_path(&path);
+                let reason = e.strip_prefix(&format!("{full}: ")).unwrap_or(&e);
+                log!("{full}: {reason}");
+                let name = std::path::Path::new(&full).file_name().map_or(full.clone(), |n| n.to_string_lossy().into_owned());
+                failed.push(format!("{name}: {reason}"));
             }
         }
-        json!({ "items": items, "failed": failed })
-    })
-    .await
-    .map_err(|e| e.to_string())
+    }
+    json!({ "items": items, "failed": failed })
 }
 
 /// Marks items to keep, or not (spec storage.limits).
@@ -1004,6 +1005,81 @@ async fn library_keep(app: AppHandle, paths: Vec<String>, kept: bool) -> Result<
     let result = for_each_item(paths, move |path| library.set_kept(path, kept)).await?;
     let _ = app.emit("library-changed", Value::Null);
     Ok(result)
+}
+
+/// Puts a tag on items, or takes it off (spec library.tags).
+#[tauri::command]
+async fn library_tag(app: AppHandle, paths: Vec<String>, tag: String, on: bool) -> Result<Value, String> {
+    let library = app.state::<Arc<Library>>().inner().clone();
+    let result = for_each_item(paths, move |path| library.set_tag(path, &tag, on)).await?;
+    let _ = app.emit("library-changed", Value::Null);
+    Ok(result)
+}
+
+/// Creates a custom tag with the name the user typed and puts it on items, none
+/// or more (spec library.tags): the tag, and the items as `library_tag` gives them.
+#[tauri::command]
+async fn library_tag_create(app: AppHandle, name: String, paths: Vec<String>) -> Result<Value, String> {
+    let library = app.state::<Arc<Library>>().inner().clone();
+    let creator = library.clone();
+    let tag = tauri::async_runtime::spawn_blocking(move || library::create_tag(&creator, &name)).await.map_err(|e| e.to_string())??;
+    let id = tag.id.clone();
+    let mut result = for_each_item(paths, move |path| library.set_tag(path, &id, true)).await?;
+    result["tag"] = json!({ "id": tag.id, "name": tag.name });
+    let _ = app.emit("library-changed", Value::Null);
+    Ok(result)
+}
+
+/// Renames a custom tag (spec library.tags, the Settings › Tags page): the tag as
+/// `{ id, name }`. Its items keep it, so the name changes everywhere at once.
+#[tauri::command]
+async fn library_tag_rename(app: AppHandle, id: String, name: String) -> Result<Value, String> {
+    let library = app.state::<Arc<Library>>().inner().clone();
+    let tag = tauri::async_runtime::spawn_blocking(move || library::rename_tag(&library, &id, &name)).await.map_err(|e| e.to_string())??;
+    let _ = app.emit("library-changed", Value::Null);
+    Ok(json!({ "id": tag.id, "name": tag.name }))
+}
+
+/// Deletes a custom tag (spec library.tags, the Settings › Tags page) and takes it
+/// off every item, those in Recently deleted too.
+#[tauri::command]
+async fn library_tag_delete(app: AppHandle, id: String) -> Result<(), String> {
+    let library = app.state::<Arc<Library>>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || library::delete_tag(&library, &id)).await.map_err(|e| e.to_string())??;
+    let _ = app.emit("library-changed", Value::Null);
+    Ok(())
+}
+
+/// How many of the items selected in the library have each tag (spec library.tags),
+/// for the selection bar's picker: `{"kill": "some", "funny": "all", "mvp": "none"}`.
+#[tauri::command]
+async fn library_tag_states(library: tauri::State<'_, Arc<Library>>, paths: Vec<String>) -> Result<Value, String> {
+    let library = library.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || library::tag_states(&library, &paths)).await.map_err(|e| e.to_string())?
+}
+
+/// A click on a tag in the selection bar's picker (spec library.tags), which the
+/// index decides from the selected items' states at that moment: the items as
+/// `library_tag` gives them, and the states the change leaves.
+#[tauri::command]
+async fn library_tag_click(app: AppHandle, paths: Vec<String>, tag: String) -> Result<Value, String> {
+    let library = app.state::<Arc<Library>>().inner().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let items = library.click_tag(&paths, &tag)?;
+        let mut result = item_results(items.into_iter().zip(paths.iter().cloned()));
+        result["states"] = library::tag_states(&library, &paths)?;
+        Ok(result)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let _ = app.emit("library-changed", Value::Null);
+    Ok(result)
+}
+
+/// The picker's groups and every tag, the standard ones in the interface's language.
+#[tauri::command]
+fn library_tags(library: tauri::State<'_, Arc<Library>>) -> Result<Value, String> {
+    library::tag_catalog(&library)
 }
 
 /// Shows a sample notice of the given kind, with its sound.
@@ -1028,6 +1104,13 @@ async fn library_list(library: tauri::State<'_, Arc<Library>>, kind: Option<Stri
 #[tauri::command]
 fn library_games(library: tauri::State<'_, Arc<Library>>, kind: Option<String>) -> Result<Vec<String>, String> {
     library.games(kind.as_deref())
+}
+
+/// Each tag in use with how many items have it, outside Recently deleted and in it
+/// (spec library.tags): `{"funny": {"items": 2, "deleted": 1}}`.
+#[tauri::command]
+fn library_tag_counts(library: tauri::State<'_, Arc<Library>>) -> Result<Value, String> {
+    library.tag_counts()
 }
 
 #[tauri::command]
@@ -1133,7 +1216,7 @@ fn watch_deleted(app: AppHandle) {
 fn share_action(action: String, path: String) -> Result<(), String> {
     match action.as_str() {
         "copy-file" => share::copy_file(&path),
-        "copy-path" => share::copy_text(&share::windows_path(&path)),
+        "copy-path" => share::copy_text(&laurel_app_core::library::native_path(&path)),
         "show" => share::show_in_folder(&path),
         "open" => share::open(&path),
         other => Err(format!("unknown action {other}")),
@@ -1204,15 +1287,6 @@ async fn logs_export(app: AppHandle) -> Result<String, String> {
     .map_err(|e| e.to_string())?
 }
 
-/// The registry's ProductName still says Windows 10 on Windows 11, whose builds
-/// start at 22000 (stability tests, finding A6).
-fn windows_name(product: &str, build: &str) -> String {
-    match product.strip_prefix("Windows 10") {
-        Some(edition) if build.parse::<u32>().is_ok_and(|b| b >= 22000) => format!("Windows 11{edition}"),
-        _ => product.to_string(),
-    }
-}
-
 fn export_logs(app: &AppHandle, dir: &std::path::Path) -> Result<PathBuf, String> {
     let (date, time) = win::date_time();
     let dest = storage::unique(dir, &format!("Laurel logs {date} {time}"), "zip");
@@ -1221,7 +1295,7 @@ fn export_logs(app: &AppHandle, dir: &std::path::Path) -> Result<PathBuf, String
     let info = format!(
         "Laurel {}\nWindows: {} {} (build {})\nSaved: {date} {time}\nAdministrator: {}\n\nEngine:\n{}\n\nMicrophone:\n{}\n\nGame:\n{}\n\nSteam achievements:\n{}\n\nSettings:\n{}\n",
         app.package_info().version,
-        windows_name(&windows("ProductName"), &build),
+        laurel_app_core::log::windows_name(&windows("ProductName"), &build),
         windows("DisplayVersion"),
         build,
         win::self_elevated(),
@@ -1441,7 +1515,7 @@ fn selftest(app: AppHandle) {
     i18n::set("en");
     let run = || -> Result<(), String> {
         wait_ready("at start")?;
-        check_log_rotation()?;
+        check_windows_name()?;
         check_player_stats(&app)?;
         check_single_instance(&app)?;
         check_language()?;
@@ -1802,9 +1876,10 @@ fn check_language() -> Result<(), String> {
 
 /// Self-test of game detection (specs game.detection, game.manual-add): a program
 /// inside the first installed game's folder on this PC is that game, and an ignored
-/// game is ignored (the fixed rules are tests of laurel-app-core). Then, with
-/// detection on, a PowerShell window added as a game is found, recording runs, a
-/// clip carries the game's name, and recording pauses after the window closes.
+/// game is ignored. Then, with detection on, a PowerShell window added as a game is
+/// found, recording runs, a clip carries the game's name, and recording pauses
+/// after the window closes. The rules of classification and detection, timings
+/// included, are tests of laurel-app-core; this checks them on the real PC.
 fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
     use games::Verdict;
     let detector = app.state::<Arc<Detector>>().inner().clone();
@@ -1828,7 +1903,8 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
 
     // A27: a program added by hand is named after its version resource, not its
     // window title (a music player's is the song); a program that runs others keeps
-    // the title. A hooked game keeps the capture longer when another one has focus.
+    // the title. (How long a hooked game keeps the capture is a test of
+    // laurel-app-core.)
     {
         let own = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
         let shell = powershell().to_string_lossy().into_owned();
@@ -1836,10 +1912,9 @@ fn check_games(app: &AppHandle, engine: &Engine) -> Result<(), String> {
         let described = win::file_description(&own);
         let own_name = default_game_name(&own, Some(title));
         let shell_name = default_game_name(&shell, Some(title));
-        let focus = (detect::focus_scans_needed(false), detect::focus_scans_needed(true));
-        log!("[selftest] added-game names: this program's resource {described:?}, named {own_name:?}; powershell.exe named {shell_name:?}; focus scans to take over: {focus:?}");
-        if described.is_none() || own_name == title || shell_name != title || focus != (2, 15) {
-            return Err("added-game names or focus scans went wrong".into());
+        log!("[selftest] added-game names: this program's resource {described:?}, named {own_name:?}; powershell.exe named {shell_name:?}");
+        if described.is_none() || own_name == title || shell_name != title {
+            return Err("added-game names went wrong".into());
         }
     }
 
@@ -2259,8 +2334,6 @@ fn check_toggle_and_cursor(app: &AppHandle, engine: &Engine) -> Result<(), Strin
     outcome
 }
 
-/// Self-test of the log rotation: a log over its limit moves to `.old.log` and starts
-/// again, so it stays within twice the limit, and a fresh open keeps the previous one.
 /// Self-test of the single instance: a second start of the program (as a probe)
 /// finds this one running and asks it to show its window, which then shows.
 fn check_single_instance(app: &AppHandle) -> Result<(), String> {
@@ -2304,58 +2377,15 @@ fn check_player_stats(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-fn check_log_rotation() -> Result<(), String> {
-    let dir = std::env::temp_dir().join("laurel-selftest-logs");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join("test.log");
-    let mut log = log::Rotating::open(&path, 0, 10_000);
-    for i in 0..300 {
-        log.line(&format!("{i:04} {}", "x".repeat(94)));
-    }
-    drop(log);
-    let size = |p: &std::path::Path| std::fs::metadata(p).map_or(0, |m| m.len());
-    let (current, old) = (size(&path), size(&log::Rotating::old_path(&path)));
-    let last = std::fs::read_to_string(&path).unwrap_or_default().lines().last().unwrap_or_default().chars().take(4).collect::<String>();
-    // Three new sessions keeping two: the first one ends up in .2, the one after in .1.
-    drop(log::Rotating::open(&path, 2, 10_000));
-    let mut second = log::Rotating::open(&path, 2, 10_000);
-    second.line("second session");
-    drop(second);
-    drop(log::Rotating::open(&path, 2, 10_000));
-    let (fresh, one, two, three) = (size(&path), std::fs::read_to_string(log::Rotating::session_path(&path, 1)).unwrap_or_default(), size(&log::Rotating::session_path(&path, 2)), log::Rotating::session_path(&path, 3).exists());
-    log!("[selftest] log rotation: 30000 bytes written with a 10000-byte limit left {current} + {old} old, last line {last}; three new sessions keeping two left {fresh} bytes, .1 {:?}, .2 {two} bytes, .3 {three}", one.trim());
-    if current > 10_100 || old == 0 || old > 10_100 || last != "0299" || fresh != 0 || one.trim() != "second session" || two != 0 || three {
-        let _ = std::fs::remove_dir_all(&dir);
-        return Err("the log rotation did not behave".into());
-    }
-
-    // The .zip to send: the masked user name, a log, and a readable archive.
-    let user = std::env::var("USERNAME").unwrap_or_default();
-    let masked = log::mask_user(&format!(r"C:\Users\{user}\Videos and C:\\Users\\{user}\\x and C:/Users/{user}/y and C:\Users\{user}x\z"), &user);
-    let wanted = format!(r"C:\Users\{{user}}\Videos and C:\\Users\\{{user}}\\x and C:/Users/{{user}}/y and C:\Users\{user}x\z");
-    log!("[selftest] user name masked: {}", masked == wanted || user.len() < 2);
-    if user.len() >= 2 && masked != wanted {
-        let _ = std::fs::remove_dir_all(&dir);
-        return Err(format!("masking gave {masked}"));
-    }
-    // Left in the temporary folder, to open it with other tools after the run.
-    let zip = std::env::temp_dir().join("laurel-selftest-logs.zip");
-    let files = log::export(&zip, &[("info.txt", format!(r"work dir C:\Users\{user}\AppData"))])?;
-    let bytes = std::fs::read(&zip).map_err(|e| e.to_string())?;
-    let entries = bytes.windows(4).filter(|w| *w == [0x50, 0x4b, 0x01, 0x02]).count();
-    let end_ok = bytes.len() > 22 && bytes[bytes.len() - 22..bytes.len() - 18] == [0x50, 0x4b, 0x05, 0x06];
-    let _ = std::fs::remove_dir_all(&dir);
-    log!("[selftest] logs .zip: {files} files, {entries} central entries, end record {end_ok}, {} bytes", bytes.len());
-    if files < 2 || entries != files || !end_ok {
-        return Err("the logs .zip is not as expected".into());
-    }
-    // info.txt names Windows 11 by its build, whatever the registry's ProductName says.
+/// Self-test of info.txt's Windows name (A6), from this PC's registry; the rule
+/// itself is tested in app/core/tests/log.rs.
+fn check_windows_name() -> Result<(), String> {
     let windows = |name: &str| win::reg_string(win::HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", name).unwrap_or_default();
-    let here = windows_name(&windows("ProductName"), &windows("CurrentBuild"));
-    log!("[selftest] Windows in info.txt: {here} (registry: {}, build {})", windows("ProductName"), windows("CurrentBuild"));
-    if windows_name("Windows 10 Pro", "26200") != "Windows 11 Pro" || windows_name("Windows 10 Pro", "19045") != "Windows 10 Pro" {
-        return Err("the Windows name in info.txt is wrong".into());
+    let (product, build) = (windows("ProductName"), windows("CurrentBuild"));
+    let here = laurel_app_core::log::windows_name(&product, &build);
+    log!("[selftest] Windows in info.txt: {here} (registry: {product}, build {build})");
+    if !here.starts_with("Windows") || build.parse::<u32>().is_err() {
+        return Err("the Windows name or build could not be read".into());
     }
     Ok(())
 }
@@ -2365,30 +2395,21 @@ fn fileish_name(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().unwrap_or(path)
 }
 
-/// Self-test of the library: the saved clip is indexed with its metadata, and a
-/// 0.5 to 3.0 s trim gives a new clip of about that length with every audio track.
+/// Self-test of the library in the app: the saved clip, named after its game, is
+/// indexed; a 0.5 to 3.0 s trim through the app's FFmpeg (the runtime's program, as
+/// the app finds it) gives a clip of about that length with every audio track; and
+/// the trim leaves through Recently deleted for the Windows Recycle Bin, with its
+/// thumbnail. The library's rules are tests of laurel-app-core, and real trims frame
+/// by frame and a clip in use are tests of laurel-app-win.
 fn check_library(app: &AppHandle, saved: &Value) -> Result<(), String> {
     let library = app.state::<Arc<Library>>();
-    let path = saved["path"].as_str().ok_or("saveClip without path")?;
-    // Naming: a game name with characters Windows forbids still gives a valid name.
-    // Without a game the pattern gives the name the engine already chose: it stays.
-    let same = app.state::<Arc<Storage>>().apply_naming(path, None, library.thumbs_dir());
-    log!("[selftest] named without a game: {same}");
-    if fileish_name(&same) != fileish_name(path) {
-        return Err(format!("a clip without a game was renamed to {same}"));
-    }
-    let path = app.state::<Arc<Storage>>().apply_naming(path, Some("Laurel self-test: <a/b>?"), library.thumbs_dir());
+    // The clip's name is the pattern's, given the game, as a saved clip gets it.
+    let path = app.state::<Arc<Storage>>().apply_naming(saved["path"].as_str().ok_or("saveClip without path")?, Some("Laurel self-test"), library.thumbs_dir());
     log!("[selftest] named: {path}");
-    if !std::path::Path::new(&path).exists() || !path.contains("Laurel self-test a b") {
+    if !std::path::Path::new(&path).exists() {
         return Err(format!("naming failed: {path}"));
     }
     let path = path.as_str();
-    // Files indexed without a game (found on disk) take it from their name.
-    for (stem, game) in [("Overwatch® 2026-10-23 20-55-06 (trim 2)", Some("Overwatch®")), ("Laurel 2026-10-23 23-26-49 (2)", None), ("my clip", None)] {
-        if library::game_from_name(stem).as_deref() != game {
-            return Err(format!("game from the name {stem:?}: {:?}", library::game_from_name(stem)));
-        }
-    }
     let item = library.add(path, Some("Laurel self-test".into()))?;
     log!("[selftest] library item: {item}");
     let trimmed = library.trim(path, 0.5, 3.0, false)?;
@@ -2398,119 +2419,16 @@ fn check_library(app: &AppHandle, saved: &Value) -> Result<(), String> {
     if !(2000..=4000).contains(&duration) || tracks != item["audioTracks"].as_i64().unwrap_or(-1) {
         return Err(format!("unexpected trim: {duration} ms, {tracks} audio tracks"));
     }
-    // The new trim (spec edit.trim): keyframes read from the file, the timeline
-    // frames, an exact trim of the chosen length, and a trim of a trim named
-    // "(trim N)" rather than "(trim) (trim)".
-    // Frame accuracy: frames 30 to 89 (exact) and from the second keyframe to frame
-    // 149 (fast) must come out as exactly those frames, the way the viewer snaps
-    // start to a frame's time and end to the end of the last frame kept.
-    let video = library.video_frames(path)?;
-    let frames = library.timeline(path, 12)?;
-    let t = &video.times;
-    if t.len() < 200 || video.keyframes.len() < 2 {
-        return Err(format!("too few frames in the self-test clip: {} frames, {} keyframes", t.len(), video.keyframes.len()));
-    }
-    let frame = t[1] - t[0];
-    let exact = library.trim(path, t[30], t[89] + frame, true)?;
-    let key = video.keyframes[1];
-    let fast = library.trim(path, key, t[149] + frame, false)?;
-    let again = library.trim(trimmed["path"].as_str().unwrap_or_default(), 0.2, 1.5, false)?;
-    let count = |v: &Value| library.video_frames(v["path"].as_str().unwrap_or_default()).map(|f| f.times.len()).unwrap_or(0);
-    let fast_expected = 150 - t.iter().position(|x| (*x - key).abs() < 0.0001).unwrap_or(0);
-    let again_path = again["path"].as_str().unwrap_or_default().to_string();
-    log!(
-        "[selftest] trim: {} frames, {} keyframes {:?}; {} timeline frames on disk; exact trim of 60 frames gave {} ({} audio tracks); fast trim of {fast_expected} frames gave {}; trim of a trim: {again_path}",
-        t.len(),
-        video.keyframes.len(),
-        video.keyframes.iter().take(3).map(|k| format!("{k:.4}")).collect::<Vec<_>>(),
-        frames.iter().filter(|f| f.exists()).count(),
-        count(&exact),
-        exact["audioTracks"],
-        count(&fast)
-    );
-    if frames.iter().filter(|f| f.exists()).count() != 12 || count(&exact) != 60 || count(&fast) != fast_expected || exact["audioTracks"] != item["audioTracks"] || again_path.contains("(trim) (trim)") {
-        return Err("the new trim did not behave".into());
-    }
-    // The exact trim's video rate is capped at the original's (stability tests, A4),
-    // read from the clip's sample sizes, which never add up to more than the file.
-    let source = mp4::probe(std::path::Path::new(path))?;
-    let file_rate = std::fs::metadata(path).map_err(|e| e.to_string())?.len() * 8 * 1000 / source.duration_ms.max(1);
-    let exact_rate = mp4::probe(std::path::Path::new(exact["path"].as_str().unwrap_or_default()))?.video_bitrate;
-    log!("[selftest] video rate: original {} bit/s (whole file {file_rate}), exact trim {exact_rate}", source.video_bitrate);
-    if source.video_bitrate == 0 || source.video_bitrate > file_rate || exact_rate == 0 {
-        return Err("the video rate of the clips could not be read".into());
-    }
-    // A clip cannot go to Recently deleted while ffmpeg reads it for a trim: the
-    // delete is refused with a reason, and the clip stays (stability tests, A3).
-    let trimming = {
-        let (library, path) = (library.inner().clone(), path.to_string());
-        let last = t[t.len() - 1];
-        std::thread::spawn(move || library.trim(&path, 0.0, last, true))
-    };
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !library.is_reading(path) && !trimming.is_finished() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    let during = library.is_reading(path).then(|| library.delete(path));
-    let long_trim = trimming.join().map_err(|_| "the trim thread panicked".to_string())??;
-    log!("[selftest] delete during a trim: {during:?}; the clip is still there: {}; the trim gave {}", std::path::Path::new(path).exists(), long_trim["path"]);
-    if !matches!(during, Some(Err(_))) || !std::path::Path::new(path).exists() {
-        return Err("a clip being trimmed was deleted, or the trim was too quick to check".into());
-    }
-    // Delete (spec library.trash): the file moves to Recently deleted, comes back
-    // where it was, and leaves for good, with its thumbnail.
+    // To the Recycle Bin, through Recently deleted (spec library.trash).
     let exists = |p: &str| std::path::Path::new(p).exists();
-    let again_thumb = again["thumbnail"].as_str().unwrap_or_default().to_string();
-    let deleted = library.delete(&again_path)?;
-    let trashed = deleted["path"].as_str().unwrap_or_default().to_string();
-    let listed = |p: &str| -> Result<(bool, bool), String> {
-        Ok((library.list(Some("clip"), None)?.iter().any(|i| i["path"] == p), library.list_deleted()?.iter().any(|i| i["path"] == p)))
-    };
-    let after_delete = (exists(&again_path), exists(&trashed), listed(&trashed)?, deleted["originalPath"] == again_path.as_str());
-    let restored = library.restore(&trashed)?;
-    let after_restore = (exists(&again_path), exists(&trashed), listed(&again_path)?, restored["deletedMs"].is_null());
-    let trashed = library.delete(&again_path)?["path"].as_str().unwrap_or_default().to_string();
+    let (trim_path, thumb) = (trimmed["path"].as_str().unwrap_or_default().to_string(), trimmed["thumbnail"].as_str().unwrap_or_default().to_string());
+    let trashed = library.delete(&trim_path)?["path"].as_str().unwrap_or_default().to_string();
     library.purge(&trashed, true)?;
-    let after_purge = (exists(&trashed), listed(&trashed)?, !again_thumb.is_empty() && exists(&again_thumb));
-    log!("[selftest] deleted {again_path} to {trashed}: {after_delete:?}; restored: {after_restore:?}; removed for good: {after_purge:?}");
-    if after_delete != (false, true, (false, true), true) || after_restore != (true, false, (true, false), true) || after_purge != (false, (false, false), false) || !trashed.contains(r"\.deleted\") {
-        return Err("delete, restore or removal did not behave".into());
+    let listed = library.list(Some("clip"), None)?.iter().chain(library.list_deleted()?.iter()).any(|i| i["path"] == trim_path.as_str() || i["path"] == trashed.as_str());
+    log!("[selftest] trim deleted to {trashed}, then to the Recycle Bin: still on disk {}, still listed {listed}, thumbnail left {}", exists(&trim_path) || exists(&trashed), !thumb.is_empty() && exists(&thumb));
+    if !trashed.contains(r"\.deleted\") || exists(&trim_path) || exists(&trashed) || listed || (!thumb.is_empty() && exists(&thumb)) {
+        return Err("the trim did not leave through Recently deleted for the Recycle Bin".into());
     }
-    // "Save and delete original" (edit.trim, 2026-11-07): the trimmed copy takes the
-    // original's name, date, Keep mark and achievement, with a thumbnail of its own;
-    // the original waits in Recently deleted and comes back under a free name.
-    let target = long_trim["path"].as_str().unwrap_or_default().to_string();
-    library.set_kept(&target, true)?;
-    let trophy = json!({ "name": "Laurel self-test achievement", "percent": 4.5 });
-    let before = library.set_achievement(&target, &trophy)?;
-    let copy = library.trim(&target, 0.5, 2.5, false)?;
-    let copy_path = copy["path"].as_str().unwrap_or_default().to_string();
-    let replaced = library.replace_with_trim(&target, &copy_path)?;
-    let (item, gone) = (&replaced["item"], &replaced["deleted"]);
-    let gone_path = gone["path"].as_str().unwrap_or_default().to_string();
-    let thumbs = (item["thumbnail"].as_str().unwrap_or_default(), before["thumbnail"].as_str().unwrap_or_default());
-    let checks = [
-        ("in the original's place", item["path"] == target.as_str() && exists(&target) && !exists(&copy_path)),
-        ("the trimmed length", (1500..=3500).contains(&item["durationMs"].as_i64().unwrap_or_default())),
-        ("the Keep mark", item["kept"] == true),
-        ("the achievement", item["achievement"] == trophy),
-        ("the original's date", item["createdMs"] == before["createdMs"]),
-        ("its own thumbnail", thumbs.0 != thumbs.1 && exists(thumbs.0) && exists(thumbs.1)),
-        ("the original in Recently deleted", gone["originalPath"] == target.as_str() && exists(&gone_path) && listed(&gone_path)? == (false, true)),
-        ("the copy's entry gone", !library.list(Some("clip"), None)?.iter().any(|i| i["path"] == copy_path.as_str())),
-    ];
-    let back = library.restore(&gone_path)?;
-    let back_path = back["path"].as_str().unwrap_or_default();
-    log!(
-        "[selftest] trim in place of {target}: {} ms, failed checks {:?}; original restored as {back_path}",
-        item["durationMs"],
-        checks.iter().filter(|(_, ok)| !ok).map(|(what, _)| *what).collect::<Vec<_>>()
-    );
-    if checks.iter().any(|(_, ok)| !ok) || back_path == target || !exists(back_path) || !exists(&target) {
-        return Err("Save and delete original did not behave".into());
-    }
-    let listed = library.list(Some("clip"), Some("Laurel self-test"))?;
-    log!("[selftest] library lists {} self-test clips", listed.len());
     Ok(())
 }
 
@@ -2700,10 +2618,10 @@ fn check_microphone(app: &AppHandle, engine: &Engine) -> Result<(), String> {
     outcome.and(capture.map(|_| ())).and(restored.map(|_| ()))
 }
 
-/// Self-test of storage: an unwritable folder is refused; the size limit removes
-/// the oldest item that is not kept (through the Recycle Bin), in a throwaway
-/// library; a free-space minimum above the free space pauses recording and
-/// restoring it resumes; start with Windows can be set and is restored.
+/// Self-test of storage on this PC: a folder Windows does not let Laurel write to
+/// is refused; a free-space minimum above the free space pauses recording and
+/// restoring it resumes; start with Windows can be set and is restored. The size
+/// limit and the folder's rules are tests of laurel-app-core.
 fn check_storage(app: &AppHandle, engine: &Engine) -> Result<(), String> {
     let storage = app.state::<Arc<Storage>>();
     // An elevated Laurel may write anywhere, System32 included (the self-test also
@@ -2712,47 +2630,11 @@ fn check_storage(app: &AppHandle, engine: &Engine) -> Result<(), String> {
     if win::self_elevated() {
         log!("[selftest] Laurel elevated: unwritable folder check skipped");
     } else {
-        match Storage::check_writable(std::path::Path::new(r"C:\Windows\System32\laurel-selftest")) {
+        match storage::check_writable(std::path::Path::new(r"C:\Windows\System32\laurel-selftest")) {
             Err(e) => log!("[selftest] unwritable folder refused: {e}"),
             Ok(()) => return Err("a folder in System32 was accepted".into()),
         }
     }
-
-    // Size limit in a throwaway library with three tiny screenshots.
-    let tmp = std::env::temp_dir().join("laurel-selftest-storage");
-    let _ = std::fs::remove_dir_all(&tmp);
-    let shots = tmp.join("Screenshots");
-    std::fs::create_dir_all(&shots).map_err(|e| e.to_string())?;
-    let lib = Library::open(&tmp, tmp.join("Clips"), shots.clone(), None)?;
-    let base = std::time::SystemTime::now() - Duration::from_secs(60);
-    let mut paths = Vec::new();
-    for i in 0..3u64 {
-        let p = shots.join(format!("Laurel self-test {i} (safe to delete).png"));
-        std::fs::write(&p, vec![0u8; 1000]).map_err(|e| e.to_string())?;
-        std::fs::File::options().write(true).open(&p).and_then(|f| f.set_modified(base + Duration::from_secs(i * 10))).map_err(|e| e.to_string())?;
-        paths.push(p.to_string_lossy().into_owned());
-    }
-    lib.scan()?;
-    lib.set_kept(&paths[0], true)?;
-    let removed = Storage::enforce_limit_bytes(&lib, lib.total_size() - 1, true);
-    let on_disk: Vec<bool> = paths.iter().map(|p| std::path::Path::new(p).exists()).collect();
-    log!("[selftest] limit removed {removed:?}; on disk: {on_disk:?}");
-    if removed != [paths[1].clone()] || on_disk != [true, false, true] {
-        return Err("the size limit removed the wrong item".into());
-    }
-    // Recently deleted goes before the oldest item, and leaves when its days are up
-    // (these test files are deleted, not sent to the Recycle Bin).
-    let trashed = lib.delete(&paths[2])?["path"].as_str().unwrap_or_default().to_string();
-    let first = Storage::enforce_limit_bytes(&lib, lib.total_size() - 1, false);
-    let trashed = lib.delete(&paths[0])?["path"].as_str().unwrap_or_default().to_string() + "|" + &trashed;
-    let kept_days = lib.expire(1, false);
-    let expired = lib.expire(0, false);
-    log!("[selftest] the limit removed {first:?} first (deleted {trashed}); one day kept {kept_days:?}; no days removed {expired:?}");
-    if first.len() != 1 || !trashed.ends_with(&first[0]) || !kept_days.is_empty() || expired.len() != 1 || !lib.list_deleted()?.is_empty() {
-        return Err("Recently deleted and the size limit did not behave".into());
-    }
-    drop(lib);
-    let _ = std::fs::remove_dir_all(&tmp);
 
     // Free-space guard, through the real watcher thread.
     let store = app.state::<Arc<Store>>();
@@ -3010,11 +2892,19 @@ fn main() {
             preview_notice,
             library_list,
             library_games,
+            library_tag_counts,
             library_rescan,
             library_trim,
             library_replace_with_trim,
             library_trim_info,
             library_keep,
+            library_tag,
+            library_tag_click,
+            library_tag_create,
+            library_tag_delete,
+            library_tag_rename,
+            library_tag_states,
+            library_tags,
             library_delete,
             library_restore,
             library_purge,
@@ -3096,7 +2986,7 @@ fn main() {
             app.manage(detector.clone());
             let selftest_folder = selftest_mode.then(|| std::env::temp_dir().join("laurel-selftest-capture"));
             let storage = Arc::new(Storage::new(store.clone(), selftest_folder));
-            if let Err(e) = Storage::check_writable(&storage.folder()) {
+            if let Err(e) = storage::check_writable(&storage.folder()) {
                 log!("capture folder not writable: {e}");
             }
             for dir in [storage.clips_dir(), storage.screenshots_dir()] {
@@ -3112,7 +3002,7 @@ fn main() {
             // would otherwise drop the player's items, with their games and Keep marks.
             let library_dir = if selftest_mode { std::env::temp_dir().join("laurel-selftest-library") } else { work_dir.clone() };
             std::fs::create_dir_all(&library_dir)?;
-            let library = Arc::new(Library::open(&library_dir, storage.clips_dir(), storage.screenshots_dir(), ffmpeg)?);
+            let library = Arc::new(library::open(&library_dir, storage.clips_dir(), storage.screenshots_dir(), ffmpeg)?);
             for dir in library.dirs() {
                 let _ = std::fs::create_dir_all(&dir);
                 app.asset_protocol_scope().allow_directory(&dir, true)?;

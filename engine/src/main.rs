@@ -80,6 +80,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+use laurel_engine_core::encoders;
 use obs::{Data, EncoderType, Obs, VideoConfig};
 use recorder::{AudioMix, Capture, GameInfo, MicNoise, Recorder, RecorderConfig, VideoChoice};
 use serde_json::{json, Value};
@@ -377,73 +378,15 @@ fn one_of(value: String, allowed: &[&str], flag: &str) -> Result<String, String>
     if allowed.contains(&value.as_str()) { Ok(value) } else { Err(format!("bad {flag} {value}, expected {}", allowed.join(" or "))) }
 }
 
-/// Video encoders in the order auto tries them (spec quality.encoding): the texture
-/// encoders of NVIDIA, AMD and Intel GPUs, which take the frames on the GPU, then
-/// NVENC's fallback that copies them, then the CPU. HEVC and AV1 come before H.264,
-/// which is the fallback for every codec.
-const H264_ENCODERS: &[&str] = &["obs_nvenc_h264_tex", "h264_texture_amf", "obs_qsv11_v2", "obs_nvenc_h264_soft", "obs_x264"];
-const HEVC_ENCODERS: &[&str] = &["obs_nvenc_hevc_tex", "h265_texture_amf", "obs_qsv11_hevc", "obs_nvenc_hevc_soft"];
-const AV1_ENCODERS: &[&str] = &["obs_nvenc_av1_tex", "av1_texture_amf", "obs_qsv11_av1", "obs_nvenc_av1_soft"];
-
-/// The encoder of a family (the choice the app offers) for a codec.
-fn family_encoder(family: &str, codec: &str) -> Option<&'static str> {
-    Some(match (family, codec) {
-        ("nvenc", "hevc") => "obs_nvenc_hevc_tex",
-        ("nvenc", "av1") => "obs_nvenc_av1_tex",
-        ("nvenc", _) => "obs_nvenc_h264_tex",
-        ("amf", "hevc") => "h265_texture_amf",
-        ("amf", "av1") => "av1_texture_amf",
-        ("amf", _) => "h264_texture_amf",
-        ("qsv", "hevc") => "obs_qsv11_hevc",
-        ("qsv", "av1") => "obs_qsv11_av1",
-        ("qsv", _) => "obs_qsv11_v2",
-        ("x264", _) => "obs_x264",
-        _ => return None,
-    })
-}
-
-/// The family of an encoder id, for the app.
-fn encoder_family(id: &str) -> &'static str {
-    if id.starts_with("obs_nvenc") {
-        "nvenc"
-    } else if id.ends_with("_amf") {
-        "amf"
-    } else if id.starts_with("obs_qsv") {
-        "qsv"
-    } else {
-        "x264"
-    }
-}
-
-/// The encoders to try: the one asked for (an id, or a family with the codec),
-/// then the codec's list, then H.264's, keeping only those OBS registered on this
-/// PC (it probes the GPUs at load).
-fn encoder_candidates(requested: &str, codec: &str, available: &[EncoderType]) -> Vec<String> {
-    let mut order: Vec<&str> = Vec::new();
-    match family_encoder(requested, codec) {
-        Some(id) => order.push(id),
-        None if requested != "auto" => order.push(requested),
-        None => {}
-    }
-    match codec {
-        "hevc" => order.extend(HEVC_ENCODERS),
-        "av1" => order.extend(AV1_ENCODERS),
-        _ => {}
-    }
-    order.extend(H264_ENCODERS);
-    let mut out: Vec<String> = Vec::new();
-    for id in order {
-        if available.iter().any(|e| e.video && e.id == id) && !out.iter().any(|o| o == id) {
-            out.push(id.to_string());
-        }
-    }
-    out
+/// The video encoders OBS registered on this PC.
+fn registered_video(available: &[EncoderType]) -> Vec<&str> {
+    available.iter().filter(|e| e.video).map(|e| e.id.as_str()).collect()
 }
 
 /// The encoders the app can offer, in the order auto tries them.
 fn video_encoder_list(available: &[EncoderType]) -> Value {
-    let known = H264_ENCODERS.iter().chain(HEVC_ENCODERS).chain(AV1_ENCODERS);
-    Value::Array(known.filter_map(|id| available.iter().find(|e| e.video && e.id == *id)).map(|e| json!({ "id": e.id, "family": encoder_family(&e.id), "codec": e.codec, "name": e.name })).collect())
+    let offered = encoders::offered(&registered_video(available));
+    Value::Array(offered.iter().filter_map(|id| available.iter().find(|e| e.video && e.id == *id)).map(|e| json!({ "id": e.id, "family": encoders::encoder_family(&e.id), "codec": e.codec, "name": e.name })).collect())
 }
 
 /// Preset levels on each encoder's own list: NVENC, x264, AMF and QSV values.
@@ -503,9 +446,9 @@ fn run(args: Args) -> Result<i32, String> {
     }
     obs.post_load_modules();
 
-    let encoders = obs.encoder_types();
+    let encoder_types = obs.encoder_types();
     if args.list {
-        for e in encoders.iter().filter(|e| e.video) {
+        for e in encoder_types.iter().filter(|e| e.video) {
             log!("[laurel] video encoder {} ({}, {})", e.id, e.codec, e.name);
             for p in obs.encoder_list_properties(&e.id) {
                 let items: Vec<String> = p.items.iter().map(|(label, value)| format!("{value}={label}")).collect();
@@ -536,7 +479,7 @@ fn run(args: Args) -> Result<i32, String> {
         return Ok(0);
     }
 
-    let choices = encoder_candidates(&args.encoder, &args.codec, &encoders);
+    let choices = encoders::candidates(&args.encoder, &args.codec, &registered_video(&encoder_types));
     log!("[laurel] video encoders to try: {}", choices.join(", "));
     let video_choices = choices.iter().map(|id| VideoChoice { id: id.clone(), settings: video_settings(&obs, id, &args) }).collect();
     let cfg = RecorderConfig {
@@ -583,7 +526,7 @@ fn run(args: Args) -> Result<i32, String> {
                 "codec": args.codec,
                 "encoderFallbacks": fallbacks_json(&rec),
                 "encoderCopy": rec.encoder_copy(),
-                "encoders": video_encoder_list(&encoders),
+                "encoders": video_encoder_list(&encoder_types),
                 "adapter": gpu.json(),
                 "target": args.capture_spec,
                 "output": [out.0, out.1],

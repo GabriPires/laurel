@@ -43,13 +43,15 @@ pub fn video_frames(path: &Path) -> Result<VideoFrames, String> {
         }
         let (scale, _) = child(mdia, b"mdhd").map(timing).unwrap_or((0, 0));
         let stbl = child(mdia, b"minf").and_then(|m| child(m, b"stbl")).ok_or("no sample table")?;
-        // Decode time of every sample from the time-to-sample table.
+        // Decode time of every sample from the time-to-sample table, for as many
+        // samples as the track has.
+        let samples = sample_count(stbl);
         let stts = child(stbl, b"stts").unwrap_or_default();
         let mut dts = Vec::new();
         let mut t = 0u64;
-        for i in 0..be32(stts, 4) as usize {
+        for i in 0..entries(stts, 4, 8, 8) {
             let (count, delta) = (be32(stts, 8 + i * 8), be32(stts, 12 + i * 8));
-            for _ in 0..count {
+            for _ in 0..(count as usize).min(samples - dts.len()) {
                 dts.push(t);
                 t += delta;
             }
@@ -59,15 +61,12 @@ pub fn video_frames(path: &Path) -> Result<VideoFrames, String> {
         if let Some(ctts) = child(stbl, b"ctts") {
             let signed = ctts.first() == Some(&1);
             let mut n = 0;
-            for i in 0..be32(ctts, 4) as usize {
+            for i in 0..entries(ctts, 4, 8, 8) {
                 let (count, raw) = (be32(ctts, 8 + i * 8), be32(ctts, 12 + i * 8));
                 let offset = if signed { raw as u32 as i32 as i64 } else { raw as i64 };
-                for _ in 0..count {
-                    if let Some(c) = cts.get_mut(n) {
-                        *c = offset;
-                    }
-                    n += 1;
-                }
+                let run = (count as usize).min(cts.len() - n);
+                cts[n..n + run].fill(offset);
+                n += run;
             }
         }
         let first = cts.first().copied().unwrap_or(0);
@@ -75,7 +74,7 @@ pub fn video_frames(path: &Path) -> Result<VideoFrames, String> {
         let mut times: Vec<f64> = (0..dts.len()).map(time).collect();
         // Without a sync sample table every sample is a keyframe.
         let keyframes = match child(stbl, b"stss") {
-            Some(stss) => (0..be32(stss, 4) as usize).map(|i| be32(stss, 8 + i * 4) as usize).filter(|n| *n >= 1 && *n <= dts.len()).map(|n| time(n - 1)).collect(),
+            Some(stss) => (0..entries(stss, 4, 8, 4)).map(|i| be32(stss, 8 + i * 4) as usize).filter(|n| *n >= 1 && *n <= dts.len()).map(|n| time(n - 1)).collect(),
             None => times.clone(),
         };
         times.sort_by(f64::total_cmp);
@@ -101,7 +100,9 @@ fn read_moov(path: &Path) -> Result<Vec<u8>, String> {
         } else if size == 0 {
             size = len - pos;
         }
-        if size < header {
+        // A box past the end of the file: the file was cut short, or the size is
+        // damaged; nothing after it can be found.
+        if size < header || size > len - pos {
             break;
         }
         if &head[4..8] == b"moov" {
@@ -130,7 +131,7 @@ fn boxes(data: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
         } else if size == 0 {
             size = data.len() - pos;
         }
-        if size < header || pos + size > data.len() {
+        if size < header || size > data.len() - pos {
             return None;
         }
         let payload = &data[pos + header..pos + size];
@@ -141,6 +142,33 @@ fn boxes(data: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
 
 fn child<'a>(data: &'a [u8], kind: &[u8]) -> Option<&'a [u8]> {
     boxes(data).find(|(k, _)| *k == kind).map(|(_, p)| p)
+}
+
+/// How many entries of `size` bytes, from `first`, a table says it has at
+/// `count_at`, but no more than its bytes hold: a damaged count cannot make the
+/// reader go past the table.
+fn entries(table: &[u8], count_at: usize, first: usize, size: usize) -> usize {
+    (be32(table, count_at) as usize).min(table.len().saturating_sub(first) / size)
+}
+
+/// The most samples a track is taken to have when its sample size table does not
+/// list them one by one, which bounds nothing: about 19 hours at 60 frames a second.
+const MAX_SAMPLES: usize = 1 << 22;
+
+/// How many samples a track has: as many as its sample size table lists (the
+/// engine's video has one size per sample), else as its tables say, up to
+/// MAX_SAMPLES.
+fn sample_count(stbl: &[u8]) -> usize {
+    match child(stbl, b"stsz") {
+        Some(stsz) if be32(stsz, 4) == 0 => entries(stsz, 8, 12, 4),
+        Some(stsz) => (be32(stsz, 8) as usize).min(MAX_SAMPLES),
+        None => MAX_SAMPLES,
+    }
+}
+
+/// `a * b / c` without overflowing, at most u64::MAX; `c` is not 0.
+fn mul_div(a: u64, b: u64, c: u64) -> u64 {
+    (a as u128 * b as u128 / c as u128).min(u64::MAX as u128) as u64
 }
 
 fn be32(d: &[u8], at: usize) -> u64 {
@@ -165,7 +193,7 @@ fn parse_moov(moov: &[u8]) -> Mp4Info {
     if let Some(mvhd) = child(moov, b"mvhd") {
         let (scale, duration) = timing(mvhd);
         if scale > 0 {
-            info.duration_ms = duration * 1000 / scale;
+            info.duration_ms = mul_div(duration, 1000, scale);
         }
     }
     for (kind, trak) in boxes(moov) {
@@ -190,15 +218,15 @@ fn parse_moov(moov: &[u8]) -> Mp4Info {
         let (scale, duration) = child(mdia, b"mdhd").map(timing).unwrap_or((0, 0));
         let stbl = child(mdia, b"minf").and_then(|m| child(m, b"stbl")).unwrap_or_default();
         let stts = child(stbl, b"stts").unwrap_or_default();
-        let delta = (0..be32(stts, 4) as usize).map(|i| (be32(stts, 8 + i * 8), be32(stts, 12 + i * 8))).max_by_key(|(count, _)| *count).map_or(0, |(_, d)| d);
+        let delta = (0..entries(stts, 4, 8, 8)).map(|i| (be32(stts, 8 + i * 8), be32(stts, 12 + i * 8))).max_by_key(|(count, _)| *count).map_or(0, |(_, d)| d);
         if scale > 0 && delta > 0 {
             info.fps = scale as f64 / delta as f64;
         }
         // Sample sizes: one size for every sample, or a table of them.
         if let (Some(stsz), true) = (child(stbl, b"stsz"), scale > 0 && duration > 0) {
-            let (size, count) = (be32(stsz, 4), be32(stsz, 8) as usize);
-            let bytes = if size > 0 { size * count as u64 } else { (0..count).map(|i| be32(stsz, 12 + i * 4)).sum() };
-            info.video_bitrate = bytes * 8 * scale / duration;
+            let size = be32(stsz, 4);
+            let bytes = if size > 0 { size.saturating_mul(be32(stsz, 8)) } else { (0..entries(stsz, 8, 12, 4)).map(|i| be32(stsz, 12 + i * 4)).sum() };
+            info.video_bitrate = mul_div(bytes.saturating_mul(8), scale, duration);
         }
     }
     info

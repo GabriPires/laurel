@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-pub use laurel_app_core::games::{Capture, Catalog, Curated, GameId, Verdict, SHIPPED};
+pub use laurel_app_core::games::{Catalog, Curated, Verdict, SHIPPED};
 use laurel_app_core::stores::{self, Listing, ReadError, Report, Store, StoreFile};
 
 use crate::win;

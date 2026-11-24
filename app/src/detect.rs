@@ -1,15 +1,7 @@
-//! Game detection loop and capture control (spec game.detection). Every scan looks
-//! at the visible windows and classifies their programs (games.rs); the game being
-//! recorded stays while its window lives, minimized or not, and another game takes
-//! over when it stays in focus. This module alone tells the engine what to capture
-//! and whether the replay buffer runs: recording turned on (spec record.toggle), a
-//! game and enough disk space are all needed; with recording off nothing is
-//! captured or hooked.
-//! A game is captured by its hook, or by its window when the hook does not start
-//! (spec capture.game-hook); a window-only game of the curated list (A39: Roblox)
-//! by its window from the start, with no hook check and no hook retries. With the screen recording option (capture.screen, off
-//! by default per D13), a monitor is recorded while no game is open, or always when
-//! the switch to games is off.
+//! The app's side of game detection (spec game.detection): the thread that scans
+//! the windows every 2 s, the catalog of games read from the store libraries, and
+//! the Windows, engine and interface behind the traits of
+//! laurel_app_core::detect, where the rules and the requests to the engine live.
 //!
 //! With a fixed target (LAUREL_CAPTURE, or the self-test), detection is off and the
 //! engine records that target all the time, as in the Phase 3 PoC.
@@ -17,179 +9,78 @@
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use laurel_app_core::detect::{self as core, Config, EngineLink, Notice, Reporter};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::engine::Engine;
-use crate::games::{self, Capture, Catalog, Curated, GameId, Verdict};
+use crate::games::{self, Catalog, Curated, Verdict};
 use laurel_app_core::stores::{self, Report};
 use crate::i18n::t;
 use crate::log::log;
 use crate::overlay::{Kind, Notifier};
 use crate::settings::Store;
-use crate::win::{self, AppWindow};
+use crate::win::{self, Win32};
 
-const SCAN_EVERY: Duration = Duration::from_secs(2);
+pub use laurel_app_core::detect::{Active, Mode, Screen};
+
 const CATALOG_EVERY: Duration = Duration::from_secs(60);
-/// Smaller windows are launchers, splash screens or dialogs, not the game itself.
-const MIN_WIDTH: i32 = 640;
-const MIN_HEIGHT: i32 = 360;
-/// Scans without the game's window before it counts as closed (a game recreates
-/// its window when it changes display mode). A minimized window still counts: a
-/// game in exclusive fullscreen minimizes on Alt+Tab.
-const MISSING_SCANS: u32 = 3;
-/// Scans another game must stay in focus before the capture moves to it.
-const FOCUS_SCANS: u32 = 2;
-/// The same when the current game's capture is hooked (A27 of the stability tests):
-/// 30 s, so that a quick switch to another program the player added, such as a
-/// music player, does not take the capture from the game being played, while a
-/// game started and played next to an idle one still gets it.
-const HOOKED_FOCUS_SCANS: u32 = 15;
 
-/// Scans in focus another game needs before it takes the capture from the current
-/// one, which is or is not hooked.
-pub fn focus_scans_needed(current_hooked: bool) -> u32 {
-    if current_hooked { HOOKED_FOCUS_SCANS } else { FOCUS_SCANS }
-}
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// A game not hooked this long after the engine started capturing it is checked
-/// for elevation.
-const HOOK_GRACE: Duration = Duration::from_secs(8);
-/// A game that is not elevated and still not hooked this long after the engine
-/// started capturing it is recorded through its window instead.
-const FALLBACK_GRACE: Duration = Duration::from_secs(15);
-/// While a game is recorded by its window, its hook is tried again over the window
-/// capture: the first try starts RETRY_FIRST after the fallback, each lasts
-/// RETRY_FOR, and the wait doubles after each, up to RETRY_MAX. A waiting game
-/// capture logs a few lines every 2 s, so the tries stay short and sparse.
-const RETRY_FIRST: Duration = Duration::from_secs(30);
-const RETRY_FOR: Duration = Duration::from_secs(10);
-const RETRY_MAX: Duration = Duration::from_secs(300);
+/// The engine the app supervises (engine.rs), looked up when needed: the detector
+/// exists before the engine starts.
+pub struct EngineRpc(AppHandle);
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum Mode {
-    Detect,
-    Fixed(String),
-}
+impl EngineLink for EngineRpc {
+    fn ready(&self) -> bool {
+        self.0.state::<Engine>().state()["state"] == "ready"
+    }
 
-/// The screen recording option (spec capture.screen).
-#[derive(Clone, Debug, PartialEq)]
-pub struct Screen {
-    /// monitor_capture device id; empty for the primary monitor.
-    pub monitor: String,
-    /// Games take over the capture while they are open.
-    pub switch_to_games: bool,
-}
+    fn buffer_secs(&self) -> u64 {
+        self.0.state::<Engine>().state()["info"]["bufferSecs"].as_u64().unwrap_or_default()
+    }
 
-impl Screen {
-    fn target(&self) -> String {
-        format!("monitor-id:{}", self.monitor)
+    fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+        self.0.state::<Engine>().request(method, params, timeout)
     }
 }
 
-/// The tries of the hook of a game recorded by its window (see retry_hook).
-#[derive(Clone, Copy, Debug)]
-struct Retry {
-    /// When the next try starts.
-    next: Instant,
-    /// When the current try ends, during a try.
-    until: Option<Instant>,
-    /// Tries already made.
-    tries: u32,
-}
+/// app.log, the overlay and the "game-state" event of the interface.
+pub struct AppReporter(AppHandle);
 
-impl Retry {
-    fn after_fallback() -> Retry {
-        Retry { next: Instant::now() + RETRY_FIRST, until: None, tries: 0 }
-    }
-}
-
-/// The game being recorded.
-#[derive(Clone, Debug)]
-pub struct Active {
-    pub id: GameId,
-    pub path: String,
-    pub pid: u32,
-    pub hwnd: isize,
-    pub title: String,
-    pub class: String,
-    /// By its hook (with the window fallback) or, for a window-only game, by its
-    /// window.
-    pub capture: Capture,
-}
-
-impl Active {
-    pub fn exe(&self) -> &str {
-        self.path.rsplit('\\').next().unwrap_or(&self.path)
+impl Reporter for AppReporter {
+    fn log(&self, line: &str) {
+        log!("{line}");
     }
 
-    /// The libobs window spec `title:class:exe`, escaped as libobs does; the engine
-    /// matches the executable when the title changes.
-    fn spec(&self) -> String {
-        let enc = |s: &str| s.replace('#', "#22").replace(':', "#3A");
-        format!("{}:{}:{}", enc(&self.title), enc(&self.class), enc(self.exe()))
+    fn notice(&self, notice: Notice) {
+        let notifier = self.0.state::<Notifier>();
+        match notice {
+            Notice::Recording { game, secs } => notifier.notify(Kind::Info, &t!("Recording|notice"), &t!("{game} · Laurel keeps the last {secs} s", game = game, secs = secs)),
+            Notice::RecordingScreen { secs } => notifier.notify(Kind::Info, &t!("Recording the screen"), &t!("Laurel keeps the last {secs} s of your screen", secs = secs)),
+            Notice::RecordingByWindow { game } => notifier.notify(Kind::Info, &t!("Recording {game} by its window", game = game), &t!("Game capture did not start, so Laurel records the game's window")),
+            // A15: shown over the game even with notices over games off.
+            Notice::NeedsAdmin { game } => notifier.notify_critical(&t!("Can't record {game}", game = game), &t!("It runs as administrator. Open Laurel and restart it as administrator.")),
+        }
     }
 
-    pub fn to_json(&self) -> Value {
-        json!({ "key": self.id.key, "name": self.id.name, "source": self.id.source, "exe": self.exe(), "path": self.path, "pid": self.pid })
+    fn game_state(&self, snapshot: Value) {
+        let _ = self.0.emit("game-state", snapshot);
     }
-}
-
-struct State {
-    mode: Mode,
-    /// Recording turned on by the user (spec record.toggle).
-    enabled: bool,
-    current: Option<Active>,
-    missing: u32,
-    focus: Option<(String, u32)>,
-    disk_paused: bool,
-    /// What the engine was last told: (capture target, recording).
-    applied: Option<(String, bool)>,
-    /// The process of the game window the applied target names (see follow).
-    applied_pid: Option<u32>,
-    /// Another process of the current game whose window took over, and the scans
-    /// it has been the current one (see follow).
-    moved: Option<(u32, u32)>,
-    /// A process the capture did not follow because the game was already hooked.
-    kept: Option<u32>,
-    /// When the engine started capturing the applied target (see check_hook).
-    capture_started: Option<Instant>,
-    /// The game whose hook was already checked (see check_hook).
-    hook_checked: Option<String>,
-    /// The game that runs as administrator while Laurel does not.
-    needs_admin: Option<String>,
-    /// The process of a game confirmed to run as administrator while Laurel does
-    /// not (A29 of the stability tests): its capture waits, instead of OBS trying
-    /// to open the process every 2 s, until Laurel runs as administrator, the game
-    /// closes or its window moves to another process.
-    parked: Option<u32>,
-    /// The game recorded through its window because its hook did not start (a
-    /// window-only game never is: see Active::capture).
-    fallback: Option<String>,
-    /// The tries of the fallback game's hook.
-    retry: Option<Retry>,
-    screen: Option<Screen>,
 }
 
 pub struct Detector {
-    app: AppHandle,
+    core: core::Detector<Win32, EngineRpc, AppReporter>,
     store: Arc<Store>,
     /// The curated list the catalog is built from: the shipped one, except while
     /// the self-test uses its own.
     curated: Mutex<Curated>,
-    catalog: RwLock<Catalog>,
+    /// Replaced whole at each scan of the stores, so that a scan of the windows
+    /// holds no lock while it waits for the engine.
+    catalog: RwLock<Arc<Catalog>>,
     /// What the last scan of each store saw; a store's line is logged again only
     /// when it changes (A32).
     store_reports: Mutex<Vec<Report>>,
-    state: Mutex<State>,
-    /// Serializes the requests that bring the engine to the wanted state.
-    apply_lock: Mutex<()>,
     wake: (Mutex<bool>, Condvar),
-    /// Whether Laurel runs as administrator.
-    elevated: bool,
-    /// LAUREL_TEST_FALLBACK=1 (tests): a game is recorded by its window from the
-    /// start, as if its hook had not started, so the tries of its hook can be seen.
-    test_fallback: bool,
 }
 
 impl Detector {
@@ -197,33 +88,29 @@ impl Detector {
         let curated = Curated::shipped();
         let (catalog, reports) = games::scan(curated.clone());
         let settings = store.get();
-        let enabled = settings.recording_enabled;
-        let screen = screen_of(&settings);
         log!("games: {} installed games found {}", catalog.store_games().len(), catalog.counts());
         for report in &reports {
             log!("games: {report}");
         }
+        let config = Config {
+            elevated: win::self_elevated(),
+            own_pid: std::process::id(),
+            test_fallback: std::env::var("LAUREL_TEST_FALLBACK").is_ok_and(|v| v == "1"),
+        };
         Arc::new(Detector {
-            app,
+            core: core::Detector::new(Win32, EngineRpc(app.clone()), AppReporter(app), mode, settings.recording_enabled, screen_of(&settings), config),
             store,
             curated: Mutex::new(curated),
-            catalog: RwLock::new(catalog),
+            catalog: RwLock::new(Arc::new(catalog)),
             store_reports: Mutex::new(reports),
-            state: Mutex::new(State { mode, enabled, current: None, missing: 0, focus: None, disk_paused: false, applied: None, applied_pid: None, moved: None, kept: None, capture_started: None, hook_checked: None, needs_admin: None, parked: None, fallback: None, retry: None, screen }),
-            apply_lock: Mutex::new(()),
             wake: (Mutex::new(false), Condvar::new()),
-            elevated: win::self_elevated(),
-            test_fallback: std::env::var("LAUREL_TEST_FALLBACK").is_ok_and(|v| v == "1"),
         })
     }
 
     /// The engine's start options for the current mode: no capture and a paused
     /// replay buffer until a game shows up.
     pub fn engine_args(&self) -> Vec<String> {
-        match initial(&self.state.lock().unwrap()) {
-            (target, true) => vec!["--capture".into(), target],
-            (target, false) => vec!["--capture".into(), target, "--paused".into()],
-        }
+        self.core.engine_args()
     }
 
     pub fn start(self: &Arc<Detector>) {
@@ -235,12 +122,17 @@ impl Detector {
                     me.rescan();
                     catalog_at = Instant::now();
                 }
-                me.scan();
+                me.tick();
                 let (lock, cvar) = &me.wake;
-                let mut woken = cvar.wait_timeout_while(lock.lock().unwrap(), SCAN_EVERY, |w| !*w).unwrap().0;
+                let mut woken = cvar.wait_timeout_while(lock.lock().unwrap(), core::SCAN_EVERY, |w| !*w).unwrap().0;
                 *woken = false;
             }
         });
+    }
+
+    fn tick(&self) {
+        let settings = self.store.get();
+        self.core.tick(&self.catalog(), &settings.user_games());
     }
 
     /// Scans again now (after the user changes the game lists).
@@ -263,11 +155,11 @@ impl Detector {
         if catalog.store_games().len() != current.store_games().len() {
             log!("games: {} installed games found {}", catalog.store_games().len(), catalog.counts());
         }
-        *current = catalog;
+        *current = Arc::new(catalog);
     }
 
-    pub fn catalog(&self) -> std::sync::RwLockReadGuard<'_, Catalog> {
-        self.catalog.read().unwrap()
+    pub fn catalog(&self) -> Arc<Catalog> {
+        self.catalog.read().unwrap().clone()
     }
 
     /// Builds the catalog from another curated list (self-test: a window-only game
@@ -278,569 +170,71 @@ impl Detector {
     }
 
     pub fn mode(&self) -> Mode {
-        self.state.lock().unwrap().mode.clone()
+        self.core.mode()
     }
 
     pub fn set_mode(&self, mode: Mode) {
-        {
-            let mut s = self.state.lock().unwrap();
-            s.mode = mode;
-            s.current = None;
-            s.missing = 0;
-        }
-        self.apply();
+        self.core.set_mode(mode);
         self.wake();
     }
 
-    /// Whether the current game's hook was checked (see check_hook).
+    /// Whether the current game's hook was checked.
     pub fn hook_checked(&self) -> bool {
-        let s = self.state.lock().unwrap();
-        s.current.as_ref().is_some_and(|g| s.hook_checked.as_deref() == Some(g.id.key.as_str()))
+        self.core.hook_checked()
     }
 
     pub fn enabled(&self) -> bool {
-        self.state.lock().unwrap().enabled
+        self.core.enabled()
     }
 
-    /// Turns recording on or off (spec record.toggle). Off releases the capture and
-    /// the replay buffer; on starts them again for the current game, if any.
+    /// Turns recording on or off (spec record.toggle).
     pub fn set_enabled(&self, enabled: bool) {
-        {
-            let mut s = self.state.lock().unwrap();
-            s.enabled = enabled;
-            // The hook is checked again once the capture starts again.
-            s.hook_checked = None;
-            s.needs_admin = None;
-            s.parked = None;
-            s.fallback = None;
-            s.retry = None;
-        }
-        self.apply();
-        let _ = self.app.emit("game-state", self.snapshot());
+        self.core.set_enabled(enabled);
     }
 
     pub fn current(&self) -> Option<Active> {
-        self.state.lock().unwrap().current.clone()
+        self.core.current()
     }
 
     /// Applies a change of the screen recording option.
     pub fn set_screen(&self, screen: Option<Screen>) {
-        let changed = {
-            let mut s = self.state.lock().unwrap();
-            let changed = s.screen != screen;
-            s.screen = screen;
-            changed
-        };
-        if changed {
-            self.apply();
-            let _ = self.app.emit("game-state", self.snapshot());
-        }
+        self.core.set_screen(screen);
     }
 
     /// The name of the current game when it runs as administrator and Laurel does
     /// not, so that it is not recorded.
     pub fn needs_admin_game(&self) -> Option<String> {
-        let s = self.state.lock().unwrap();
-        s.current.as_ref().filter(|g| s.needs_admin.as_deref() == Some(g.id.key.as_str())).map(|g| g.id.name.clone())
+        self.core.needs_admin_game()
     }
 
     /// Whether the replay buffer should be running.
     pub fn recording(&self) -> bool {
-        let s = self.state.lock().unwrap();
-        wanted(&s).1
+        self.core.recording()
     }
 
     pub fn snapshot(&self) -> Value {
-        let s = self.state.lock().unwrap();
-        json!({
-            "mode": if s.mode == Mode::Detect { "detect" } else { "fixed" },
-            "enabled": s.enabled,
-            "game": s.current.as_ref().map(Active::to_json),
-            "recording": wanted(&s).1,
-            "needsAdmin": s.needs_admin.is_some(),
-            "capture": capture_kind(&wanted(&s).0),
-            "screen": s.screen.is_some(),
-            "elevated": self.elevated,
-        })
+        self.core.snapshot()
     }
 
     /// Called by the disk guard (spec storage.limits).
     pub fn set_disk_paused(&self, paused: bool) {
-        self.state.lock().unwrap().disk_paused = paused;
-        self.apply();
+        self.core.set_disk_paused(paused);
     }
 
     /// The engine (re)started with the options of `engine_args`.
     pub fn engine_ready(&self) {
-        {
-            let mut s = self.state.lock().unwrap();
-            s.applied = None;
-            // A26: the new engine hooks the game anew, so its hook is checked again
-            // (a game hooked before a restart could stay without image); the
-            // administrator notice is not shown a second time (see check_hook).
-            s.hook_checked = None;
-            // A new engine has no hook try running: the next one starts now.
-            if let Some(retry) = s.retry.as_mut() {
-                *retry = Retry { next: Instant::now(), until: None, ..*retry };
-            }
-        }
-        self.apply();
+        self.core.engine_ready();
     }
 
     /// Starts the next try of the fallback game's hook now (self-test).
     pub fn retry_hook_now(&self) {
-        if let Some(retry) = self.state.lock().unwrap().retry.as_mut() {
-            retry.next = Instant::now();
-        }
+        self.core.retry_hook_now();
     }
 
     /// Names of the games open now (the self-test leaves them alone).
     pub fn games_open(&self) -> Vec<String> {
-        self.game_windows().into_iter().map(|g| g.id.name).collect()
-    }
-
-    /// The classified windows of games, one per game (the focused window, else the
-    /// first in Z order).
-    fn game_windows(&self) -> Vec<Active> {
         let settings = self.store.get();
-        let catalog = self.catalog();
-        let me = std::process::id();
-        let foreground = win::foreground_window();
-        let mut found: Vec<Active> = Vec::new();
-        let mut paths = std::collections::HashMap::new();
-        for w in win::app_windows() {
-            let AppWindow { hwnd, pid, title, class, rect } = w;
-            if pid == me || rect.right - rect.left < MIN_WIDTH || rect.bottom - rect.top < MIN_HEIGHT {
-                continue;
-            }
-            let Some(path) = paths.entry(pid).or_insert_with(|| win::process_path(pid)).clone() else { continue };
-            let Verdict::Game(id) = catalog.classify_window(&path, &class, &title, || win::process_command_line(pid), &settings.user_games()) else { continue };
-            let capture = catalog.capture(&path);
-            let active = Active { id, path, pid, hwnd, title, class, capture };
-            match found.iter_mut().find(|a| a.id.key == active.id.key) {
-                Some(existing) if hwnd == foreground => *existing = active,
-                Some(_) => {}
-                None => found.push(active),
-            }
-        }
-        found
-    }
-
-    fn scan(&self) {
-        if self.mode() != Mode::Detect {
-            return;
-        }
-        let found = self.game_windows();
-        let foreground = win::foreground_window();
-        let mut held = None;
-        let mut renamed = false;
-        let (started, ended, moved, unparked) = {
-            let mut s = self.state.lock().unwrap();
-            let mut ended = None;
-            if let Some(current) = s.current.clone() {
-                match found.iter().find(|a| a.id.key == current.id.key) {
-                    Some(same) => {
-                        s.missing = 0;
-                        // The player renamed the game (A27): the app shows the new name.
-                        renamed = same.id.name != current.id.name;
-                        s.current = Some(same.clone());
-                    }
-                    // Minimized (or hidden) is not closed: the window is still there,
-                    // and so are the capture and the replay buffer.
-                    None if win::window_of(current.hwnd, current.pid) => s.missing = 0,
-                    None => {
-                        s.missing += 1;
-                        if s.missing >= MISSING_SCANS {
-                            ended = s.current.take();
-                            s.missing = 0;
-                        }
-                    }
-                }
-            }
-            // Another game in focus takes over after a few scans, or after more of
-            // them when the current game's capture is hooked (A27).
-            let focused = found.iter().find(|a| a.hwnd == foreground && s.current.as_ref().is_some_and(|c| c.id.key != a.id.key)).cloned();
-            let hooked = s.current.as_ref().is_some_and(|c| s.hook_checked.as_deref() == Some(c.id.key.as_str())) && s.fallback.is_none() && s.needs_admin.is_none();
-            let mut started = None;
-            match focused {
-                Some(other) => {
-                    let scans = match &s.focus {
-                        Some((key, n)) if *key == other.id.key => n + 1,
-                        _ => 1,
-                    };
-                    s.focus = Some((other.id.key.clone(), scans));
-                    if scans >= focus_scans_needed(hooked) {
-                        ended = s.current.replace(other.clone());
-                        started = Some(other);
-                        s.focus = None;
-                    } else if hooked && scans == FOCUS_SCANS {
-                        held = s.current.as_ref().map(|c| (other.id.name.clone(), c.id.name.clone()));
-                    }
-                }
-                None => s.focus = None,
-            }
-            if s.current.is_none() {
-                let next = found.iter().find(|a| a.hwnd == foreground).or(found.first()).cloned();
-                if let Some(next) = next {
-                    s.current = Some(next.clone());
-                    started = Some(next);
-                }
-            }
-            // A29: a parked game whose window is now another process's (a launcher
-            // running as administrator, then the game itself) is checked again.
-            let mut unparked = None;
-            let moved_on = s.current.clone().filter(|c| s.parked.is_some_and(|pid| pid != c.pid));
-            if let Some(c) = moved_on.filter(|_| started.is_none() && ended.is_none()) {
-                s.parked = None;
-                s.hook_checked = None;
-                unparked = Some(c);
-            }
-            // A23: the game's window moved to another of its processes, as Fortnite's
-            // from its anti-cheat bootstrapper's splash screen to the game itself,
-            // and the target the engine has names the old one. A blip of focus does
-            // not count: the new window must stay the game's for FOCUS_SCANS scans.
-            let mut moved = None;
-            let follow = match (&s.current, &s.applied) {
-                (Some(c), Some((target, _)))
-                    if started.is_none()
-                        && ended.is_none()
-                        && (target.starts_with("game:") || target.starts_with("window:"))
-                        && s.applied_pid.is_some_and(|pid| pid != c.pid)
-                        && s.kept != Some(c.pid)
-                        && wanted(&s).0 != *target =>
-                {
-                    Some(c.clone())
-                }
-                _ => None,
-            };
-            match follow {
-                Some(game) => {
-                    let scans = match s.moved {
-                        Some((pid, n)) if pid == game.pid => n + 1,
-                        _ => 1,
-                    };
-                    s.moved = Some((game.pid, scans));
-                    if scans >= FOCUS_SCANS {
-                        s.moved = None;
-                        moved = Some(game);
-                    }
-                }
-                None => s.moved = None,
-            }
-            if ended.is_some() || started.is_some() {
-                s.hook_checked = None;
-                s.needs_admin = None;
-                s.parked = None;
-                s.fallback = None;
-                s.retry = None;
-                s.moved = None;
-                s.kept = None;
-            }
-            if let Some(game) = started.as_ref().filter(|g| self.test_fallback && g.capture == Capture::Hook) {
-                s.hook_checked = Some(game.id.key.clone());
-                s.fallback = Some(game.id.key.clone());
-                s.retry = Some(Retry::after_fallback());
-            }
-            (started, ended, moved, unparked)
-        };
-        if let Some((other, current)) = &held {
-            log!("{other} in focus: {current} keeps the capture while it is hooked, unless {other} stays in focus for {} s", u64::from(HOOKED_FOCUS_SCANS) * SCAN_EVERY.as_secs());
-        }
-        if let Some(game) = &ended {
-            log!("game closed or left: {} ({})", game.id.name, game.path);
-        }
-        if let Some(game) = &started {
-            log!("game found: {} [{}] {} pid {} window {:?}", game.id.name, game.id.key, game.path, game.pid, game.title);
-            if game.capture == Capture::Window {
-                log!("capture: {} is a window-only game: recorded by its window, with no game hook", game.id.name);
-            }
-        }
-        if renamed && started.is_none() && ended.is_none() {
-            let _ = self.app.emit("game-state", self.snapshot());
-        }
-        if started.is_some() || ended.is_some() {
-            self.apply();
-            let _ = self.app.emit("game-state", self.snapshot());
-            if let Some(game) = started.filter(|_| self.recording()) {
-                let secs = self.app.state::<Engine>().state()["info"]["bufferSecs"].as_u64().unwrap_or_default();
-                self.app.state::<Notifier>().notify(Kind::Info, &t!("Recording|notice"), &t!("{game} · Laurel keeps the last {secs} s", game = game.id.name, secs = secs));
-            }
-        }
-        if let Some(game) = moved {
-            self.follow(game);
-        }
-        if let Some(game) = unparked {
-            log!("capture: {} moved to {} (pid {}); its capture starts again", game.id.name, game.exe(), game.pid);
-            self.apply();
-            let _ = self.app.emit("game-state", self.snapshot());
-        }
-        self.check_hook();
-        self.retry_hook();
-    }
-
-    /// A game whose window moved to another of its processes before its hook
-    /// started (A23 of the stability tests: Fortnite shows its anti-cheat
-    /// bootstrapper's splash screen first, then its own window) is captured in the
-    /// new window: the game capture starts over there, with its grace, or, for a
-    /// game recorded by its window, the window capture and the tries of the hook
-    /// move to it. A hooked game keeps its capture, so a second window of the game
-    /// does not drop the hook.
-    fn follow(&self, game: Active) {
-        let Ok(status) = self.app.state::<Engine>().request("status", Value::Null, REQUEST_TIMEOUT) else { return };
-        let hooked = !status["game"].is_null();
-        {
-            let mut s = self.state.lock().unwrap();
-            if s.current.as_ref().map(|c| c.pid) != Some(game.pid) {
-                return;
-            }
-            if hooked {
-                s.kept = Some(game.pid);
-            } else {
-                // The hook of the new process is checked again; the notice that the
-                // game runs as administrator still comes once (see check_hook).
-                s.hook_checked = None;
-                if s.fallback.is_some() {
-                    s.retry = Some(Retry::after_fallback());
-                }
-            }
-        }
-        if hooked {
-            log!("capture: {} moved to {} (pid {}) after its hook started; capture kept", game.id.name, game.exe(), game.pid);
-            return;
-        }
-        match game.capture {
-            Capture::Hook => log!("capture: {} moved to {} (pid {}) before its hook started; the capture follows it", game.id.name, game.exe(), game.pid),
-            Capture::Window => log!("capture: {} moved to {} (pid {}); its window capture follows it", game.id.name, game.exe(), game.pid),
-        }
-        self.apply();
-        let _ = self.app.emit("game-state", self.snapshot());
-    }
-
-    /// A game that runs as administrator cannot be recorded by a Laurel that does
-    /// not: the engine cannot open its process to hook it, and its keys do not reach
-    /// the hotkeys. When the game is still not hooked HOOK_GRACE after the engine
-    /// started capturing it and its process is elevated (or its token cannot be
-    /// read), the player is offered a restart of Laurel as administrator.
-    ///
-    /// Both deadlines count from the start of the capture, not from when the game
-    /// was found: on a slow PC, starting Laurel and the engine used up the time
-    /// before the hook was even tried.
-    ///
-    /// An elevated Laurel asks the engine too (A14 of the stability tests): its
-    /// hook can still fail, for example with the game on another GPU (A13), and
-    /// then the game's window is recorded as for any other game. Only a Laurel
-    /// that is not elevated offers the restart as administrator.
-    fn check_hook(&self) {
-        let (game, capturing) = {
-            let s = self.state.lock().unwrap();
-            let hooking = s.applied.as_ref().is_some_and(|(target, _)| target.starts_with("game:"));
-            match (&s.current, s.capture_started) {
-                (Some(g), Some(started)) if hooking && s.hook_checked.as_deref() != Some(g.id.key.as_str()) && started.elapsed() >= HOOK_GRACE => (g.clone(), started.elapsed()),
-                _ => return,
-            }
-        };
-        let Ok(hooked) = self.app.state::<Engine>().request("status", Value::Null, REQUEST_TIMEOUT).map(|status| !status["game"].is_null()) else { return };
-        let elevated = if hooked { Some(false) } else { win::process_elevated(game.pid) };
-        let needs_admin = !hooked && !self.elevated && elevated != Some(false);
-        // A game this Laurel can hook (not elevated, or Laurel elevated too) gets
-        // until FALLBACK_GRACE before its window is recorded instead.
-        let fallback = !hooked && !needs_admin && capturing >= FALLBACK_GRACE;
-        if !hooked && !needs_admin && !fallback {
-            return;
-        }
-        let notified;
-        let parked;
-        {
-            let mut s = self.state.lock().unwrap();
-            if s.current.as_ref().map(|g| &g.id.key) != Some(&game.id.key) {
-                return;
-            }
-            s.hook_checked = Some(game.id.key.clone());
-            // Checked again after the game moved to another process (see follow):
-            // that process decides, and the notice is not shown a second time.
-            notified = s.needs_admin.is_some();
-            s.needs_admin = needs_admin.then(|| game.id.key.clone());
-            // A29: a process known to run as administrator cannot be opened by this
-            // Laurel; OBS would try every 2 s for as long as the game runs.
-            parked = needs_admin && elevated == Some(true);
-            if parked {
-                s.parked = Some(game.pid);
-            }
-            if fallback {
-                s.fallback = Some(game.id.key.clone());
-                s.retry = Some(Retry::after_fallback());
-            }
-        }
-        if hooked {
-            log!("capture: {} hooked (checked {} s after the capture started)", game.id.name, capturing.as_secs());
-            return;
-        }
-        log!("capture: {} not hooked after {} s of capture; process elevated: {elevated:?}; Laurel elevated: {}", game.id.name, capturing.as_secs(), self.elevated);
-        let notifier = self.app.state::<Notifier>();
-        if needs_admin {
-            if parked {
-                log!("capture: {} runs as administrator: its capture waits until Laurel runs as administrator, the game closes or its window moves to another process", game.id.name);
-                self.apply();
-            }
-            let _ = self.app.emit("game-state", self.snapshot());
-            if notified {
-                return;
-            }
-            // A15: shown over the game even with notices over games off.
-            notifier.notify_critical(&t!("Can't record {game}", game = game.id.name), &t!("It runs as administrator. Open Laurel and restart it as administrator."));
-        } else {
-            self.apply();
-            let _ = self.app.emit("game-state", self.snapshot());
-            notifier.notify(Kind::Info, &t!("Recording {game} by its window", game = game.id.name), &t!("Game capture did not start, so Laurel records the game's window"));
-        }
-    }
-
-    /// Tries the hook of a game recorded by its window again (A7 of the stability
-    /// tests): the engine puts a game capture of the same window over the window
-    /// capture for RETRY_FOR. Once it hooks the game, the game capture takes over
-    /// without a second hook, and the window capture goes, with the border Windows
-    /// 10 draws around a captured window.
-    fn retry_hook(&self) {
-        let (game, retry) = {
-            let s = self.state.lock().unwrap();
-            let windowed = s.applied.as_ref().is_some_and(|(target, _)| target.starts_with("window:"));
-            match (&s.current, s.retry) {
-                (Some(g), Some(retry)) if windowed && s.fallback.as_deref() == Some(g.id.key.as_str()) => (g.clone(), retry),
-                _ => return,
-            }
-        };
-        let engine = self.app.state::<Engine>();
-        let now = Instant::now();
-        let next = match retry.until {
-            None if now < retry.next => return,
-            None => {
-                if let Err(e) = engine.request("probeHook", json!({ "enabled": true }), REQUEST_TIMEOUT) {
-                    log!("capture: probeHook failed: {e}");
-                    return;
-                }
-                log!("capture: trying the hook of {} again (try {})", game.id.name, retry.tries + 1);
-                Some(Retry { until: Some(now + RETRY_FOR), ..retry })
-            }
-            Some(until) => {
-                let Ok(status) = engine.request("status", Value::Null, REQUEST_TIMEOUT) else { return };
-                if !status["game"].is_null() {
-                    log!("capture: {} hooked on try {}; back to game capture", game.id.name, retry.tries + 1);
-                    None
-                } else if now >= until {
-                    if let Err(e) = engine.request("probeHook", json!({ "enabled": false }), REQUEST_TIMEOUT) {
-                        log!("capture: probeHook failed: {e}");
-                    }
-                    let wait = (RETRY_FIRST * 2u32.saturating_pow(retry.tries + 1)).min(RETRY_MAX);
-                    log!("capture: {} still not hooked; next try in {} s", game.id.name, wait.as_secs());
-                    Some(Retry { next: now + wait, until: None, tries: retry.tries + 1 })
-                } else {
-                    return;
-                }
-            }
-        };
-        {
-            let mut s = self.state.lock().unwrap();
-            if s.current.as_ref().map(|g| &g.id.key) != Some(&game.id.key) || s.fallback.as_deref() != Some(game.id.key.as_str()) {
-                return;
-            }
-            s.retry = next;
-            if next.is_none() {
-                // The game capture already hooked the game: setCapture for it makes
-                // that capture the one recorded (Recorder::switch_capture). The hook
-                // is checked again, in case the game capture lost it meanwhile.
-                s.fallback = None;
-                s.hook_checked = None;
-            }
-        }
-        if next.is_none() {
-            self.apply();
-            let _ = self.app.emit("game-state", self.snapshot());
-        }
-    }
-
-    /// Brings the engine to the wanted capture target and recording state.
-    fn apply(&self) {
-        let _serial = self.apply_lock.lock().unwrap();
-        let (target, recording, applied, pid) = {
-            let s = self.state.lock().unwrap();
-            let (t, r) = wanted(&s);
-            (t, r, s.applied.clone(), s.current.as_ref().map(|g| g.pid))
-        };
-        if applied.as_ref() == Some(&(target.clone(), recording)) {
-            return;
-        }
-        let engine = self.app.state::<Engine>();
-        if engine.state()["state"] != "ready" {
-            return; // engine_ready applies it
-        }
-        let (have_target, have_recording) = applied.unwrap_or_else(|| initial(&self.state.lock().unwrap()));
-        if have_target != target {
-            if let Err(e) = engine.request("setCapture", json!({ "target": target }), REQUEST_TIMEOUT) {
-                log!("capture: setCapture {target} failed: {e}");
-                return;
-            }
-        }
-        if have_recording != recording {
-            if let Err(e) = engine.request("setRecording", json!({ "enabled": recording }), REQUEST_TIMEOUT) {
-                log!("capture: setRecording {recording} failed: {e}");
-                return;
-            }
-        }
-        log!("capture: target {target}, recording {recording}");
-        let screen_started = target.starts_with("monitor") && !have_target.starts_with("monitor") && recording;
-        {
-            let mut s = self.state.lock().unwrap();
-            if have_target != target {
-                s.capture_started = Some(Instant::now());
-            }
-            s.applied = Some((target, recording));
-            s.applied_pid = pid;
-        }
-        if screen_started {
-            let secs = engine.state()["info"]["bufferSecs"].as_u64().unwrap_or_default();
-            self.app.state::<Notifier>().notify(Kind::Info, &t!("Recording the screen"), &t!("Laurel keeps the last {secs} s of your screen", secs = secs));
-        }
-    }
-}
-
-/// What the engine starts with (see engine_args).
-fn initial(s: &State) -> (String, bool) {
-    match &s.mode {
-        Mode::Fixed(target) if s.enabled => (target.clone(), true),
-        _ => ("none".into(), false),
-    }
-}
-
-/// The capture target and recording state the engine should have.
-fn wanted(s: &State) -> (String, bool) {
-    if !s.enabled {
-        return ("none".into(), false);
-    }
-    match &s.mode {
-        Mode::Fixed(target) => (target.clone(), !s.disk_paused),
-        Mode::Detect => {
-            let game = s.current.as_ref().filter(|_| s.screen.as_ref().is_none_or(|screen| screen.switch_to_games));
-            match (game, &s.screen) {
-                // A29: nothing can be recorded of a parked game; the screen, when the
-                // player records it without a game.
-                (Some(game), Some(screen)) if s.parked == Some(game.pid) => (screen.target(), !s.disk_paused),
-                (Some(game), None) if s.parked == Some(game.pid) => ("none".into(), false),
-                (Some(game), _) if game.capture == Capture::Window || s.fallback.as_deref() == Some(game.id.key.as_str()) => (format!("window:{}", game.spec()), !s.disk_paused),
-                (Some(game), _) => (format!("game:{}", game.spec()), !s.disk_paused),
-                (None, Some(screen)) => (screen.target(), !s.disk_paused),
-                (None, None) => ("none".into(), false),
-            }
-        }
-    }
-}
-
-/// game, window, screen or none, for the UI.
-fn capture_kind(target: &str) -> &'static str {
-    match target.split(':').next().unwrap_or_default() {
-        "game" => "game",
-        "window" => "window",
-        t if t.starts_with("monitor") => "screen",
-        _ => "none",
+        self.core.games_open(&self.catalog(), &settings.user_games())
     }
 }
 

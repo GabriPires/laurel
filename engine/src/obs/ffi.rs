@@ -121,11 +121,6 @@ pub type log_handler_t = unsafe extern "C" fn(level: i32, msg: *const c_char, ar
 pub type obs_task_t = Option<unsafe extern "C" fn(param: *mut c_void)>;
 pub type obs_task_handler_t = unsafe extern "C" fn(task: obs_task_t, param: *mut c_void, wait: bool);
 
-// log levels (util/base.h)
-pub const LOG_ERROR: i32 = 100;
-pub const LOG_WARNING: i32 = 200;
-pub const LOG_INFO: i32 = 300;
-
 #[repr(C)]
 pub struct dstr {
     pub array: *mut c_char,

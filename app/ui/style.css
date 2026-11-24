@@ -110,6 +110,8 @@ input.switch:disabled { opacity: 0.45; cursor: default; }
 .side-item:hover { background: var(--surface); color: var(--text); }
 .side-item.active { background: var(--primary-soft); color: var(--text); font-weight: 600; }
 .side-item.active > svg { color: var(--primary); }
+/* A row's icon keeps its size beside a long name, such as a tag's (spec library.tags). */
+.side-item > svg { flex: none; }
 .side-item .kept-icon { color: var(--accent); }
 .side-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .count { flex: none; font: 12px var(--mono); color: var(--muted); }
@@ -182,13 +184,28 @@ h1 { margin: 0; font: 700 22px var(--display); letter-spacing: 1px; }
 .preview { position: absolute; inset: 0; width: 100%; height: 100%; border-radius: 5px; object-fit: cover; opacity: 0; transition: opacity 0.15s; pointer-events: none; }
 .preview.shown { opacity: 1; }
 .item.previewing .play { opacity: 0; }
+/* The look of what sits over a thumbnail: Kept, the trophy, a clip's length, the
+   days left in Recently deleted and the tags. */
+.kept, .trophy, .badge, .deleted-badge, .card-tag, .card-more { padding: 2px 6px; border-radius: 4px; background: var(--scrim); font-size: 12px; }
 /* Marks at the top left of a thumbnail: kept (violet) and made from an achievement (blue trophy). */
 .marks { z-index: 1; position: absolute; left: 8px; top: 8px; display: flex; gap: 4px; }
-.kept, .trophy { display: inline-flex; align-items: center; gap: 4px; padding: 2px 6px; border-radius: 4px; background: var(--scrim); font-size: 12px; }
+.kept, .trophy { display: inline-flex; align-items: center; gap: 4px; }
 .kept { color: var(--accent); }
 .trophy { color: var(--trophy); }
 .side-item .trophy-icon, .trophy-value { color: var(--trophy); }
-.badge { z-index: 1; position: absolute; right: 8px; bottom: 8px; padding: 2px 6px; border-radius: 4px; background: var(--scrim); font: 500 11px var(--mono); }
+/* The bottom of a thumbnail: the tags over the days left in Recently deleted on the
+   left, a clip's length on the right; the tags stop 8 px before it, or take the
+   whole width on a screenshot. */
+.thumb-foot { z-index: 1; position: absolute; left: 8px; right: 8px; bottom: 8px; display: flex; align-items: flex-end; gap: 8px; }
+.thumb-left { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+.badge { flex: none; margin-left: auto; font: 500 11px var(--mono); }
+/* The tags on a card (spec library.tags): grown from nothing up to its own width,
+   each chip keeps a short name whole and cuts a long one with "…"; "+N" never
+   shrinks. */
+.card-tags { align-self: stretch; display: flex; gap: 4px; min-width: 0; }
+.card-tag, .card-more { color: var(--soft); white-space: nowrap; }
+.card-tag { flex: 1 1 0; min-width: 0; max-width: max-content; overflow: hidden; text-overflow: ellipsis; }
+.card-more { flex: none; }
 .item .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .item .meta { font-size: 12px; color: var(--muted); }
 
@@ -207,8 +224,11 @@ section:hover > .group-head .group-select, .selecting .group-select, .group-sele
 .selection-main { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .selection-main .link-btn { align-self: center; }
 .selection-count { font-weight: 600; }
+/* The selection bar's Tags button opens the viewer's tag picker under it, over the grid. */
+.sel-tags { position: relative; }
+.sel-tags .tag-picker { position: absolute; top: calc(100% + 8px); right: 0; width: 320px; max-width: calc(100vw - 48px); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45); }
 .selection-question { color: var(--text); }
-.deleted-badge { z-index: 1; position: absolute; left: 8px; bottom: 8px; padding: 2px 6px; border-radius: 4px; background: var(--scrim); color: var(--danger-text); font-size: 12px; }
+.deleted-badge { color: var(--danger-text); }
 .deleted-note { margin: 0; padding: 10px 12px; border: 1px solid var(--danger-line); border-radius: 8px; background: var(--danger-bg); color: var(--soft); font-size: 13px; }
 .toast { z-index: 20; position: fixed; left: 50%; bottom: 24px; display: flex; align-items: center; gap: 16px; max-width: calc(100vw - 48px); padding: 12px 18px; border: 1px solid var(--line); border-radius: 8px; background: var(--raised); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45); transform: translateX(-50%); }
 .toast .link-btn { align-self: center; }
@@ -279,6 +299,30 @@ body.player-full .stage { position: fixed; inset: 0; z-index: 50; border: 0; bor
 .detail-game:hover { background: var(--surface); }
 .detail-game-name { flex: 1 1 auto; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
 .detail-game-count { flex: none; font-size: 12px; color: var(--primary); }
+/* Tags (spec library.tags): one neutral style for every tag, no colour or icon of
+   its own. Chips wrap to the next line; a name is cut with "…" only when its chip
+   alone is wider than the panel. */
+.tag-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.tag-chip { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; min-width: 0; height: 26px; padding: 0 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--raised); color: var(--soft); font-size: 13px; }
+.tag-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tag-remove { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; margin-right: -4px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: var(--muted); cursor: pointer; }
+.tag-remove:hover { background: var(--line); color: var(--text); }
+.tag-add { flex: none; height: 26px; padding: 0 8px; border: 1px dashed var(--line); border-radius: 6px; background: transparent; color: var(--muted); font-size: 13px; font-weight: 500; cursor: pointer; }
+.tag-add:hover, .tag-add[aria-expanded="true"] { border-color: var(--muted); color: var(--text); }
+.tag-picker { display: flex; flex-direction: column; gap: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.tag-options { display: flex; flex-direction: column; gap: 10px; max-height: 320px; overflow-y: auto; }
+.tag-group { display: flex; flex-direction: column; gap: 6px; }
+.tag-group-label { font-size: 12px; font-weight: 500; letter-spacing: 1.6px; text-transform: uppercase; color: var(--muted); }
+.tag-option { cursor: pointer; }
+.tag-option:hover { border-color: var(--muted); color: var(--text); }
+.tag-option[aria-pressed="true"], .tag-option[aria-pressed="mixed"] { border-color: var(--soft); color: var(--text); }
+.tag-check, .tag-some { flex: none; }
+.tag-option:not([aria-pressed="true"]) .tag-check, .tag-option:not([aria-pressed="mixed"]) .tag-some { display: none; }
+.tag-none { margin: 0; font-size: 13px; color: var(--muted); }
+.tag-create { display: inline-flex; align-self: flex-start; align-items: center; gap: 4px; max-width: 100%; min-width: 0; height: 26px; padding: 0 8px; border: 1px dashed var(--line); border-radius: 4px; background: transparent; color: var(--soft); font-size: 13px; cursor: pointer; }
+.tag-create svg { flex: none; }
+.tag-create:hover, .tag-create:focus-visible { border-color: var(--muted); color: var(--text); }
+.tag-error { margin: 0; font-size: 13px; color: var(--danger-text); }
 .facts { display: grid; grid-template-columns: auto 1fr; gap: 10px 14px; margin: 0; font-size: 13px; }
 .facts dt { color: var(--muted); }
 .facts dd { margin: 0; overflow-wrap: anywhere; }
@@ -333,8 +377,8 @@ kbd.hotkey.capturing { border: 1px dashed var(--primary); background: var(--grou
 
 /* Games */
 .game-list { max-height: 360px; overflow: auto; }
-.game-list li { display: flex; align-items: center; gap: 12px; padding: 10px 18px; }
-.game-list li + li { border-top: 1px solid var(--line); }
+.game-list li, .tag-list li { display: flex; align-items: center; gap: 12px; padding: 10px 18px; }
+.game-list li + li, .tag-list li + li { border-top: 1px solid var(--line); }
 .game-list .game-name { flex: 1 1 auto; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
 .game-list .game-name-input { font: inherit; font-weight: 600; padding: 4px 8px; border-color: transparent; background: transparent; }
 .game-list .game-name-input:hover { border-color: var(--line); }
@@ -344,6 +388,16 @@ kbd.hotkey.capturing { border: 1px dashed var(--primary); background: var(--grou
 .game-list .live { flex: none; color: var(--primary); font-size: 12px; font-weight: 600; }
 .add-game { display: flex; align-items: center; gap: 8px; }
 .add-game select { flex: 1 1 auto; }
+
+/* Tags: a row of the list above (as a game's), which wraps for a confirmation or a
+   refusal; a long name is cut with "…", whole on hover, as in the library's side panel. */
+.tag-list li { flex-wrap: wrap; }
+.tag-row-name { flex: 1 1 0; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tag-row-group { flex: none; font-size: 12px; color: var(--muted); }
+.tag-row-count { flex: none; min-width: 64px; font: 12px var(--mono); color: var(--muted); text-align: right; }
+.tag-rename-input { flex: 1 1 0; min-width: 0; }
+.add-tag { display: flex; align-items: center; gap: 8px; }
+.add-tag input { flex: 1 1 auto; min-width: 0; }
 
 /* Advanced */
 .capture-state { display: flex; align-items: center; gap: 8px; margin: 0; font-weight: 600; color: var(--muted); }

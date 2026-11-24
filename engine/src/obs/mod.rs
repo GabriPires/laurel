@@ -13,6 +13,7 @@ use std::sync::mpsc::{Sender, SyncSender};
 use std::sync::{Mutex, OnceLock};
 
 use laurel_engine_core::frames::FrameCounts;
+use laurel_engine_core::obs_lines::{self, AudioLine, AudioLines, Level};
 
 pub fn cstr(s: &str) -> CString {
     CString::new(s).expect("string without NUL")
@@ -32,18 +33,6 @@ pub fn watch_shared_texture_failures(tx: Option<Sender<String>>) {
     if let Ok(mut slot) = SHARED_TEXTURE_FAILURES.lock() {
         *slot = tx;
     }
-}
-
-/// The source's name and OBS's message in a game capture line such as
-/// "[game-capture: 'capture'] init_shtex_capture: failed to open shared handle".
-fn game_capture_line(line: &str) -> Option<(&str, &str)> {
-    line.strip_prefix("[game-capture: '")?.split_once("'] ")
-}
-
-/// The source in a game capture line that says OBS cannot open the shared texture.
-fn shared_texture_failure(line: &str) -> Option<&str> {
-    let (name, message) = game_capture_line(line)?;
-    message.starts_with("init_shtex_capture: failed to open shared handle").then_some(name)
 }
 
 /// What a WASAPI audio source logged about its device (A16 of the stability tests).
@@ -82,25 +71,11 @@ pub fn take_nvenc_texture_failure() -> Option<String> {
     NVENC_TEXTURE_FAILURE.lock().ok().and_then(|mut slot| slot.take())
 }
 
-/// The reason in an obs-nvenc line about its texture encoder, if it is one: an
-/// error ("init_session: ... failed: 1 (NV_ENC_ERR_NO_ENCODE_DEVICE)" gives the
-/// error's name) or a fallback it chose ("..., falling back to non-texture encoder").
-fn nvenc_texture_failure(level: i32, line: &str) -> Option<String> {
-    let message = line.strip_prefix("[obs-nvenc] ")?;
-    if message.contains("falling back to") {
-        return Some(message.to_string());
-    }
-    if level != ffi::LOG_ERROR {
-        return None;
-    }
-    let named = message.rsplit_once('(').and_then(|(_, rest)| rest.strip_suffix(')')).filter(|name| name.starts_with("NV_ENC_ERR_"));
-    Some(named.unwrap_or(message).to_string())
-}
-
 thread_local! {
-    /// The error of the last "[WASAPISource::TryInitialize]" line on this thread;
-    /// the same thread then logs which source failed to start.
-    static INIT_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// The reader of win-wasapi's lines on this thread, which keeps the error of a
+    /// "[WASAPISource::TryInitialize]" line; the same thread then logs which source
+    /// failed to start.
+    static AUDIO_LINES: RefCell<AudioLines> = RefCell::new(AudioLines::default());
 }
 
 /// Starts (or, with None, stops) sending audio device events to `tx`.
@@ -110,27 +85,12 @@ pub fn watch_audio_events(tx: Option<Sender<AudioEvent>>) {
     }
 }
 
-/// The audio device event in a libobs line (win-wasapi), if any:
-/// "[WASAPISource::TryInitialize]:[<device>] Failed to initialize audio client: 80070005",
-/// "WASAPI: Device 'default' failed to start (source: microphone)",
-/// "Device '<device>' invalidated.  Retrying (source: microphone)",
-/// "WASAPI: Device '<device>' [48000 Hz] initialized (source: microphone)".
+/// The audio device event in a libobs line (win-wasapi), if any.
 fn audio_event(line: &str) -> Option<AudioEvent> {
-    if let Some(rest) = line.strip_prefix("[WASAPISource::TryInitialize]:[") {
-        let code = rest.rsplit(": ").next().filter(|c| !c.is_empty() && c.chars().all(|ch| ch.is_ascii_hexdigit()));
-        INIT_ERROR.with(|e| *e.borrow_mut() = code.map(str::to_ascii_uppercase));
-        return None;
-    }
-    let source = line.strip_suffix(')')?.rsplit_once("(source: ")?.1.to_string();
-    if line.starts_with("WASAPI: Device '") && line.contains("' failed to start (source: ") {
-        Some(AudioEvent::Failed { source, code: INIT_ERROR.with(|e| e.borrow_mut().take()) })
-    } else if line.starts_with("Device '") && line.contains("' invalidated.  Retrying (source: ") {
-        Some(AudioEvent::Failed { source, code: None })
-    } else if line.starts_with("WASAPI: Device '") && line.contains("] initialized (source: ") {
-        Some(AudioEvent::Started { source })
-    } else {
-        None
-    }
+    Some(match AUDIO_LINES.with(|audio| audio.borrow_mut().read(line))? {
+        AudioLine::Failed { source, code } => AudioEvent::Failed { source, code },
+        AudioLine::Started { source } => AudioEvent::Started { source },
+    })
 }
 
 /// Sends libobs log messages to stderr (the default handler prints to stdout, which
@@ -144,14 +104,9 @@ unsafe extern "C" fn on_log(level: i32, msg: *const c_char, args: *mut c_void, _
     ffi::dstr_vprintf(&mut text, msg, args);
     let line = opt_string(text.array).unwrap_or_default();
     ffi::bfree(text.array.cast());
-    let prefix = match level {
-        ffi::LOG_ERROR => "error",
-        ffi::LOG_WARNING => "warning",
-        ffi::LOG_INFO => "info",
-        _ => "debug",
-    };
-    log!("{prefix}: {line}");
-    if let Some(reason) = nvenc_texture_failure(level, &line) {
+    let level = Level::from_obs(level);
+    log!("{}: {line}", level.name());
+    if let Some(reason) = obs_lines::nvenc_texture_failure(level, &line) {
         if let Ok(mut slot) = NVENC_TEXTURE_FAILURE.lock() {
             *slot = Some(reason);
         }
@@ -162,17 +117,17 @@ unsafe extern "C" fn on_log(level: i32, msg: *const c_char, args: *mut c_void, _
         }
     }
     // A24: libobs logs this after a Direct3D 11 call fails on a lost device.
-    if line.contains("Device Removed Reason") {
+    if obs_lines::device_removed(&line) {
         crate::health::wake();
     }
-    if let Some(name) = shared_texture_failure(&line) {
+    if let Some(name) = obs_lines::shared_texture_failure(&line) {
         if let Some(tx) = SHARED_TEXTURE_FAILURES.lock().ok().as_ref().and_then(|slot| slot.as_ref()) {
             let _ = tx.send(name.to_string());
         }
     }
     // A34: right here, in the thread that stopped the game capture, so that the
     // engine clears the hook's stop signal after OBS set it.
-    if let Some((name, message)) = game_capture_line(&line) {
+    if let Some((name, message)) = obs_lines::game_capture_line(&line) {
         crate::hook_stop::on_game_capture_line(name, message);
     }
 }

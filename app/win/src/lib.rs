@@ -1,6 +1,13 @@
 //! The Win32 calls the app needs, declared by hand and linked with `raw-dylib`
 //! (no import libraries are needed when cross-compiling from WSL). Window handles
-//! are passed as `isize`.
+//! are passed as `isize`. A crate of its own, apart from the app's Tauri, so that
+//! its tests reach the real Windows behind laurel_app_core's traits (the game
+//! detector's [`Win32`] platform); it holds nothing on other systems.
+#![cfg(windows)]
+
+mod platform;
+
+pub use platform::Win32;
 
 use std::ffi::c_void;
 
@@ -743,6 +750,8 @@ pub fn raw_input_device_id(device: isize) -> Option<String> {
 }
 
 static RAW_HANDLER: std::sync::OnceLock<fn(RawInput)> = std::sync::OnceLock::new();
+/// Where a failed change of the Raw Input registration is reported.
+static RAW_ERRORS: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
 
 fn register_devices(hwnd: isize, mouse: bool) -> Result<(), String> {
     let size = std::mem::size_of::<RawInputDevice>() as u32;
@@ -765,8 +774,8 @@ fn register_devices(hwnd: isize, mouse: bool) -> Result<(), String> {
 extern "system" fn raw_input_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize {
     match msg {
         WM_APP_RAW_INPUT => {
-            if let Err(e) = register_devices(hwnd, wparam != 0) {
-                crate::log::log!("hotkeys: {e}");
+            if let (Err(e), Some(report)) = (register_devices(hwnd, wparam != 0), RAW_ERRORS.get()) {
+                report(&e);
             }
             0
         }
@@ -806,8 +815,11 @@ extern "system" fn raw_input_proc(hwnd: isize, msg: u32, wparam: usize, lparam: 
 
 /// Creates the hidden message-only window that receives Raw Input on the calling
 /// thread, registered for the keyboard. Run `run_message_loop` on the same thread.
-pub fn raw_input_window(handler: fn(RawInput)) -> Result<isize, String> {
+/// A later change of the registration that fails (`request_raw_input`) goes to
+/// `errors`.
+pub fn raw_input_window(handler: fn(RawInput), errors: fn(&str)) -> Result<isize, String> {
     RAW_HANDLER.set(handler).map_err(|_| "raw input already started".to_string())?;
+    let _ = RAW_ERRORS.set(errors);
     let class = wide("LaurelRawInput");
     unsafe {
         let instance = GetModuleHandleW(std::ptr::null());
@@ -1297,4 +1309,53 @@ pub fn simulate_session_end(ask: bool) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Runs FFmpeg's program (`program`, the runtime's ffmpeg.exe) with `args`, without
+/// a console window: the function behind laurel_app_core::media::Ffmpeg. Ok when it
+/// ends well, else its error output.
+pub fn run_ffmpeg(program: &std::path::Path, args: &[std::ffi::OsString]) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new(program)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("could not run ffmpeg: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("ffmpeg failed: {}", String::from_utf8_lossy(&out.stderr).trim()))
+    }
+}
+
+/// Windows behind the library (laurel_app_core::library::Desktop): the Recycle Bin
+/// and hidden folders, with the app's log and the interface's texts given by the app.
+pub struct WinDesktop {
+    log: Box<dyn Fn(&str) + Send + Sync>,
+    text: Box<dyn Fn(laurel_app_core::library::Text) -> String + Send + Sync>,
+}
+
+impl WinDesktop {
+    pub fn new(log: impl Fn(&str) + Send + Sync + 'static, text: impl Fn(laurel_app_core::library::Text) -> String + Send + Sync + 'static) -> WinDesktop {
+        WinDesktop { log: Box::new(log), text: Box::new(text) }
+    }
+}
+
+impl laurel_app_core::library::Desktop for WinDesktop {
+    fn hide(&self, folder: &std::path::Path) {
+        set_hidden(folder);
+    }
+
+    fn remove(&self, file: &std::path::Path, recycle: bool) -> Result<(), String> {
+        delete_file(file, recycle)
+    }
+
+    fn log(&self, line: &str) {
+        (self.log)(line);
+    }
+
+    fn text(&self, text: laurel_app_core::library::Text) -> String {
+        (self.text)(text)
+    }
 }

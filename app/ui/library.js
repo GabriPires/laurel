@@ -1,7 +1,8 @@
 // Library, the home screen (specs library.browse, library.thumbnails, edit.trim,
-// share.local, library.trash): a side panel with All, Clips, Screenshots, Kept,
-// Recently deleted, the games and the storage used; a grid of clips and screenshots
-// grouped by day, sorted and searched, with a muted preview of a clip under the
+// share.local, library.trash, library.tags): a side panel with All, Clips,
+// Screenshots, Kept, Recently deleted, the games, the tags and the storage used; a
+// grid of clips and screenshots grouped by day, sorted and searched (by game, file
+// name, achievement or tag), with a muted preview of a clip under the
 // pointer, where several items can be selected and kept, deleted or restored at
 // once; and the viewer, with Laurel's own player, the previous and next item, the
 // trim under the video and the details and actions on the right, Delete included.
@@ -13,9 +14,17 @@ const { convertFileSrc } = window.__TAURI__.core;
 // original's place keeps the path, and the WebView would play the cached original.
 const mediaSrc = (item) => `${convertFileSrc(item.path)}?v=${item.size}-${item.durationMs ?? 0}`;
 
-const library = { items: [], deleted: [], filter: { type: 'all' }, sort: 'new', query: '', current: null, selected: new Set(), anchor: null, confirm: null };
+// tagCounts: each tag in use, by ID, with its items outside Recently deleted and in
+// it, as the index counts them ({ funny: { items: 2, deleted: 1 } }).
+const library = { items: [], deleted: [], tagCounts: {}, filter: { type: 'all' }, sort: 'new', query: '', current: null, selected: new Set(), anchor: null, confirm: null };
+// The open tag picker (see Tags below): what it works on (target, viewerTags or
+// barTags, null while it is closed), the button that opened it, and the box that
+// holds both.
+const tagPicker = { target: null, button: null, box: null };
 
 const typeTitle = (type) => ({ all: t('All'), clip: t('Clips'), screenshot: t('Screenshots'), kept: t('Kept'), achievement: t('Achievements'), deleted: t('Recently deleted') })[type];
+// One icon for every tag in the side panel: the tags have no icon of their own.
+const TAG_ICON = '<path d="M4 4h7l9 9-7 7-9-9z"/><circle cx="8" cy="8" r="1.4"/>';
 const TROPHY = '<path d="M8 4h8v5a4 4 0 01-8 0V4z"/><path d="M8 6H5.5a2.5 2.5 0 002.7 3.5M16 6h2.5a2.5 2.5 0 01-2.7 3.5"/><path d="M12 13v4M8.5 20h7M10 17h4"/>';
 const DAY_MS = 86400000;
 const deletedDays = () => settings?.deletedDays ?? 7;
@@ -96,6 +105,7 @@ function matches(item, filter) {
   if (filter.type === 'kept') return item.kept;
   if (filter.type === 'achievement') return item.achievement != null;
   if (filter.type === 'game') return gameKey(item) === filter.key;
+  if (filter.type === 'tag') return (item.tags ?? []).includes(filter.id);
   return true;
 }
 
@@ -117,10 +127,12 @@ function libraryGames() {
 const sortTime = (item) => item.deletedMs ?? item.createdMs;
 function visible() {
   const query = library.query.trim().toLowerCase();
+  const tagQuery = foldName(query);
   const source = inTrash() ? library.deleted : library.items;
   const items = source.filter((item) => (inTrash() || matches(item, library.filter))
     && (!query || gameOf(item).toLowerCase().includes(query) || fileName(item.path).toLowerCase().includes(query)
-      || (item.achievement?.name ?? '').toLowerCase().includes(query)));
+      || (item.achievement?.name ?? '').toLowerCase().includes(query)
+      || (tagQuery && (item.tags ?? []).some((id) => tagFound(id, tagQuery)))));
   if (library.sort === 'old') items.sort((a, b) => sortTime(a) - sortTime(b));
   else if (library.sort === 'size') items.sort((a, b) => b.size - a.size);
   else items.sort((a, b) => sortTime(b) - sortTime(a));
@@ -161,6 +173,26 @@ function renderSide() {
     count.textContent = game.count;
     button.append(tile, name, count);
     button.onclick = () => setFilter({ type: 'game', key: game.key, name: game.name });
+    return button;
+  }));
+  // The tags with items outside Recently deleted, by the name shown.
+  const tags = Object.entries(library.tagCounts).filter(([, count]) => count.items > 0)
+    .map(([id, count]) => ({ id, name: tagName(id), count: count.items }))
+    .sort((a, b) => a.name.localeCompare(b.name, LOCALE) || a.id.localeCompare(b.id));
+  $('side-tags-label').hidden = !tags.length;
+  $('side-tags').replaceChildren(...tags.map((tag) => {
+    const button = document.createElement('button');
+    button.className = 'side-item';
+    button.classList.toggle('active', library.filter.type === 'tag' && library.filter.id === tag.id);
+    const name = document.createElement('span');
+    name.className = 'side-name';
+    name.textContent = tag.name;
+    name.title = tag.name;
+    const count = document.createElement('span');
+    count.className = 'count';
+    count.textContent = tag.count;
+    button.append(svgIcon(TAG_ICON), name, count);
+    button.onclick = () => setFilter({ type: 'tag', id: tag.id });
     return button;
   }));
 }
@@ -211,6 +243,85 @@ function startPreview(card, item) {
 
 const CHECK = '<path d="M5 12l4 4 10-10" stroke-width="3"/>';
 
+// The tags on a card (spec library.tags, Cartão; the owner's point: a long name
+// never leaks from its chip): the first two in chip order and "+N" for the rest,
+// all of them in the tooltip. The CSS shares the row: each chip grows up to its own
+// width, so a short name stays whole while a long one is cut with "…", and "+N"
+// never shrinks. Only "a second chip left with fewer than about four characters
+// goes into +N" needs a measure, in fitCardTags.
+const CARD_TAGS_SHOWN = 2;
+const CARD_MIN_VISIBLE = 4;
+
+function cardTags(tags) {
+  const row = document.createElement('span');
+  row.className = 'card-tags';
+  row.dataset.count = tags.length;
+  const names = tags.map(tagName);
+  const all = names.join('\n');
+  for (const name of names.slice(0, CARD_TAGS_SHOWN)) {
+    const chip = document.createElement('span');
+    chip.className = 'card-tag';
+    chip.textContent = name;
+    chip.title = all;
+    row.append(chip);
+  }
+  const more = document.createElement('span');
+  more.className = 'card-more';
+  more.title = all;
+  row.append(more);
+  showCardTags(row, CARD_TAGS_SHOWN);
+  return row;
+}
+
+// Shows the first `shown` chips of a row and "+N" for the others.
+function showCardTags(row, shown) {
+  const count = Number(row.dataset.count);
+  const chips = row.querySelectorAll('.card-tag');
+  chips.forEach((chip, i) => { chip.hidden = i >= shown; });
+  const more = row.lastElementChild;
+  more.hidden = count <= shown;
+  more.textContent = `+${count - shown}`;
+}
+
+// Moves into "+N" each second chip that shows fewer than CARD_MIN_VISIBLE
+// characters, as the user sees them (graphemes: "👍🏽" is one): its first ones and
+// the "…" do not fit in it, and its whole name does not either. On each render
+// and when the grid's width changes; the writes go first and the reads after, so
+// the whole grid is laid out once.
+const textMeasurer = document.createElement('canvas').getContext('2d');
+const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
+function fitCardTags() {
+  const rows = [...$('library-groups').querySelectorAll('.card-tags')].filter((row) => Number(row.dataset.count) > 1);
+  for (const row of rows) showCardTags(row, CARD_TAGS_SHOWN);
+  // Hidden (the viewer or another section open): the width coming back fits them.
+  if (!rows.length || !rows[0].getBoundingClientRect().width) return;
+  const style = getComputedStyle(rows[0].querySelector('.card-tag'));
+  textMeasurer.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+  const padding = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+  const width = (text) => textMeasurer.measureText(text).width;
+  const squeezed = rows.filter((row) => {
+    const chip = row.querySelectorAll('.card-tag')[1];
+    const room = chip.getBoundingClientRect().width - padding;
+    const name = chip.textContent;
+    const first = [...graphemes.segment(name)].slice(0, CARD_MIN_VISIBLE).map((g) => g.segment).join('');
+    // A whole name within a pixel of its room fits: the canvas and the layout can
+    // measure the same text a fraction of a pixel apart.
+    return room + 1 < width(name) && room < width(`${first}…`);
+  });
+  for (const row of squeezed) showCardTags(row, 1);
+}
+
+let gridWidth = 0;
+new ResizeObserver(([entry]) => {
+  const width = Math.round(entry.contentRect.width);
+  if (width === gridWidth) return;
+  gridWidth = width;
+  if (width) fitCardTags();
+}).observe($('library-groups'));
+// A web font that ends loading changes the names' widths.
+document.fonts.addEventListener('loadingdone', () => fitCardTags());
+
 function card(item, withDay) {
   const button = document.createElement('button');
   button.className = 'item';
@@ -228,12 +339,6 @@ function card(item, withDay) {
     else toggleSelect(item.path);
   };
   thumb.append(box);
-  if (item.deletedMs != null) {
-    const left = document.createElement('span');
-    left.className = 'deleted-badge';
-    left.textContent = tp(daysLeft(item), 'Goes in {n} day', 'Goes in {n} days');
-    thumb.append(left);
-  }
   const marks = document.createElement('span');
   marks.className = 'marks';
   if (item.kept) {
@@ -252,6 +357,20 @@ function card(item, withDay) {
     marks.append(trophy);
   }
   if (marks.childElementCount) thumb.append(marks);
+  // The bottom of the thumbnail: on the left the tags, over the days left in
+  // Recently deleted; on the right a clip's length, which the tags stop before.
+  const foot = document.createElement('span');
+  foot.className = 'thumb-foot';
+  const left = document.createElement('span');
+  left.className = 'thumb-left';
+  if (item.tags?.length) left.append(cardTags(item.tags));
+  if (item.deletedMs != null) {
+    const days = document.createElement('span');
+    days.className = 'deleted-badge';
+    days.textContent = tp(daysLeft(item), 'Goes in {n} day', 'Goes in {n} days');
+    left.append(days);
+  }
+  if (left.childElementCount) foot.append(left);
   if (item.kind === 'clip') {
     const play = document.createElement('span');
     play.className = 'play';
@@ -260,8 +379,10 @@ function card(item, withDay) {
     const badge = document.createElement('span');
     badge.className = 'badge';
     badge.textContent = fmtDuration(item.durationMs);
-    thumb.append(play, badge);
+    thumb.append(play);
+    foot.append(badge);
   }
+  if (foot.childElementCount) thumb.append(foot);
   const name = document.createElement('span');
   name.className = 'name';
   name.textContent = gameOf(item);
@@ -302,6 +423,13 @@ function emptyText() {
   }[library.filter.type] ?? t('No clips yet. Press {key} in a game to save the last seconds.', { key: clipKey });
 }
 
+// The grid's title: the chosen game's or tag's name, else the filter's.
+function filterTitle(filter) {
+  if (filter.type === 'game') return filter.name;
+  if (filter.type === 'tag') return tagName(filter.id);
+  return typeTitle(filter.type);
+}
+
 function renderLibrary() {
   stopPreview();
   renderSide();
@@ -309,7 +437,7 @@ function renderLibrary() {
   // The selection keeps only what is shown.
   const shown = new Set(items.map((i) => i.path));
   library.selected = new Set([...library.selected].filter((path) => shown.has(path)));
-  $('library-title').textContent = library.filter.type === 'game' ? library.filter.name : typeTitle(library.filter.type);
+  $('library-title').textContent = filterTitle(library.filter);
   $('library-count').textContent = tp(items.length, '{n} item', '{n} items');
   $('library-empty').hidden = items.length > 0;
   $('library-empty').textContent = emptyText();
@@ -347,15 +475,17 @@ function renderLibrary() {
     section.append(grid);
     return section;
   }));
+  fitCardTags();
   showSelection();
 }
 
 async function loadLibrary() {
   try {
-    [library.items, library.deleted] = await Promise.all([invoke('library_list', {}), invoke('library_list', { deleted: true })]);
+    [library.items, library.deleted, library.tagCounts] = await Promise.all([invoke('library_list', {}), invoke('library_list', { deleted: true }), invoke('library_tag_counts')]);
   } catch (e) {
     library.items = [];
     library.deleted = [];
+    library.tagCounts = {};
     activity(t('Could not read the library: {error}', { error: e }), 'bad');
   }
 }
@@ -367,6 +497,12 @@ function setFilter(filter) {
   closeViewer(false);
   renderLibrary();
   $('library-groups').closest('.pane').scrollTop = 0;
+}
+
+// A custom tag deleted in Settings › Tags: a library filtered by it goes back to
+// All, as no item can have it now and its name is gone.
+function leaveTagFilter(id) {
+  if (library.filter.type === 'tag' && library.filter.id === id) setFilter({ type: 'all' });
 }
 
 // Selection (a friends' suggestion, 2026-10-25): the cards follow it without a
@@ -388,6 +524,8 @@ const selectedItems = () => visible().filter((item) => library.selected.has(item
 function showBar() {
   const n = library.selected.size;
   const confirm = library.confirm;
+  // The bar's tag picker closes when the selection it serves changes.
+  if (tagPicker.target === barTags && !barPickerServes(barTags.paths)) closeTagPicker(false);
   $('selection-bar').hidden = !confirm && n === 0;
   $('selection-bar').classList.toggle('danger', Boolean(confirm));
   $('selection-main').hidden = Boolean(confirm);
@@ -398,7 +536,7 @@ function showBar() {
     return;
   }
   $('selection-count').textContent = tp(n, '{n} selected', '{n} selected');
-  for (const id of ['sel-keep', 'sel-delete']) $(id).hidden = inTrash();
+  for (const id of ['sel-keep', 'sel-tags-box', 'sel-delete']) $(id).hidden = inTrash();
   for (const id of ['sel-restore', 'sel-purge']) $(id).hidden = !inTrash();
   const chosen = selectedItems();
   $('sel-keep').textContent = chosen.length && chosen.every((i) => i.kept) ? t('Stop keeping') : t('Keep');
@@ -467,6 +605,7 @@ $('sel-keep').onclick = async () => {
   await loadLibrary();
   renderLibrary();
 };
+$('sel-tags').onclick = () => ($('tag-picker').hidden ? openBarTagPicker() : closeTagPicker());
 $('sel-delete').onclick = () => askDeleteSelection();
 $('sel-restore').onclick = () => restoreItems([...library.selected]);
 $('sel-purge').onclick = () => askDeleteSelection();
@@ -551,9 +690,10 @@ async function purgeItems(paths) {
 }
 
 // Library keys, while the grid is shown: Esc drops the selection or the question,
-// Ctrl+A selects everything shown, Del deletes the selection.
+// Ctrl+A selects everything shown, Del deletes the selection. Keys in the open tag
+// picker are its own.
 document.addEventListener('keydown', (e) => {
-  if ($('view-library').hidden || e.target.matches('input, select, textarea')) return;
+  if ($('view-library').hidden || e.target.matches('input, select, textarea') || e.target.closest('#tag-picker')) return;
   if (e.key === 'Escape' && (library.confirm || library.selected.size)) clearSelection();
   else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') selectAll();
   else if (e.key === 'Delete' && library.selected.size) askDeleteSelection();
@@ -633,6 +773,7 @@ function showDetails(item) {
   $('viewer-path').textContent = item.path;
   $('viewer-open-label').textContent = clip ? t('Open in player') : t('Open in image viewer');
   showKept(item.kept);
+  showTags(item);
   // An item in Recently deleted: Restore and Delete now instead of Keep and Delete.
   const gone = item.deletedMs != null;
   $('viewer-keep').hidden = gone;
@@ -791,6 +932,7 @@ function openViewer(item) {
   $('viewer-when').textContent = fmtWhen(item.createdMs);
   $('viewer-status').textContent = '';
   cancelDelete();
+  closeTagPicker(false);
   const media = item.kind === 'clip' ? document.createElement('video') : document.createElement('img');
   media.src = mediaSrc(item);
   if (item.kind === 'clip') {
@@ -827,6 +969,7 @@ function closeViewer(render = true) {
   if ($('view-viewer').hidden) return;
   const path = library.current?.path;
   setFull(false);
+  closeTagPicker(false);
   releaseMedia();
   library.current = null;
   showView('library');
@@ -869,6 +1012,308 @@ $('viewer-keep').onclick = async () => {
     $('viewer-status').textContent = `${e}`;
   }
 };
+
+// Tags (spec library.tags): the item's tags as chips under its game, in the order
+// the index gives them (the standard list's, then the custom tags by name); ×
+// takes one off, and "+ Tag" or T opens the picker, where a click puts a tag on or
+// takes it off at once. The search finds a tag by its name in the interface's
+// language or in English, ignoring case, accents and spaces, and a name no tag
+// has offers "Create": Enter or a click creates the custom tag and puts it on the
+// item. In Recently deleted the tags are read-only. The selection bar's Tags button
+// opens the same picker for the selected items (not in Recently deleted): each tag
+// shows ✓ when every one has it, – when some do and nothing when none does; a click
+// on – or nothing puts it on every one, on ✓ takes it off every one (the index
+// decides, library_tag_click), and "Create" puts the new tag on every one.
+const tagCatalog = { groups: [], tags: [] };
+const loadTagCatalog = async () => Object.assign(tagCatalog, await invoke('library_tags'));
+loadTagCatalog().then(() => {
+  if (library.current) showTags(library.current);
+  // The side panel, the title and the search read the names; with no tag in use
+  // (or the library not read yet) nothing shows one.
+  else if (!$('view-library').hidden && Object.keys(library.tagCounts).length) renderLibrary();
+}).catch((e) => activity(t('Tags unavailable: {error}', { error: e }), 'bad'));
+
+// The one place a tag's ID becomes the name the interface shows.
+const tagName = (id) => tagCatalog.tags.find((tag) => tag.id === id)?.name ?? id;
+// A name as the index compares two (app/core/src/library/tags.rs, fold and
+// check_name), step by step: lowercase, decomposed, without marks, and without the
+// spaces Rust's trim and is_whitespace know (Unicode's White_Space, which `\s` and
+// trim() are not), so that "Create" shows for the names the index takes but long ones.
+const foldName = (s) => s.toLowerCase().normalize('NFD').replace(/[\p{M}\p{White_Space}]/gu, '');
+const trimName = (s) => s.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '');
+// A tag's names the picker's search compares, folded: a custom tag has no English one.
+const foldedNames = (tag) => [tag.name, tag.english].filter(Boolean).map(foldName);
+// The library search finds an item by a tag's name in the interface's language or
+// in English, by the picker's rule; `query` is already folded.
+const tagFound = (id, query) => foldedNames(tagCatalog.tags.find((tag) => tag.id === id) ?? { name: id }).some((name) => name.includes(query));
+
+// A chip's element with a tag's name, cut with "…" when it does not fit; the full
+// name shows on hover.
+function tagChipOf(tag, name) {
+  const chip = document.createElement(tag);
+  chip.className = 'tag-chip';
+  chip.title = name;
+  const text = document.createElement('span');
+  text.className = 'tag-name';
+  text.textContent = name;
+  chip.append(text);
+  return chip;
+}
+
+function tagChip(id, removable) {
+  const chip = tagChipOf('span', tagName(id));
+  if (removable) {
+    const remove = document.createElement('button');
+    remove.className = 'tag-remove';
+    remove.append(svgIcon('<path d="M6 6l12 12M18 6L6 18"/>', 12));
+    remove.title = t('Take off {tag}', { tag: tagName(id) });
+    remove.setAttribute('aria-label', remove.title);
+    remove.onclick = () => takeOffTag(id);
+    chip.append(remove);
+  }
+  return chip;
+}
+
+function showTags(item) {
+  const gone = item.deletedMs != null;
+  const tags = item.tags ?? [];
+  const add = $('viewer-tag-add');
+  const focused = document.activeElement;
+  $('viewer-tags').hidden = gone && !tags.length;
+  add.hidden = gone;
+  $('key-hint-tags').hidden = gone;
+  $('viewer-tag-list').replaceChildren(...tags.map((id) => tagChip(id, !gone)), add);
+  if (focused === add || (focused?.classList.contains('tag-remove') && !focused.isConnected)) add.focus();
+  if (gone) closeTagPicker(false);
+  showTagStates();
+}
+
+// A tag's state in the open picker: 'all' (✓), 'some' (–) or 'none'.
+const tagState = (id) => tagPicker.target?.state(id) ?? 'none';
+const PRESSED = { all: 'true', some: 'mixed', none: 'false' };
+const showTagStates = () => {
+  for (const option of $('tag-options').querySelectorAll('[data-tag]')) option.setAttribute('aria-pressed', PRESSED[tagState(option.dataset.tag)]);
+};
+
+// Fills the picker with the groups and tags the search finds, and offers to create
+// a tag with the name typed when no tag has that name (the index's rule, which
+// ignores case, accents and spaces, so "engracado" or "funny" finds "Engraçado").
+function showTagOptions() {
+  const typed = trimName($('tag-search').value);
+  const query = foldName(typed);
+  const groups = [];
+  for (const group of tagCatalog.groups) {
+    const found = tagCatalog.tags.filter((tag) => tag.group === group.id && foldedNames(tag).some((name) => name.includes(query)));
+    if (!found.length) continue;
+    const label = document.createElement('div');
+    label.className = 'tag-group-label';
+    label.textContent = group.name;
+    const list = document.createElement('div');
+    list.className = 'tag-chips';
+    for (const tag of found) {
+      const option = tagChipOf('button', tag.name);
+      option.classList.add('tag-option');
+      option.dataset.tag = tag.id;
+      option.setAttribute('aria-pressed', PRESSED[tagState(tag.id)]);
+      const check = svgIcon('<path d="M5 12l4 4 10-10"/>', 12);
+      check.classList.add('tag-check');
+      const some = svgIcon('<path d="M6 12h12"/>', 12);
+      some.classList.add('tag-some');
+      option.prepend(check, some);
+      option.onclick = () => toggleTag(tag.id);
+      list.append(option);
+    }
+    const box = document.createElement('div');
+    box.className = 'tag-group';
+    box.append(label, list);
+    groups.push(box);
+  }
+  $('tag-options').replaceChildren(...groups);
+  const create = $('tag-create');
+  create.hidden = !typed || tagCatalog.tags.some((tag) => foldedNames(tag).includes(query));
+  $('tag-create-label').textContent = t('Create “{name}”', { name: typed });
+  create.title = $('tag-create-label').textContent;
+  $('tag-none').hidden = groups.length > 0 || !create.hidden;
+}
+
+// Opens the picker on `target`, in `box`, under the `button` that opened it.
+function showPicker(target, button, box) {
+  Object.assign(tagPicker, { target, button, box });
+  box.append($('tag-picker'));
+  $('tag-picker').hidden = false;
+  button.setAttribute('aria-expanded', 'true');
+  $('tag-search').value = '';
+  $('tag-error').hidden = true;
+  showTagOptions();
+  $('tag-search').focus();
+}
+
+function openTagPicker() {
+  const item = library.current;
+  if (!item || item.deletedMs != null) return;
+  showPicker(viewerTags, $('viewer-tag-add'), $('viewer-tags'));
+}
+
+// Whether the selection bar's picker serves `paths`: the items selected in the
+// library on screen, no more and no fewer, outside Recently deleted and with no
+// question in the bar.
+function barPickerServes(paths) {
+  if ($('view-library').hidden || library.confirm || inTrash() || !paths.length) return false;
+  return paths.length === library.selected.size && paths.every((path) => library.selected.has(path));
+}
+
+// The selection bar's picker, with each tag's state over the selected items.
+async function openBarTagPicker() {
+  const paths = [...library.selected];
+  if (!barPickerServes(paths)) return;
+  let states;
+  try {
+    // After the changes still queued, from a picker closed right after a click.
+    await tagChanges;
+    states = await invoke('library_tag_states', { paths });
+  } catch (e) {
+    toast(t('Tags unavailable: {error}', { error: e }));
+    return;
+  }
+  // The selection or the view may have changed while the index counted.
+  if (!$('tag-picker').hidden || !barPickerServes(paths)) return;
+  Object.assign(barTags, { paths, states });
+  showPicker(barTags, $('sel-tags'), $('sel-tags-box'));
+}
+
+function closeTagPicker(focus = true) {
+  if ($('tag-picker').hidden) return;
+  $('tag-picker').hidden = true;
+  tagPicker.target = null;
+  tagPicker.button.setAttribute('aria-expanded', 'false');
+  if (focus && !tagPicker.button.hidden) tagPicker.button.focus();
+}
+
+const showTagError = (e) => {
+  $('tag-error').textContent = `${e}`;
+  $('tag-error').hidden = false;
+};
+
+// One change at a time, in the order of the clicks: each reads the tags the one
+// before left, so two quick clicks on a tag put it on and take it off again.
+// `tagWrites` counts the changes that are waiting or done, so that an item read
+// meanwhile does not bring back the tags of before (see library-changed).
+let tagChanges = Promise.resolve();
+const tagWrites = { waiting: 0, done: 0 };
+// Queues `change`, an async tag change; a failure goes to `failed`.
+function queueTagChange(change, failed) {
+  tagWrites.waiting += 1;
+  tagChanges = tagChanges.then(change).catch(failed).finally(() => {
+    tagWrites.waiting -= 1;
+    tagWrites.done += 1;
+  });
+}
+// Queues `write(item)`, which gives the open item's tag change as library_tag
+// does, and shows the item it leaves.
+function writeTags(write, failed) {
+  const path = library.current?.path;
+  queueTagChange(async () => {
+    const item = library.current;
+    if (!item || item.path !== path || item.deletedMs != null) return;
+    const result = await write(item);
+    if (result.failed.length) throw result.failed[0];
+    if (library.current?.path !== path) return;
+    library.current = result.items[0];
+    showTags(library.current);
+  }, failed);
+}
+function changeTag(id, wanted) {
+  writeTags((item) => invoke('library_tag', { paths: [item.path], tag: id, on: wanted(item.tags ?? []) }), (e) => {
+    $('viewer-status').textContent = `${e}`;
+  });
+}
+const takeOffTag = (id) => changeTag(id, () => false);
+// Queues `write(paths)`, a change to the tags of the items the bar's picker opened
+// for, which gives the items as library_tag does and the states it leaves; the
+// picker shows them while it serves those items.
+function writeBarTags(write, failed) {
+  const paths = barTags.paths;
+  queueTagChange(async () => {
+    const result = await write(paths);
+    if (tagPicker.target === barTags && barTags.paths === paths) {
+      barTags.states = result.states;
+      showTagStates();
+    }
+    if (result.failed.length) throw result.failed.join('; ');
+  }, failed);
+}
+
+// What the picker works on: the item open in the viewer, or the items selected
+// when the selection bar's picker opened (paths), with each tag's state over them
+// as the index gave it (states: { kill: 'some', ... }). Each gives a tag's state,
+// does a click on a tag and creates a custom tag with the name typed, which goes on
+// its item or items; `refused` gets why the index refused the name.
+const viewerTags = {
+  state: (id) => ((library.current?.tags ?? []).includes(id) ? 'all' : 'none'),
+  toggle: (id) => changeTag(id, (tags) => !tags.includes(id)),
+  create: (name, refused) => writeTags(async (item) => {
+    const result = await invoke('library_tag_create', { name, paths: [item.path] });
+    await loadTagCatalog();
+    showTagOptions();
+    return result;
+  }, refused),
+};
+const barTags = {
+  paths: [],
+  states: {},
+  state: (id) => barTags.states[id] ?? 'none',
+  // The index decides from the states it has then (library_tag_click).
+  toggle: (id) => writeBarTags((paths) => invoke('library_tag_click', { paths, tag: id }), showTagError),
+  create: (name, refused) => writeBarTags(async (paths) => {
+    const result = await invoke('library_tag_create', { name, paths });
+    await loadTagCatalog();
+    const states = await invoke('library_tag_states', { paths });
+    // With the old states for a moment: writeBarTags shows the new ones in the same task.
+    showTagOptions();
+    return { ...result, states };
+  }, refused),
+};
+const toggleTag = (id) => tagPicker.target?.toggle(id);
+
+// Creates a custom tag with the name typed in the search and puts it on what the
+// picker works on. The search empties at once, so a second Enter cannot ask for
+// the same tag; when the index refuses the name, it comes back with the reason.
+function createTag() {
+  const name = $('tag-search').value;
+  $('tag-search').value = '';
+  $('tag-error').hidden = true;
+  showTagOptions();
+  $('tag-search').focus();
+  tagPicker.target?.create(name, (e) => {
+    if (!$('tag-search').value) $('tag-search').value = name;
+    showTagOptions();
+    showTagError(e);
+  });
+}
+
+$('viewer-tag-add').onclick = () => ($('tag-picker').hidden ? openTagPicker() : closeTagPicker());
+$('tag-search').oninput = () => {
+  $('tag-error').hidden = true;
+  showTagOptions();
+};
+$('tag-create').onclick = createTag;
+// In the picker: the arrows move between the search field, the tags and
+// "Create", Enter in the search field creates the tag it offers, and Esc closes it.
+$('tag-picker').addEventListener('keydown', (e) => {
+  const options = [...$('tag-options').querySelectorAll('[data-tag]'), $('tag-create')].filter((option) => !option.hidden);
+  const at = options.indexOf(document.activeElement);
+  if (e.key === 'Escape') closeTagPicker();
+  else if (e.key === 'Enter' && e.target === $('tag-search') && !$('tag-create').hidden) createTag();
+  else if (e.key === 'ArrowDown' && e.target === $('tag-search')) options[0]?.focus();
+  else if ((e.key === 'ArrowDown' || e.key === 'ArrowRight') && at >= 0) options[Math.min(at + 1, options.length - 1)].focus();
+  else if ((e.key === 'ArrowUp' || e.key === 'ArrowLeft') && at > 0) options[at - 1].focus();
+  else if ((e.key === 'ArrowUp' || e.key === 'ArrowLeft') && at === 0) $('tag-search').focus();
+  else return;
+  e.preventDefault();
+});
+document.addEventListener('pointerdown', (e) => {
+  if (!$('tag-picker').hidden && !tagPicker.box.contains(e.target)) closeTagPicker(false);
+});
 
 // Delete: to Recently deleted (or, from there, for good), after a confirmation;
 // the viewer moves on to the next item.
@@ -1148,22 +1593,27 @@ for (const radio of document.querySelectorAll('input[name="trim-mode"]')) radio.
 
 // Viewer keys, in the capture phase so they work wherever the focus is: ← →
 // previous and next, Del delete, Esc out of full screen or back to the library, M
-// mute, F full screen, and I, O and Space for the trim.
+// mute, F full screen, T the tag picker, and I, O and Space for the trim. Keys
+// in the open tag picker are its own.
 document.addEventListener('keydown', (e) => {
   if ($('view-viewer').hidden || e.ctrlKey || e.altKey || e.metaKey) return;
   if (e.target.matches('input[type="text"], input[type="number"], input[type="search"], select')) return;
+  if (e.target.closest?.('#tag-picker')) return;
   const key = e.key;
   // A clip that plays (deleted ones too), and one that can be trimmed.
   const playing = trim.video != null;
   const trimming = !$('trim').hidden;
   if (key === 'Escape') {
-    if (document.body.classList.contains('player-full')) setFull(false);
+    if (!$('tag-picker').hidden) closeTagPicker();
+    else if (document.body.classList.contains('player-full')) setFull(false);
     else if (!$('delete-confirm').hidden) cancelDelete();
     else closeViewer();
   } else if (playing && key.toLowerCase() === 'm') {
     toggleMute();
   } else if (playing && key.toLowerCase() === 'f') {
     toggleFull();
+  } else if (key.toLowerCase() === 't' && !$('viewer-tag-add').hidden && !document.body.classList.contains('player-full')) {
+    openTagPicker();
   } else if (key === 'Delete') {
     askDelete();
   } else if ((key === 'ArrowLeft' || key === 'ArrowRight') && !e.target.matches('.timeline-handle, input[type="range"]')) {
@@ -1185,8 +1635,8 @@ document.addEventListener('keydown', (e) => {
 
 // "Save and delete original" (friends' request of 2026-11-07): the trimmed copy is
 // saved as usual while the video stays; then the viewer lets go of the original,
-// which goes to Recently deleted, and the copy takes its name, date, Keep mark and
-// achievement. Undo brings the original back next to the trimmed clip.
+// which goes to Recently deleted, and the copy takes its name, date, Keep mark,
+// achievement and tags. Undo brings the original back next to the trimmed clip.
 $('trim-replace').onclick = async () => {
   const item = library.current;
   const exact = trimMode() === 'exact';
@@ -1247,13 +1697,16 @@ for (const button of document.querySelectorAll('[data-share]')) {
   };
 }
 
-// New, trimmed, kept or removed items: the grid follows; an open viewer keeps its
-// video and only refreshes the details and the position.
+// New, trimmed, kept, tagged or removed items: the grid follows; an open viewer
+// keeps its video and only refreshes the details and the position. An item read
+// while a tag change was waiting or done may hold the tags of before: the change's
+// own event brings it again.
 listen('library-changed', async () => {
+  const tagsBefore = tagWrites.done;
   await loadLibrary();
   if (!$('view-viewer').hidden && library.current) {
     const fresh = [...library.items, ...library.deleted].find((i) => i.path === library.current.path);
-    if (fresh) {
+    if (fresh && !tagWrites.waiting && tagWrites.done === tagsBefore) {
       library.current = fresh;
       showDetails(fresh);
     }

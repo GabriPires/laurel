@@ -6,7 +6,9 @@ The English text is the key (app/src/i18n.rs). The texts come from:
     except under script, style, code, [data-i18n-skip] and kbd (unless [data-i18n]),
     and the key an element names in data-i18n="key" (instead of its text);
   - app/ui/*.js: t('...') and tp(n, '...', '...');
-  - app/src/*.rs: t!("..."), t_later!("...") and tr_plural(n, "...", "...").
+  - app/src/*.rs: t!("..."), t_later!("...") and tr_plural(n, "...", "...");
+  - app/core/src/library/tags.rs: the standard tags' and their groups' names,
+    each a name: "..." field (the app translates them with tr).
 
 It reports the texts with no translation, the translations nothing uses, and
 translations whose {name} fields differ from the English ones. A text with no
@@ -92,6 +94,8 @@ JS_TP = re.compile(r"\btp\([^,()]*(?:\([^()]*\))?[^,()]*,\s*" + JS_STRING + r"\s
 RS_STRING = r'"((?:\\.|[^"\\])*)"'
 RS_T = re.compile(r"\bt(?:_later)?!\(\s*" + RS_STRING)
 RS_TP = re.compile(r"\btr_plural\([^,]*,\s*" + RS_STRING + r"\s*,\s*" + RS_STRING)
+RS_NAME = re.compile(r"\bname:\s*" + RS_STRING)
+TAGS = APP / "core" / "src" / "library" / "tags.rs"
 
 
 def collect():
@@ -120,6 +124,8 @@ def collect():
         for m in RS_TP.finditer(code):
             one, other = unescape_js(m.group(1)), unescape_js(m.group(2))
             plurals.setdefault(other, [one, set()])[1].add(path.name)
+    for m in RS_NAME.finditer(TAGS.read_text(encoding="utf-8")):
+        add(unescape_js(m.group(1)), TAGS.name)
     return texts, plurals
 
 

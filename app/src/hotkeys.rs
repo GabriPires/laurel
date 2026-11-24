@@ -130,7 +130,7 @@ impl Hotkeys {
         SHARED.set(shared.clone()).map_err(|_| "hotkeys already started".to_string())?;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = win::raw_input_window(on_raw_input);
+            let result = win::raw_input_window(on_raw_input, |e| log!("hotkeys: {e}"));
             let _ = tx.send(result.map(|hwnd| {
                 SHARED.get().unwrap().hwnd.store(hwnd, Ordering::SeqCst);
                 hwnd

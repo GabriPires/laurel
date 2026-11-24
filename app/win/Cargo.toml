@@ -1,0 +1,19 @@
+[package]
+name = "laurel-app-win"
+# An internal library built into laurel-app; its version is not released on its own.
+version = "0.0.0"
+description = "The Win32 calls of Laurel's app, and the real Windows behind laurel-app-core's traits; empty on other systems."
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Tests live only in tests/ (decision D14); a code block in a doc comment is an
+# example, not a test.
+[lib]
+doctest = false
+
+[dependencies]
+laurel-app-core = { path = "../core" }
+
+[dev-dependencies]
+serde_json = "1"

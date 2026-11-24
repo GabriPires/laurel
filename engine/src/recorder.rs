@@ -981,7 +981,7 @@ impl Recorder {
         }
         // A game capture that replaces another one gets another name: OBS names the
         // source in each line, and the old one's last lines can come after the new
-        // one's first (A34: hook_stop.rs counts each line for the process of that name).
+        // one's first (A34: laurel_engine_core::hook_stop counts each line for the process of that name).
         let name = match (&self.target, capture) {
             (Capture::Game(_), Capture::Game(_)) if self.capture_name == "capture" => "capture-2",
             _ => "capture",

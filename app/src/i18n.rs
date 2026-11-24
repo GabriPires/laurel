@@ -17,9 +17,6 @@ use std::sync::OnceLock;
 
 use serde_json::{json, Value};
 
-/// The values of the language setting; "system" follows Windows.
-pub const LANGUAGES: &[&str] = &["system", "en", "pt-BR"];
-
 static PORTUGUESE: AtomicBool = AtomicBool::new(false);
 
 fn portuguese() -> &'static HashMap<String, Value> {

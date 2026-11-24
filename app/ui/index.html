@@ -103,6 +103,8 @@
           </button>
           <div class="side-label">Games</div>
           <div id="side-games" class="side-games"></div>
+          <div id="side-tags-label" class="side-label" hidden>Tags</div>
+          <div id="side-tags" class="side-games"></div>
           <button id="storage-open" class="side-foot storage-btn" title="Storage settings">
             <span class="side-label flush">Storage</span>
             <span class="meter" aria-hidden="true"><span id="storage-bar" class="meter-fill"></span></span>
@@ -123,7 +125,7 @@
             </label>
             <label class="search">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></svg>
-              <input id="library-search" type="search" placeholder="Search clips" aria-label="Search by game or file name" spellcheck="false">
+              <input id="library-search" type="search" placeholder="Search clips" aria-label="Search by game, file name or tag" spellcheck="false">
             </label>
             <button id="library-empty-trash" class="btn btn-secondary" hidden>Empty</button>
             <button id="library-refresh" class="icon-btn" aria-label="Look for new files" title="Look for new files">
@@ -137,6 +139,10 @@
               <button id="sel-all" class="link-btn">Select all</button>
               <div class="spacer"></div>
               <button id="sel-keep" class="btn btn-secondary">Keep</button>
+              <!-- The viewer's tag picker (#tag-picker) moves in here when this button opens it. -->
+              <div id="sel-tags-box" class="sel-tags">
+                <button id="sel-tags" class="btn btn-secondary" aria-expanded="false" aria-controls="tag-picker" title="Put tags on the selected items or take them off">Tags</button>
+              </div>
               <button id="sel-delete" class="btn btn-danger-outline">Delete</button>
               <button id="sel-restore" class="btn btn-primary">Restore</button>
               <button id="sel-purge" class="btn btn-danger-outline">Delete now</button>
@@ -224,7 +230,7 @@
               </div>
             </div>
           </section>
-          <p class="key-hint"><kbd>←</kbd> <kbd>→</kbd> <span>previous or next</span> · <kbd>M</kbd> <span>mute</span> · <kbd>F</kbd> <span>full screen</span> · <kbd>Del</kbd> <span>delete</span> · <kbd>Esc</kbd> <span>back to the library</span></p>
+          <p class="key-hint"><kbd>←</kbd> <kbd>→</kbd> <span>previous or next</span> · <kbd>M</kbd> <span>mute</span> · <kbd>F</kbd> <span>full screen</span> · <span id="key-hint-tags"><kbd>T</kbd> <span>tags</span> · </span><kbd>Del</kbd> <span>delete</span> · <kbd>Esc</kbd> <span>back to the library</span></p>
         </main>
 
         <aside class="details" aria-label="Details">
@@ -235,6 +241,26 @@
               <span id="viewer-game-name" class="detail-game-name"></span>
               <span id="viewer-game-count" class="detail-game-count"></span>
             </button>
+          </div>
+          <div id="viewer-tags" class="detail-block">
+            <div class="side-label flush">Tags</div>
+            <div id="viewer-tag-list" class="tag-chips">
+              <button id="viewer-tag-add" class="tag-add" aria-expanded="false" aria-controls="tag-picker" title="Put tags on it or take them off (T)">+ Tag</button>
+            </div>
+            <!-- The tag picker of the viewer and, moved into #sel-tags-box, of the selection bar. -->
+            <div id="tag-picker" class="tag-picker" hidden>
+              <label class="search">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></svg>
+                <input id="tag-search" type="search" placeholder="Search tags" aria-label="Search tags" spellcheck="false" autocomplete="off">
+              </label>
+              <div id="tag-options" class="tag-options"></div>
+              <p id="tag-none" class="tag-none" hidden>No tag has that name</p>
+              <button id="tag-create" class="tag-create" hidden>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+                <span id="tag-create-label" class="tag-name"></span>
+              </button>
+              <p id="tag-error" class="tag-error" role="alert" hidden></p>
+            </div>
           </div>
           <dl class="facts">
             <dt>Recorded</dt><dd id="fact-recorded"></dd>
@@ -302,6 +328,10 @@
             <button class="side-item" data-page="shortcuts"><span class="side-name">Shortcuts</span></button>
             <button class="side-item" data-page="games"><span class="side-name">Games</span></button>
             <button class="side-item" data-page="autoclip"><span class="side-name">Auto-clip</span></button>
+          </div>
+          <div class="side-group">
+            <div class="side-label">Library</div>
+            <button class="side-item" data-page="tags"><span class="side-name">Tags</span></button>
           </div>
           <div class="side-group">
             <div class="side-label">Storage</div>
@@ -541,6 +571,24 @@
             <p class="group-desc">Turn a game off to leave its achievements out.</p>
             <ul id="steam-games" class="rows game-list"></ul>
           </section>
+          <section class="page" data-page="tags" aria-labelledby="page-tags" hidden>
+            <div class="page-head">
+              <span class="page-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h7l9 9-7 7-9-9z"/><circle cx="8" cy="8" r="1.4"/></svg></span>
+              <div><h1 id="page-tags">Tags</h1><p>Names you put on clips and screenshots to find them later.</p></div>
+            </div>
+            <h2 class="group-label">Standard tags</h2>
+            <p class="group-desc">They come with Laurel and cannot be renamed or deleted. The counts leave out Recently deleted.</p>
+            <ul id="tags-standard" class="rows tag-list"></ul>
+            <h2 class="group-label">Your tags</h2>
+            <p class="group-desc">Renaming a tag renames it on every item that has it; deleting it takes it off every one.</p>
+            <ul id="tags-custom" class="rows tag-list"></ul>
+            <div class="add-tag">
+              <input id="tags-new" type="text" placeholder="New tag" aria-label="Name of the new tag" spellcheck="false" autocomplete="off">
+              <button id="tags-create" class="btn btn-secondary" disabled>Create</button>
+            </div>
+            <p id="tags-new-error" class="tag-error" role="alert" hidden></p>
+          </section>
+
           <section class="page" data-page="storage" aria-labelledby="page-storage" hidden>
             <div class="page-head">
               <span class="page-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg></span>
@@ -749,6 +797,7 @@
   <script src="library.js"></script>
   <script src="settings.js"></script>
   <script src="games.js"></script>
+  <script src="tags.js"></script>
   <script src="autoclip.js"></script>
   <script src="hotkeys.js"></script>
 </body>

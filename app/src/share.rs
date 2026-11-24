@@ -6,6 +6,8 @@ use std::ffi::c_void;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 
+use laurel_app_core::library::native_path;
+
 use crate::i18n::t;
 
 #[link(name = "user32", kind = "raw-dylib")]
@@ -39,11 +41,6 @@ const SW_SHOWNORMAL: i32 = 1;
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-/// Windows paths with backslashes (the engine reports clips with forward slashes).
-pub fn windows_path(path: &str) -> String {
-    path.replace('/', "\\")
 }
 
 /// Moves `bytes` into a movable global block, as the clipboard requires.
@@ -91,7 +88,7 @@ pub fn copy_text(text: &str) -> Result<(), String> {
 /// Puts the file on the clipboard as a file list (CF_HDROP) marked as a copy, so
 /// pasting in Discord, a chat or Explorer attaches or copies the file itself.
 pub fn copy_file(path: &str) -> Result<(), String> {
-    let path = windows_path(path);
+    let path = native_path(path);
     if !Path::new(&path).exists() {
         return Err(t!("File not found: {path}", path = path));
     }
@@ -111,7 +108,7 @@ pub fn copy_file(path: &str) -> Result<(), String> {
 /// Opens an Explorer window with the file selected.
 pub fn show_in_folder(path: &str) -> Result<(), String> {
     std::process::Command::new("explorer.exe")
-        .raw_arg(format!("/select,\"{}\"", windows_path(path)))
+        .raw_arg(format!("/select,\"{}\"", native_path(path)))
         .spawn()
         .map(|_| ())
         .map_err(|e| e.to_string())
@@ -120,7 +117,7 @@ pub fn show_in_folder(path: &str) -> Result<(), String> {
 /// Opens the file with its default app (the video player for clips), or a folder in
 /// Explorer.
 pub fn open(path: &str) -> Result<(), String> {
-    shell_open(&windows_path(path))
+    shell_open(&native_path(path))
 }
 
 /// Opens a web address in the default browser.
